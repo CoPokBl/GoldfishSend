@@ -1,6 +1,9 @@
+using GoldfishSend.Infrastructure.Redis;
+
 namespace GoldfishSend.Infrastructure.Services;
 
-public sealed record ServiceError(int Status, string Code, TimeSpan? RetryAfter = null) {
+/// <param name="Scope">For <c>rate_limited</c>: which limit was hit (<c>ip</c>, <c>network</c>, <c>mailbox</c>, <c>global</c>).</param>
+public sealed record ServiceError(int Status, string Code, TimeSpan? RetryAfter = null, string? Scope = null) {
     public static readonly ServiceError InvalidRequest = new(400, "invalid_request");
     public static readonly ServiceError InvalidEndpoint = new(400, "invalid_endpoint");
     public static readonly ServiceError PowInvalid = new(403, "pow_invalid");
@@ -13,7 +16,7 @@ public sealed record ServiceError(int Status, string Code, TimeSpan? RetryAfter 
     public static readonly ServiceError MailboxFull = new(507, "mailbox_full", TimeSpan.FromHours(1));
     public static readonly ServiceError Unavailable = new(503, "unavailable");
 
-    public static ServiceError RateLimited(TimeSpan retryAfter) => new(429, "rate_limited", retryAfter);
+    public static ServiceError RateLimited(RateLimitDecision decision) => new(429, "rate_limited", decision.RetryAfter, decision.Scope);
 }
 
 public readonly struct ServiceResult<T> {

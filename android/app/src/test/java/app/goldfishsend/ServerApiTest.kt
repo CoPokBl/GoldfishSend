@@ -83,6 +83,23 @@ class ServerApiTest {
     }
 
     @Test
+    fun rateLimitScopeDecidesWhetherPowHelps() = runBlocking {
+        val cases = listOf("ip" to true, "network" to false, "mailbox" to false, "global" to false, null to false)
+        for ((scope, powHelps) in cases) {
+            val body = if (scope == null) """{"error":"rate_limited"}""" else """{"error":"rate_limited","scope":"$scope"}"""
+            server.enqueue(json(429, body, "Retry-After" to "5"))
+            try {
+                api.sendMessage(ByteArray(32), byteArrayOf(1), ByteArray(16), null)
+                fail()
+            } catch (e: ApiException) {
+                assertEquals(scope, e.scope)
+                assertEquals("scope=$scope", powHelps, e.powCanHelp)
+                assertTrue(e.retryable)
+            }
+        }
+    }
+
+    @Test
     fun errorCodesParsed() = runBlocking {
         server.enqueue(json(429, """{"error":"rate_limited"}""", "Retry-After" to "12"))
         try {

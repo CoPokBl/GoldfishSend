@@ -71,7 +71,7 @@ public sealed class MailboxService {
         foreach (var (policy, subject) in new[] { (RatePolicies.CreatePerIp, client.Host), (RatePolicies.CreatePerNetwork, client.Network) }) {
             var limit = await _limiter.CheckAsync(policy, subject, failOpen: false);
             if (!limit.Allowed) {
-                return ServiceError.RateLimited(limit.RetryAfter);
+                return ServiceError.RateLimited(limit);
             }
         }
         if (!await _pow.RedeemAsync(powChallenge, powNonce)) {
@@ -122,7 +122,7 @@ public sealed class MailboxService {
         foreach (var id in ids) {
             var decision = await _limiter.CheckAsync(RatePolicies.RotatePerMailbox, id);
             if (!decision.Allowed) {
-                return ServiceError.RateLimited(decision.RetryAfter);
+                return ServiceError.RateLimited(decision);
             }
         }
 
@@ -230,7 +230,7 @@ public sealed class MailboxService {
             }
         }
         var limit = await _limiter.CheckAsync(RatePolicies.OwnerPerIp, client.Host);
-        return limit.Allowed ? null : ServiceError.RateLimited(limit.RetryAfter);
+        return limit.Allowed ? null : ServiceError.RateLimited(limit);
     }
 
     /// <summary>

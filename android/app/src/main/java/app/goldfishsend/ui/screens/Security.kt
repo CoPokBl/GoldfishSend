@@ -55,6 +55,7 @@ import app.goldfishsend.core.Session
 import app.goldfishsend.security.AuditReport
 import app.goldfishsend.security.Finding
 import app.goldfishsend.security.Fix
+import app.goldfishsend.security.KeyboardTrust
 import app.goldfishsend.security.SecurityAudit
 import app.goldfishsend.security.Severity
 import kotlinx.coroutines.Dispatchers
@@ -102,6 +103,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
             Fix.DEVELOPER_SETTINGS -> open(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
             Fix.ACCESSIBILITY_SETTINGS -> open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             Fix.INPUT_METHOD_SETTINGS -> open(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+            Fix.GET_OPEN_SOURCE_KEYBOARD -> open(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(KeyboardTrust.SUGGESTED_KEYBOARD_URL)))
             Fix.BATTERY_SETTINGS -> open(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             Fix.SET_PASSPHRASE -> openPassphrase()
             Fix.ENABLE_SCREENSHOT_BLOCK -> p.screenshotProtection = true

@@ -38,6 +38,22 @@ public static class RatePolicies {
         [PushPerHost] = new(50, 1, 50),
     };
 
+    public const string ScopeIp = "ip";
+    public const string ScopeNetwork = "network";
+    public const string ScopeMailbox = "mailbox";
+    public const string ScopeGlobal = "global";
+
+    /// <summary>
+    /// Which kind of subject a policy limits. It's reported to clients as <c>scope</c> on <c>429</c>, so they can react:
+    /// only an <c>ip</c>-scoped send limit can be paid off with a proof of work.
+    /// </summary>
+    public static string ScopeOf(string policy) => policy switch {
+        SendPerIp or CreatePerIp or PowPerIp or OwnerPerIp or InviteCreatePerIp or InviteFetchPerIp => ScopeIp,
+        CreatePerNetwork or PowPerNetwork or InviteCreatePerNetwork => ScopeNetwork,
+        SendPerMailbox or SendPerMailboxDaily or RotatePerMailbox => ScopeMailbox,
+        _ => ScopeGlobal,
+    };
+
     /// <summary>
     /// The configured policy, with any field left at 0 taken from the default. A partial override
     /// (just <c>Limit</c>, say) can't silently switch a limit off.

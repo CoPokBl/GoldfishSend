@@ -59,7 +59,7 @@ public static class ApiEndpoints {
         foreach (var (policy, subject) in new[] { (RatePolicies.PowPerIp, client.Host), (RatePolicies.PowPerNetwork, client.Network) }) {
             var limit = await limiter.CheckAsync(policy, subject);
             if (!limit.Allowed) {
-                return Error(ServiceError.RateLimited(limit.RetryAfter));
+                return Error(ServiceError.RateLimited(limit));
             }
         }
         var challenge = await pow.IssueAsync();

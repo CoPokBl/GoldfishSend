@@ -78,7 +78,7 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 - Notifications reveal nothing by default (`VISIBILITY_SECRET`).
 - No backups or device transfer.
 
-**Security tab**: an on-device audit covering patch age, Android end of life, a Google/FCM push distributor, screen lock, encryption, ADB and developer options, root or bootloader state, accessibility services, a third-party keyboard, StrongBox, and app settings. Each item has a one-tap **Fix** where possible.
+**Security tab**: an on-device audit covering patch age, Android end of life, a Google/FCM push distributor, screen lock, encryption, ADB and developer options, root or bootloader state, accessibility services, the keyboard (closed-source keyboards such as Gboard or SwiftKey are a warning and known cloud keyboards such as Sogou, Baidu or Grammarly are critical; known open-source keyboards and anything installed by an F-Droid client are trusted, see `security/KeyboardTrust.kt`), StrongBox, and app settings. Each item has a one-tap **Fix** where possible.
 
 ## Known gaps / TODO
 - **No group chats or attachments.** Multi-device isn't supported either.

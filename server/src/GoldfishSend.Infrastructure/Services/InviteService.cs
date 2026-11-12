@@ -36,7 +36,7 @@ public sealed class InviteService {
                  }) {
             var limit = await _limiter.CheckAsync(policy, subject, failOpen: false);
             if (!limit.Allowed) {
-                return ServiceError.RateLimited(limit.RetryAfter);
+                return ServiceError.RateLimited(limit);
             }
         }
         var ttl = Math.Clamp(ttlSeconds ?? _options.DefaultTtlSeconds, _options.MinTtlSeconds, _options.MaxTtlSeconds);
@@ -51,7 +51,7 @@ public sealed class InviteService {
         }
         var limit = await _limiter.CheckAsync(RatePolicies.InviteFetchPerIp, client.Host);
         if (!limit.Allowed) {
-            return ServiceError.RateLimited(limit.RetryAfter);
+            return ServiceError.RateLimited(limit);
         }
         var blob = await _store.TakeInviteAsync(id);
         return blob is null ? ServiceError.NotFound : blob;

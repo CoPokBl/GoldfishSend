@@ -8,8 +8,11 @@ using StackExchange.Redis;
 
 namespace GoldfishSend.Infrastructure.Redis;
 
-public readonly record struct RateLimitDecision(bool Allowed, TimeSpan RetryAfter) {
+public readonly record struct RateLimitDecision(bool Allowed, TimeSpan RetryAfter, string Policy = "") {
     public static readonly RateLimitDecision Allow = new(true, TimeSpan.Zero);
+
+    /// <summary>The kind of subject that was limited: <c>ip</c>, <c>network</c>, <c>mailbox</c> or <c>global</c>.</summary>
+    public string Scope => RatePolicies.ScopeOf(Policy);
 }
 
 /// <summary>
@@ -53,6 +56,10 @@ public sealed class RateLimiter {
     /// If Redis is unavailable: <c>true</c> falls back to a per-process limiter, and <c>false</c> denies.
     /// </param>
     public async Task<RateLimitDecision> CheckAsync(string policyName, ReadOnlyMemory<byte> subject, bool failOpen = true, int cost = 1) {
+        return await CheckCoreAsync(policyName, subject, failOpen, cost) with { Policy = policyName };
+    }
+
+    private async Task<RateLimitDecision> CheckCoreAsync(string policyName, ReadOnlyMemory<byte> subject, bool failOpen, int cost) {
         var policy = RatePolicies.Resolve(_options, policyName);
         if (policy.Limit <= 0) {
             return RateLimitDecision.Allow;

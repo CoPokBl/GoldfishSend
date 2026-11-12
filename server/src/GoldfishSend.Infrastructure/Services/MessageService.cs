@@ -62,7 +62,7 @@ public sealed class MessageService {
         // Shared-IP users (Tor, CGNAT) who hit the per-IP limit can pay with a proof of work instead.
         var perIp = await _limiter.CheckAsync(RatePolicies.SendPerIp, client.Host);
         if (!perIp.Allowed && (pow is null || !await _pow.RedeemAsync(pow.Challenge, pow.Nonce, countsTowardLoad: false))) {
-            return ServiceError.RateLimited(perIp.RetryAfter);
+            return ServiceError.RateLimited(perIp);
         }
 
         var mailboxId = _crypto.MailboxId(sendSecret);
@@ -76,7 +76,7 @@ public sealed class MessageService {
         foreach (var policy in new[] { RatePolicies.SendPerMailbox, RatePolicies.SendPerMailboxDaily }) {
             var decision = await _limiter.CheckAsync(policy, mailboxId);
             if (!decision.Allowed) {
-                return ServiceError.RateLimited(decision.RetryAfter);
+                return ServiceError.RateLimited(decision);
             }
         }
 
@@ -89,7 +89,7 @@ public sealed class MessageService {
         // Charged last, only for messages that are about to be accepted. Junk can't drain the shared budget.
         var global = await _limiter.CheckAsync(RatePolicies.SendGlobal, GlobalSubject);
         if (!global.Allowed) {
-            return ServiceError.RateLimited(global.RetryAfter);
+            return ServiceError.RateLimited(global);
         }
 
         var messageId = RandomNumberGenerator.GetBytes(ProtocolLimits.MessageIdSize);

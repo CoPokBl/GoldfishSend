@@ -67,14 +67,24 @@ data class ExpiresResponse(val expiresAt: String)
 data class IdResponse(val id: String)
 
 @Serializable
-private data class ErrorBody(val error: String = "unknown")
+private data class ErrorBody(val error: String = "unknown", val scope: String? = null)
 
 /**
  * A failed server call. [code] is the protocol error code (or "network"/"http_<n>"), and [human] is a
  * friendly sentence that's safe to show users. Callers decide whether to retry using [retryable].
  */
-class ApiException(val code: String, val status: Int, val retryAfterSeconds: Long? = null, cause: Throwable? = null) :
-    IOException("api error $code ($status)", cause) {
+class ApiException(
+    val code: String,
+    val status: Int,
+    val retryAfterSeconds: Long? = null,
+    cause: Throwable? = null,
+    /** For `rate_limited`: which limit was hit, one of `ip`, `network`, `mailbox` or `global` (docs/protocol.md). */
+    val scope: String? = null,
+) : IOException("api error $code ($status)", cause) {
+    /** Only the per-IP send limit can be paid off with a proof of work. Retrying any other scope just wastes CPU. */
+    val powCanHelp: Boolean
+        get() = status == 429 && scope == "ip"
+
     val retryable: Boolean
         get() = code == "network" || code == "rate_limited" || status >= 500 || status == 0
 
@@ -191,12 +201,12 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
             if (r.isSuccessful) {
                 return onOk(r)
             }
-            val code = try {
-                lenient.decodeFromString(ErrorBody.serializer(), r.body.string()).error
+            val body = try {
+                lenient.decodeFromString(ErrorBody.serializer(), r.body.string())
             } catch (e: Exception) {
-                "http_${r.code}"
+                ErrorBody("http_${r.code}")
             }
-            throw ApiException(code, r.code, r.header("Retry-After")?.toLongOrNull())
+            throw ApiException(body.error, r.code, r.header("Retry-After")?.toLongOrNull(), scope = body.scope)
         }
     }
 

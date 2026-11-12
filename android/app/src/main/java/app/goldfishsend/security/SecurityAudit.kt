@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
+import android.view.inputmethod.InputMethodManager
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.NotificationContent
 import app.goldfishsend.push.PushHub
@@ -26,6 +27,7 @@ enum class Fix {
     DEVELOPER_SETTINGS,
     ACCESSIBILITY_SETTINGS,
     INPUT_METHOD_SETTINGS,
+    GET_OPEN_SOURCE_KEYBOARD,
     BATTERY_SETTINGS,
     SET_PASSPHRASE,
     ENABLE_SCREENSHOT_BLOCK,
@@ -219,20 +221,7 @@ object SecurityAudit {
         }
 
         // --- Keyboard ---
-        val ime = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)?.substringBefore('/')
-        if (ime != null) {
-            val system = runCatching {
-                @Suppress("DEPRECATION")
-                ctx.packageManager.getApplicationInfo(ime, 0).flags and ApplicationInfo.FLAG_SYSTEM != 0
-            }.getOrDefault(true)
-            if (!system) {
-                out += Finding(
-                    "ime", Severity.INFO, "Third-party keyboard",
-                    "Your keyboard can see everything you type. GoldfishSend asks it not to learn from your messages, but it can't enforce this.",
-                    Fix.INPUT_METHOD_SETTINGS, "Keyboard settings",
-                )
-            }
-        }
+        out += keyboardFindings(ctx)
 
         // --- Hardware key storage ---
         val strongBox = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
@@ -302,4 +291,89 @@ object SecurityAudit {
     } catch (e: Exception) {
         null
     }
+
+    /**
+     * The default keyboard sees every keystroke, so a closed-source one gets a warning, and a known cloud keyboard
+     * gets a critical finding. Other enabled keyboards that aren't trusted are listed as info, because switching
+     * to them is one tap away.
+     */
+    private fun keyboardFindings(ctx: Context): List<Finding> {
+        val pm = ctx.packageManager
+        val findings = mutableListOf<Finding>()
+        val current = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)?.substringBefore('/')
+
+        fun classify(pkg: String): KeyboardTrust.Result {
+            val system = runCatching {
+                pm.getApplicationInfo(pkg, 0).flags and ApplicationInfo.FLAG_SYSTEM != 0
+            }.getOrDefault(false)
+            return KeyboardTrust.classify(pkg, installerOf(pm, pkg), system)
+        }
+
+        fun label(pkg: String, result: KeyboardTrust.Result): String = result.name
+            ?: runCatching { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
+
+        if (current != null) {
+            val r = classify(current)
+            val name = label(current, r)
+            findings += when (r.verdict) {
+                KeyboardTrust.Verdict.OPEN_SOURCE -> Finding(
+                    "ime", Severity.OK, "Open-source keyboard",
+                    if (r.viaFdroid) "$name was installed from F-Droid, which only distributes open-source apps." else "$name is open source.",
+                )
+                KeyboardTrust.Verdict.SOURCE_AVAILABLE -> Finding(
+                    "ime", Severity.INFO, "Source-available keyboard: $name",
+                    listOfNotNull(r.note, "It sees everything you type.").joinToString(" "),
+                    Fix.INPUT_METHOD_SETTINGS, "Keyboard settings",
+                )
+                KeyboardTrust.Verdict.CLOSED_SOURCE_CLOUD -> Finding(
+                    "ime", Severity.CRITICAL, "Your keyboard sends what you type: $name",
+                    listOfNotNull(r.note, "Your messages pass through it before they're encrypted.", KeyboardTrust.ALTERNATIVES).joinToString(" "),
+                    Fix.GET_OPEN_SOURCE_KEYBOARD, "Get an open-source keyboard",
+                )
+                KeyboardTrust.Verdict.CLOSED_SOURCE -> Finding(
+                    "ime", Severity.WARNING, "Closed-source keyboard: $name",
+                    listOfNotNull(
+                        r.note ?: "$name is closed source.",
+                        "Nobody can check what it does with what you type, including your messages before they're encrypted.",
+                        KeyboardTrust.ALTERNATIVES,
+                    ).joinToString(" "),
+                    Fix.GET_OPEN_SOURCE_KEYBOARD, "Get an open-source keyboard",
+                )
+                KeyboardTrust.Verdict.UNKNOWN -> Finding(
+                    "ime", Severity.WARNING, "Keyboard may be closed source: $name",
+                    "GoldfishSend couldn't confirm that $name is open source, and it sees everything you type. " +
+                        "Keyboards installed from F-Droid are recognised automatically. ${KeyboardTrust.ALTERNATIVES}",
+                    Fix.GET_OPEN_SOURCE_KEYBOARD, "Get an open-source keyboard",
+                )
+            }
+        }
+
+        val imm = ctx.getSystemService(InputMethodManager::class.java)
+        val others = runCatching { imm.enabledInputMethodList }.getOrDefault(emptyList())
+            .map { it.packageName }
+            .distinct()
+            .filter { it != current }
+            .mapNotNull { pkg ->
+                val r = classify(pkg)
+                if (r.verdict == KeyboardTrust.Verdict.OPEN_SOURCE) null else label(pkg, r)
+            }
+        if (others.isNotEmpty()) {
+            findings += Finding(
+                "ime-enabled", Severity.INFO, "Other keyboards can be switched to",
+                "${others.joinToString()} ${if (others.size == 1) "is" else "are"} enabled but not confirmed open source. " +
+                    "Turn off keyboards you don't use.",
+                Fix.INPUT_METHOD_SETTINGS, "Keyboard settings",
+            )
+        }
+        return findings
+    }
+
+    private fun installerOf(pm: PackageManager, pkg: String): String? = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            pm.getInstallSourceInfo(pkg).installingPackageName
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getInstallerPackageName(pkg)
+        }
+    }.getOrNull()
 }

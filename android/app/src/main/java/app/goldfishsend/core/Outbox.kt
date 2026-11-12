@@ -107,9 +107,9 @@ object Outbox {
             try {
                 api.sendMessage(secret, blob, item.idem, null)
             } catch (e: ApiException) {
-                // A 429 may be the per-IP limit (shared IP / Tor). Pay with proof of work once and retry.
-                // If it's the per-mailbox limit the retry fails too, and we fall back to normal backoff.
-                if (e.status != 429 || item.attempts >= 3) {
+                // Only the per-IP limit (shared IP, Tor) can be paid with a proof of work: solve one and retry once.
+                // Mailbox, network and global limits fall through to normal backoff, honouring Retry-After.
+                if (!e.powCanHelp || item.attempts >= 3) {
                     throw e
                 }
                 val ch = api.powChallenge()

@@ -21,7 +21,7 @@ public sealed record ExpiresResponse(string ExpiresAt);
 
 public sealed record IdResponse(string Id);
 
-public sealed record ErrorResponse(string Error);
+public sealed record ErrorResponse(string Error, string? Scope = null);
 
 public sealed record PowChallengeResponse(string Challenge, int Difficulty, long ExpiresAt);
 

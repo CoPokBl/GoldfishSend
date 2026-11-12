@@ -62,7 +62,7 @@ internal static class HttpHelpers {
                 context.Response.Headers.RetryAfter = seconds.ToString(CultureInfo.InvariantCulture);
             }
             context.Response.StatusCode = error.Status;
-            await context.Response.WriteAsJsonAsync(new ErrorResponse(error.Code), ApiJsonContext.Default.ErrorResponse);
+            await context.Response.WriteAsJsonAsync(new ErrorResponse(error.Code, error.Scope), ApiJsonContext.Default.ErrorResponse);
         }
     }
 }

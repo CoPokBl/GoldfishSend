@@ -5,6 +5,14 @@ This is the contract between the server (`server/`) and the Android client (`and
 ## Conventions
 - All binary values in JSON or headers use **base64url without padding** (`b64u`).
 - JSON uses camelCase. Errors are JSON `{ "error": "<code>" }` with an appropriate HTTP status.
+- `429 rate_limited` errors also carry `"scope"`: which limit was hit, so the client knows how to react.
+
+  | scope | Limited subject | Client reaction |
+  |---|---|---|
+  | `ip` | this client's IPv4 /32 or IPv6 /64 | On `POST /v1/messages` only: solve a PoW and retry once with `GF-PoW`. Elsewhere, wait `Retry-After`. |
+  | `network` | this client's IPv4 /24 or IPv6 /48 | Wait `Retry-After`. |
+  | `mailbox` | the target mailbox (protects the recipient) | Wait `Retry-After`. PoW does **not** help. |
+  | `global` | the whole server | Wait `Retry-After`. |
 - `‖` means concatenation. String literals are UTF-8 bytes with no terminator.
 - `SHA256`, `HMAC-SHA256` and `HKDF-SHA256` follow RFC 6234, RFC 2104 and RFC 5869.
 
@@ -98,8 +106,8 @@ No body. Response as above. Rate limited per IP.
   - `GF-Send-Token: b64u(sendSecret)`, required.
   - `GF-Idempotency-Key: b64u(16 B)`, optional but recommended. Duplicates within 24 h return the original `202`.
   - `GF-TTL: seconds`, optional. The default is `defaultTtlSeconds`, clamped to `[60, maxTtlSeconds]`.
-  - `GF-PoW: <challenge b64u>.<nonce b64u>`, optional. A solved `/v1/pow/challenge` that pays for this request if the **per-IP**
-    limit was hit (shared IPs, Tor). It doesn't bypass the per-mailbox limits.
+  - `GF-PoW: <challenge b64u>.<nonce b64u>`, optional. A solved `/v1/pow/challenge` that pays for this request after a
+    `429` with `"scope": "ip"` (shared IPs, Tor). It doesn't bypass any other scope.
 - Responses: `202 { "id": b64u(16 B) }`, `404 not_found` (unknown, expired or deleted mailbox), `413 too_large`,
   `415 unsupported_media_type`, `429 rate_limited` (with `Retry-After`), and `507 mailbox_full` (with `Retry-After`).
   `507` means the recipient's device has been unreachable long enough that the server holds its maximum number of undelivered

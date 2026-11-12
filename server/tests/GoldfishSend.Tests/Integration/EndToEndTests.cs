@@ -190,6 +190,14 @@ public sealed class EndToEndTests {
     }
 
     [IntegrationFact]
+    public async Task NonRateLimitErrors_CarryNoScope() {
+        var response = await _f.SendAsync(RandomNumberGenerator.GetBytes(32), [1]);
+        var error = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("not_found", error.GetProperty("error").GetString());
+        Assert.False(error.TryGetProperty("scope", out _));
+    }
+
+    [IntegrationFact]
     public async Task Send_ValidatesInput() {
         var mailbox = await _f.CreateActiveMailboxAsync();
         Assert.Equal(HttpStatusCode.NotFound, (await _f.SendAsync(RandomNumberGenerator.GetBytes(32), [1])).StatusCode);
@@ -210,6 +218,10 @@ public sealed class EndToEndTests {
         }
         Assert.NotNull(limited);
         Assert.NotNull(limited!.Headers.RetryAfter);
+        var error = await limited.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("rate_limited", error.GetProperty("error").GetString());
+        // "mailbox" tells the client a proof of work won't help, so it backs off instead.
+        Assert.Equal("mailbox", error.GetProperty("scope").GetString());
     }
 
     [IntegrationFact]
