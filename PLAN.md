@@ -375,7 +375,8 @@ signal_* (identity, prekeys, signed_prekeys, kyber_prekeys, sessions)
 6. The app is sleek and modern Material 3 with **dynamic colour** (Material You), light/dark/system and an AMOLED black option.
 7. **Security tab**: on-device audit with warnings, for example an outdated security patch, an end-of-life Android version, a Google (FCM) push distributor,
    no screen lock, developer options or USB debugging on, a likely root or unlocked bootloader, accessibility services that can read the screen,
-   a closed-source keyboard (e.g. Gboard; open-source ones and anything installed via F-Droid are trusted; known cloud keyboards are critical), missing StrongBox, an app lock that's off, notification previews that are on, unverified contacts, and a non-TLS server.
+   a closed-source keyboard (e.g. Gboard; open-source ones and anything installed via F-Droid are trusted; known cloud keyboards are critical), missing StrongBox, an app lock that's off, notification previews that are on, unverified contacts, a non-TLS server, a long auto-lock delay, notification-listener apps, and Private DNS off (a note only).
+   Findings with a legitimate justification can be dismissed. Those without one can't. The audit never requires extra permissions.
 8. Extra controls: **wipe messages on device restart** (detected through `BOOT_COMPLETED` *and* a `Settings.Global.BOOT_COUNT` check at
    start, so it can't be missed), plus an **inactivity wipe** (a dead man's switch).
 

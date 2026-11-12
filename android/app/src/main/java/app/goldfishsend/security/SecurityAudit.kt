@@ -6,19 +6,24 @@ import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
 import android.view.inputmethod.InputMethodManager
+import androidx.core.app.NotificationManagerCompat
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.NotificationContent
 import app.goldfishsend.push.PushHub
 import java.io.File
+import java.security.MessageDigest
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 
-enum class Severity(val weight: Int) { CRITICAL(25), WARNING(10), INFO(2), OK(0) }
+/** [NOTE] is advice with no score penalty: there are legitimate reasons to ignore it. */
+enum class Severity(val weight: Int) { CRITICAL(25), WARNING(10), INFO(2), NOTE(0), OK(0) }
 
 /** One-tap fixes the app can apply itself, or system screens it can open. */
 enum class Fix {
@@ -28,6 +33,9 @@ enum class Fix {
     ACCESSIBILITY_SETTINGS,
     INPUT_METHOD_SETTINGS,
     GET_OPEN_SOURCE_KEYBOARD,
+    DISPLAY_SETTINGS,
+    PRIVATE_DNS_SETTINGS,
+    NOTIFICATION_ACCESS_SETTINGS,
     BATTERY_SETTINGS,
     SET_PASSPHRASE,
     ENABLE_SCREENSHOT_BLOCK,
@@ -45,15 +53,39 @@ data class Finding(
     val detail: String,
     val fix: Fix? = null,
     val fixLabel: String? = null,
-)
+) {
+    val dismissible: Boolean
+        get() = AuditRules.isDismissible(id, severity)
 
-data class AuditReport(val findings: List<Finding>) {
-    val score: Int = (100 - findings.sumOf { it.severity.weight }).coerceIn(0, 100)
+    /**
+     * Identifies this exact finding. A dismissal covers only what the user saw: if the situation changes (another
+     * keyboard, more notification-reading apps, a longer lock delay, a worse severity), the text changes and the finding comes back.
+     */
+    val dismissKey: String
+        get() = "$id:" + MessageDigest.getInstance("SHA-256")
+            .digest("$severity\u0000$title\u0000$detail".toByteArray())
+            .take(8).joinToString("") { "%02x".format(it) }
+}
+
+/**
+ * @param findings everything the audit found.
+ * @param dismissedKeys the user's dismissals. Only findings that are [Finding.dismissible] honour them.
+ */
+data class AuditReport(private val findings: List<Finding>, private val dismissedKeys: Set<String> = emptySet()) {
+    private fun isDismissed(f: Finding) = f.dismissible && f.dismissKey in dismissedKeys
+
+    /** The findings that count: everything except the ones the user dismissed. */
+    val active: List<Finding> = findings.filterNot(::isDismissed)
+
+    /** Hidden by the user, but still listed so they can be restored. */
+    val dismissed: List<Finding> = findings.filter(::isDismissed)
+
+    val score: Int = (100 - active.sumOf { it.severity.weight }).coerceIn(0, 100)
 
     val headline: String
         get() = when {
-            findings.any { it.severity == Severity.CRITICAL } -> "At risk"
-            findings.any { it.severity == Severity.WARNING } -> "Needs attention"
+            active.any { it.severity == Severity.CRITICAL } -> "At risk"
+            active.any { it.severity == Severity.WARNING } -> "Needs attention"
             else -> "Looking good"
         }
 }
@@ -160,6 +192,11 @@ object SecurityAudit {
             Finding("screenlock", Severity.OK, "Screen lock is on", "Your device storage key is protected by your lock screen.")
         }
 
+        // --- Auto-lock delay ---
+        if (km.isDeviceSecure) {
+            lockTimeoutFinding(ctx)?.let { out += it }
+        }
+
         // --- Storage encryption ---
         val dpm = ctx.getSystemService(DevicePolicyManager::class.java)
         val enc = dpm.storageEncryptionStatus
@@ -223,6 +260,12 @@ object SecurityAudit {
         // --- Keyboard ---
         out += keyboardFindings(ctx)
 
+        // --- Apps that can read notifications ---
+        notificationListenerFinding(ctx, prefs.notificationContent != NotificationContent.NONE)?.let { out += it }
+
+        // --- Private DNS ---
+        privateDnsFinding(ctx)?.let { out += it }
+
         // --- Hardware key storage ---
         val strongBox = ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
         out += if (strongBox && Graph.vault.usesStrongBox) {
@@ -282,7 +325,7 @@ object SecurityAudit {
                 "Your server address doesn't use HTTPS. Message contents stay end-to-end encrypted, but metadata is exposed.",
             )
         }
-        return AuditReport(out.sortedBy { it.severity.ordinal })
+        return AuditReport(out.sortedBy { it.severity.ordinal }, prefs.dismissedFindings)
     }
 
     private fun getprop(name: String): String? = try {
@@ -327,7 +370,10 @@ object SecurityAudit {
                 )
                 KeyboardTrust.Verdict.CLOSED_SOURCE_CLOUD -> Finding(
                     "ime", Severity.CRITICAL, "Your keyboard sends what you type: $name",
-                    listOfNotNull(r.note, "Your messages pass through it before they're encrypted.", KeyboardTrust.ALTERNATIVES).joinToString(" "),
+                    listOfNotNull(
+                        r.note, "Your messages pass through it before they're encrypted.",
+                        KeyboardTrust.CJK_ALTERNATIVES, KeyboardTrust.ALTERNATIVES,
+                    ).joinToString(" "),
                     Fix.GET_OPEN_SOURCE_KEYBOARD, "Get an open-source keyboard",
                 )
                 KeyboardTrust.Verdict.CLOSED_SOURCE -> Finding(
@@ -367,6 +413,92 @@ object SecurityAudit {
         }
         return findings
     }
+
+    private fun lockTimeoutFinding(ctx: Context): Finding? {
+        val cr = ctx.contentResolver
+        val screenOff = runCatching { Settings.System.getLong(cr, Settings.System.SCREEN_OFF_TIMEOUT) }.getOrNull() ?: return null
+        // A hidden setting: readable on some builds, refused on others. When it's unknown, judge by the screen timeout alone.
+        val lockAfter = runCatching { Settings.Secure.getLong(cr, "lock_screen_lock_after_timeout") }.getOrNull()
+        val severity = AuditRules.lockTimeoutSeverity(screenOff, lockAfter) ?: return null
+        val total = if (screenOff >= Int.MAX_VALUE) screenOff else screenOff + (lockAfter ?: 0L)
+        val detail = if (screenOff >= Int.MAX_VALUE) {
+            "Your screen never turns off by itself, so an unattended phone stays unlocked with your chats open."
+        } else {
+            "Your phone stays unlocked for ${if (lockAfter == null) "at least " else ""}${AuditRules.describeDuration(total)} " +
+                "after you stop using it. Anyone who picks it up in that time can read your chats. A minute or less is safer."
+        }
+        return Finding("autolock", severity, "Your phone takes a long time to lock", detail, Fix.DISPLAY_SETTINGS, "Screen timeout")
+    }
+
+    /**
+     * Notification listeners can read every notification. With previews hidden (the default), GoldfishSend's
+     * notifications carry nothing, so this is info. With previews on, those apps can read names and message text.
+     */
+    private fun notificationListenerFinding(ctx: Context, previewsOn: Boolean): Finding? {
+        val apps = NotificationManagerCompat.getEnabledListenerPackages(ctx)
+            .filter { it != ctx.packageName && !isSystemApp(ctx.packageManager, it) }
+            .map { appLabel(ctx.packageManager, it) }
+            .sorted()
+        if (apps.isEmpty()) {
+            return null
+        }
+        val who = apps.joinToString()
+        return if (previewsOn) {
+            Finding(
+                "notif-listeners", Severity.WARNING, "Apps can read your message previews",
+                "$who can read all notifications, and yours currently show names or messages. Hide notification details, " +
+                    "or remove notification access from apps that don't need it.",
+                Fix.HIDE_NOTIFICATION_CONTENT, "Hide details",
+            )
+        } else {
+            Finding(
+                "notif-listeners", Severity.INFO, "Apps can read notifications",
+                "$who can read every notification on your phone. GoldfishSend's notifications contain no names or messages, " +
+                    "so this only matters for other apps.",
+                Fix.NOTIFICATION_ACCESS_SETTINGS, "Review",
+            )
+        }
+    }
+
+    /**
+     * Private DNS is only a note (no score penalty). It hides lookups from the local network and ISP, but it
+     * conflicts with some legitimate setups (Tailscale MagicDNS, split-horizon or corporate DNS), so turning it off
+     * is a reasonable choice.
+     */
+    private fun privateDnsFinding(ctx: Context): Finding? {
+        // Uses ACCESS_NETWORK_STATE, which the app already has through WorkManager. No extra permission is added for
+        // the audit, and the check is skipped if the permission ever goes away.
+        val cm = ctx.getSystemService(ConnectivityManager::class.java)
+        val (link, vpn) = runCatching {
+            val network = cm.activeNetwork ?: return null
+            val props = cm.getLinkProperties(network) ?: return null
+            props to (cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true)
+        }.getOrNull() ?: return null
+        return when (AuditRules.dnsState(link.isPrivateDnsActive, vpn)) {
+            AuditRules.DnsState.PRIVATE_DNS_ACTIVE -> Finding(
+                "dns", Severity.OK, "Private DNS is on",
+                "DNS lookups are encrypted${link.privateDnsServerName?.let { " via $it" } ?: ""}.",
+            )
+            AuditRules.DnsState.THROUGH_VPN -> Finding(
+                "dns", Severity.OK, "DNS goes through your VPN", "Your VPN handles DNS lookups.",
+            )
+            AuditRules.DnsState.PLAIN -> Finding(
+                "dns", Severity.NOTE, "Private DNS is off",
+                "Your network provider can see which servers your phone looks up, including your GoldfishSend server (never " +
+                    "message contents or contacts). Private DNS encrypts lookups. It's fine to leave it off if it breaks something " +
+                    "you rely on, such as Tailscale MagicDNS or local network names.",
+                Fix.PRIVATE_DNS_SETTINGS, "Network settings",
+            )
+        }
+    }
+
+    private fun isSystemApp(pm: PackageManager, pkg: String): Boolean = runCatching {
+        pm.getApplicationInfo(pkg, 0).flags and ApplicationInfo.FLAG_SYSTEM != 0
+    }.getOrDefault(false)
+
+    private fun appLabel(pm: PackageManager, pkg: String): String = runCatching {
+        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+    }.getOrDefault(pkg)
 
     private fun installerOf(pm: PackageManager, pkg: String): String? = runCatching {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

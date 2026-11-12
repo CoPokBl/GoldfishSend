@@ -31,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
@@ -69,6 +70,7 @@ private fun severityColor(s: Severity): Color = when (s) {
     Severity.CRITICAL -> MaterialTheme.colorScheme.error
     Severity.WARNING -> Amber
     Severity.INFO -> MaterialTheme.colorScheme.primary
+    Severity.NOTE -> MaterialTheme.colorScheme.onSurfaceVariant
     Severity.OK -> Green
 }
 
@@ -80,6 +82,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
     val dbVersion by s.db.changes.collectAsState()
     var resumes by remember { mutableIntStateOf(0) }
     var pushPicker by remember { mutableStateOf(false) }
+    var showDismissed by remember { mutableStateOf(false) }
     LifecycleResumeEffect(Unit) {
         resumes++
         onPauseOrDispose { }
@@ -103,6 +106,10 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
             Fix.DEVELOPER_SETTINGS -> open(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
             Fix.ACCESSIBILITY_SETTINGS -> open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             Fix.INPUT_METHOD_SETTINGS -> open(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+            Fix.DISPLAY_SETTINGS -> open(Intent(Settings.ACTION_DISPLAY_SETTINGS))
+            // There's no public intent for the Private DNS page. It lives under network settings.
+            Fix.PRIVATE_DNS_SETTINGS -> open(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+            Fix.NOTIFICATION_ACCESS_SETTINGS -> open(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
             Fix.GET_OPEN_SOURCE_KEYBOARD -> open(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(KeyboardTrust.SUGGESTED_KEYBOARD_URL)))
             Fix.BATTERY_SETTINGS -> open(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             Fix.SET_PASSPHRASE -> openPassphrase()
@@ -125,8 +132,8 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
             return@Scaffold
         }
-        val issues = r.findings.filter { it.severity != Severity.OK }
-        val good = r.findings.filter { it.severity == Severity.OK }
+        val issues = r.active.filter { it.severity != Severity.OK }
+        val good = r.active.filter { it.severity == Severity.OK }
         LazyColumn(
             Modifier.padding(top = pad.calculateTopPadding()).fillMaxSize(),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
@@ -135,11 +142,29 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
             item { ScoreCard(r, issues.size) }
             if (issues.isNotEmpty()) {
                 item { Label("Recommendations") }
-                items(issues, key = { it.id }) { f -> FindingCard(f) { f.fix?.let(::apply) } }
+                items(issues, key = { it.dismissKey }) { f ->
+                    FindingCard(
+                        f,
+                        onFix = { f.fix?.let(::apply) },
+                        onDismiss = if (f.dismissible) ({ Graph.prefs.dismissFinding(f.dismissKey) }) else null,
+                    )
+                }
             }
             if (good.isNotEmpty()) {
                 item { Label("All good") }
-                items(good, key = { it.id }) { f -> FindingCard(f, null) }
+                items(good, key = { it.dismissKey }) { f -> FindingCard(f) }
+            }
+            if (r.dismissed.isNotEmpty()) {
+                item {
+                    TextButton(onClick = { showDismissed = !showDismissed }, modifier = Modifier.padding(top = 4.dp)) {
+                        Text(if (showDismissed) "Hide dismissed (${r.dismissed.size})" else "Show dismissed (${r.dismissed.size})")
+                    }
+                }
+                if (showDismissed) {
+                    items(r.dismissed, key = { "d:" + it.dismissKey }) { f ->
+                        FindingCard(f, onRestore = { Graph.prefs.restoreFinding(f.dismissKey) })
+                    }
+                }
             }
             item {
                 Text(
@@ -169,8 +194,8 @@ private fun Label(text: String) {
 @Composable
 private fun ScoreCard(r: AuditReport, issues: Int) {
     val color = when {
-        r.findings.any { it.severity == Severity.CRITICAL } -> MaterialTheme.colorScheme.error
-        r.findings.any { it.severity == Severity.WARNING } -> Amber
+        r.active.any { it.severity == Severity.CRITICAL } -> MaterialTheme.colorScheme.error
+        r.active.any { it.severity == Severity.WARNING } -> Amber
         else -> Green
     }
     Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.fillMaxWidth()) {
@@ -189,7 +214,12 @@ private fun ScoreCard(r: AuditReport, issues: Int) {
             Column {
                 Text(r.headline, style = MaterialTheme.typography.titleLarge)
                 Text(
-                    if (issues == 0) "Nothing needs your attention." else "$issues thing${if (issues == 1) "" else "s"} you can improve",
+                    buildString {
+                        append(if (issues == 0) "Nothing needs your attention." else "$issues thing${if (issues == 1) "" else "s"} you can improve")
+                        if (r.dismissed.isNotEmpty()) {
+                            append(" · ${r.dismissed.size} dismissed")
+                        }
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -199,11 +229,16 @@ private fun ScoreCard(r: AuditReport, issues: Int) {
 }
 
 @Composable
-private fun FindingCard(f: Finding, onFix: (() -> Unit)?) {
+private fun FindingCard(
+    f: Finding,
+    onFix: (() -> Unit)? = null,
+    onDismiss: (() -> Unit)? = null,
+    onRestore: (() -> Unit)? = null,
+) {
     val icon = when (f.severity) {
         Severity.CRITICAL -> Icons.Rounded.Error
         Severity.WARNING -> Icons.Rounded.Warning
-        Severity.INFO -> Icons.Rounded.Info
+        Severity.INFO, Severity.NOTE -> Icons.Rounded.Info
         Severity.OK -> Icons.Rounded.CheckCircle
     }
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
@@ -214,9 +249,28 @@ private fun FindingCard(f: Finding, onFix: (() -> Unit)?) {
                 Text(f.title, style = MaterialTheme.typography.titleSmall)
                 Spacer(Modifier.height(2.dp))
                 Text(f.detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (onFix != null && f.fix != null) {
+                val showFix = onFix != null && f.fix != null
+                if (showFix || onDismiss != null || onRestore != null) {
                     Spacer(Modifier.height(10.dp))
-                    FilledTonalButton(onClick = onFix) { Text(f.fixLabel ?: "Fix") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (showFix) {
+                            FilledTonalButton(onClick = onFix!!) { Text(f.fixLabel ?: "Fix") }
+                        }
+                        if (onDismiss != null) {
+                            TextButton(onClick = onDismiss) { Text("Dismiss") }
+                        }
+                        if (onRestore != null) {
+                            TextButton(onClick = onRestore) { Text("Restore") }
+                        }
+                    }
+                }
+                if (onRestore == null && f.severity != Severity.OK && !f.dismissible) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "This can't be dismissed: there's no safe reason to leave it as it is.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }

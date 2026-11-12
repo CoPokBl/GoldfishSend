@@ -47,10 +47,11 @@ import app.goldfishsend.ui.components.biometricAvailable
 import app.goldfishsend.ui.components.promptBiometric
 import android.view.inputmethod.EditorInfo
 import kotlinx.coroutines.launch
+import androidx.activity.compose.LocalActivity
 
 @Composable
 fun LockScreen() {
-    val activity = LocalContext.current as FragmentActivity
+    val activity = LocalActivity.current as FragmentActivity
     val scope = rememberCoroutineScope()
     var pass by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }

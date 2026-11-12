@@ -78,7 +78,11 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 - Notifications reveal nothing by default (`VISIBILITY_SECRET`).
 - No backups or device transfer.
 
-**Security tab**: an on-device audit covering patch age, Android end of life, a Google/FCM push distributor, screen lock, encryption, ADB and developer options, root or bootloader state, accessibility services, the keyboard (closed-source keyboards such as Gboard or SwiftKey are a warning and known cloud keyboards such as Sogou, Baidu or Grammarly are critical; known open-source keyboards and anything installed by an F-Droid client are trusted, see `security/KeyboardTrust.kt`), StrongBox, and app settings. Each item has a one-tap **Fix** where possible.
+**Security tab**: an on-device audit covering patch age, Android end of life, a Google/FCM push distributor, screen lock, encryption, ADB and developer options, root or bootloader state, accessibility services, the keyboard (closed-source keyboards such as Gboard or SwiftKey are a warning and known cloud keyboards such as Sogou, Baidu or Grammarly are critical; known open-source keyboards and anything installed by an F-Droid client are trusted, see `security/KeyboardTrust.kt`), StrongBox, the auto-lock delay (screen timeout plus lock delay: info over 2 min, warning over 5 min or "never"), apps with notification access (a warning if previews are on), Private DNS (a zero-penalty note, since Tailscale MagicDNS and similar setups are good reasons to leave it off; skipped when a VPN handles DNS), and app settings. Each item has a one-tap **Fix** where possible.
+
+Findings can be **dismissed** if there's a legitimate reason to leave them as they are, for example root, an unlocked bootloader, accessibility services, USB debugging, a Google push service or a closed-source keyboard a language needs. Dismissed findings stop counting toward the score, and a Restore option keeps them visible. They come back if the situation changes. Findings with no safe justification can't be dismissed: no screen lock, a non-HTTPS server, unencrypted storage, push not working, a cloud keyboard, patches over 180 days old, and an unsupported Android version (`security/AuditRules.kt`).
+
+The audit adds **no extra permissions**. Checks that would need one, such as listing apps that can draw over other apps (which needs `QUERY_ALL_PACKAGES`), are deliberately left out.
 
 ## Known gaps / TODO
 - **No group chats or attachments.** Multi-device isn't supported either.

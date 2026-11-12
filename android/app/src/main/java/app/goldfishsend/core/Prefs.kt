@@ -148,6 +148,22 @@ class Prefs(context: Context) {
         get() = str("push_host")
         set(v) = setStr("push_host", v)
 
+    /** Dismiss keys of Security-tab findings the user chose to hide (see Finding.dismissKey). */
+    val dismissedFindings: Set<String>
+        get() = sp.getStringSet("dismissed_findings", null)?.toSet() ?: emptySet()
+
+    fun dismissFinding(key: String) {
+        // Bounded: stale keys from situations that no longer exist are harmless but shouldn't pile up forever.
+        val next = (dismissedFindings + key).toList().takeLast(200).toSet()
+        sp.edit().putStringSet("dismissed_findings", next).apply()
+        changed()
+    }
+
+    fun restoreFinding(key: String) {
+        sp.edit().putStringSet("dismissed_findings", dismissedFindings - key).apply()
+        changed()
+    }
+
     fun clear() {
         sp.edit().clear().commit()
         changed()

@@ -59,6 +59,9 @@ object KeyboardTrust {
         "inc.flide.vi8" to Known("8VIM", Verdict.OPEN_SOURCE),
         "org.pocketworkstation.pckeyboard" to Known("Hacker's Keyboard", Verdict.OPEN_SOURCE),
         "org.smc.inputmethod.indic" to Known("Indic Keyboard", Verdict.OPEN_SOURCE),
+        // Open-source input methods for Chinese, Japanese and Korean, the usual reason people need a cloud keyboard.
+        "org.fcitx.fcitx5.android" to Known("Fcitx5", Verdict.OPEN_SOURCE),
+        "com.osfans.trime" to Known("Trime (Rime)", Verdict.OPEN_SOURCE),
         "keepass2android.keepass2android" to Known("Keepass2Android keyboard", Verdict.OPEN_SOURCE),
         "keepass2android.keepass2android_nonet" to Known("Keepass2Android Offline keyboard", Verdict.OPEN_SOURCE),
 
@@ -134,6 +137,9 @@ object KeyboardTrust {
 
     /** A short suggestion naming open-source alternatives, shown on warnings. */
     const val ALTERNATIVES = "Open-source options include HeliBoard, FlorisBoard and AnySoftKeyboard, all on F-Droid."
+
+    /** For cloud keyboards, usually installed for CJK input. These open-source input methods cover it, offline. */
+    const val CJK_ALTERNATIVES = "For Chinese, Japanese or Korean input, Fcitx5 and Trime (Rime) are open source and work offline, both on F-Droid."
 
     /** Where the "get an open-source keyboard" fix sends the user. */
     const val SUGGESTED_KEYBOARD_URL = "https://f-droid.org/packages/helium314.keyboard/"
