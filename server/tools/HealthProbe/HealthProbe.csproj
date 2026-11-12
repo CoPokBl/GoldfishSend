@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    A tiny HTTP probe for container healthchecks. The runtime image is distroless (chiseled):
+    it has no shell, curl or wget, so the healthcheck runs this with the bundled `dotnet` host.
+    It is deliberately not part of GoldfishSend.slnx; only the Dockerfile builds it.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>HealthProbe</AssemblyName>
+    <RootNamespace>HealthProbe</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <UseAppHost>false</UseAppHost>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+</Project>

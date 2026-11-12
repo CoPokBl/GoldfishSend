@@ -1,0 +1,33 @@
+# --- Deployment secrets -----------------------------------------------------------------------------
+deploy/.env
+deploy/goldfish.env
+deploy/secrets/
+*.pem
+*.key
+
+# --- .NET -------------------------------------------------------------------------------------------
+**/bin/
+**/obj/
+**/TestResults/
+*.user
+*.suo
+.vs/
+**/appsettings.*.local.json
+
+# --- Android ----------------------------------------------------------------------------------------
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.kotlin/
+android/captures/
+*.keystore
+*.jks
+*.apk
+*.aab
+
+# --- Editors / OS -----------------------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store

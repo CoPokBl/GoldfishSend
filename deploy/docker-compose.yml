@@ -1,0 +1,270 @@
+# GoldfishSend production stack.
+#
+#   cd deploy
+#   cp .env.example .env                  # domain + database/redis passwords (compose interpolation)
+#   cp goldfish.env.example goldfish.env  # server keys (api + worker only)
+#   chmod 600 .env goldfish.env
+#   docker compose up -d --build          # or: podman compose up -d --build
+#
+# See server/README.md for key generation, backups and operations.
+#
+# Scaling out: every process is stateless and coordinates through MySQL and Redis, so
+#   docker compose up -d --scale api=3 --scale worker=4
+# works as-is. Caddy discovers api replicas through DNS. Workers share one Redis consumer group, so each
+# message goes to one worker, and they claim held messages with SKIP LOCKED. Across hosts, run the same
+# images against shared MySQL and both Redis instances.
+#
+# Networks
+#   public    caddy + api. Not internal: caddy publishes 80/443 and reaches Let's Encrypt; the api uses
+#             it for outbound verification pushes (POST /v1/mailboxes sends one synchronously).
+#             The subnet is fixed so the api can trust X-Forwarded-For from it and nothing else.
+#   internal  internal: true (no route to the outside world). api, worker, mysql, redis.
+#             mysql and redis live only here.
+#   egress    worker only. Gives the worker outbound internet to reach push servers (ntfy, FCM
+#             distributors, ...) without putting it on the network caddy faces. Outbound requests are
+#             SSRF-filtered in the app (private, loopback, link-local, metadata ranges are refused).
+#
+# Secrets
+#   Option A (default): deploy/goldfish.env, loaded with env_file into api and worker.
+#   Option B: Docker secrets. Put the JSON printed by `keygen` in deploy/secrets/goldfish.json and
+#   uncomment the `secrets:` blocks below. It is mounted as /app/appsettings.Production.json, which
+#   ASP.NET Core loads automatically. Environment variables still win over it, so remove the
+#   Goldfish__Keys__* lines from goldfish.env if you switch. See server/README.md.
+
+name: goldfish
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Shared environment for api and worker. Passwords come from deploy/.env via interpolation.
+x-goldfish-env: &goldfish-env
+  ConnectionStrings__MySql: "Server=mysql;Port=3306;Database=goldfish;User ID=goldfish;Password=${MYSQL_PASSWORD:?set MYSQL_PASSWORD in deploy/.env};SslMode=Required"
+  # $$CONFIG= tells StackExchange.Redis that CONFIG is disabled on the server (see redis.conf).
+  ConnectionStrings__Redis: "redis:6379,user=goldfish,password=${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env},abortConnect=false,$$CONFIG="
+  # Rate limits, PoW and circuit breakers live in a separate Redis that never writes to disk (see redis-ephemeral.conf).
+  ConnectionStrings__RedisEphemeral: "redis-ephemeral:6379,user=goldfish,password=${REDIS_EPHEMERAL_PASSWORD:?set REDIS_EPHEMERAL_PASSWORD in deploy/.env},abortConnect=false,$$CONFIG="
+  # Never accept this server's own name as a push endpoint (loop protection).
+  Goldfish__Push__BlockedHosts__0: "${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}"
+  # Defence in depth: no framework request/URL logging even if appsettings change.
+  Logging__LogLevel__Microsoft.AspNetCore: "Warning"
+  Logging__LogLevel__System.Net.Http: "Warning"
+
+x-goldfish-app: &goldfish-app
+  <<: *hardening
+  image: localhost/goldfishsend:latest
+  build:
+    context: ../server
+    dockerfile: Dockerfile
+  env_file:
+    - goldfish.env
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  ulimits:
+    # No core dumps: they would contain key material.
+    core: 0
+    nofile:
+      soft: 65536
+      hard: 65536
+  # Option B (Docker secrets), see the header:
+  # secrets:
+  #   - source: goldfish_keys
+  #     target: /app/appsettings.Production.json
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    redis-ephemeral:
+      condition: service_healthy
+
+services:
+  caddy:
+    <<: *hardening
+    image: caddy:2.10-alpine
+    # Runs as root inside the container only to bind 80/443; every capability except
+    # NET_BIND_SERVICE is dropped and the root filesystem is read-only.
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      GOLDFISH_DOMAIN: "${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # certificates and ACME account: back this up or re-issue on loss
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:size=8m
+    networks:
+      - public
+    depends_on:
+      - api
+
+  api:
+    <<: *goldfish-app
+    environment:
+      <<: *goldfish-env
+      Goldfish__Roles: "api"
+      # Trust X-Forwarded-For only from the public network, where the only other member is caddy.
+      # (Docker's bridge gateway, i.e. the host itself, is also in this range; the api port is not
+      # published, so only caddy and the host can reach it.)
+      Goldfish__Network__TrustedProxies__0: "${GOLDFISH_PUBLIC_SUBNET:-172.30.250.0/24}"
+    networks:
+      - public
+      - internal
+    healthcheck:
+      test: ["CMD", "dotnet", "/app/probe/HealthProbe.dll", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    <<: *goldfish-app
+    environment:
+      <<: *goldfish-env
+      Goldfish__Roles: "worker"
+    networks:
+      - internal
+      - egress
+    # A worker-only process maps /healthz (liveness) but not /readyz.
+    healthcheck:
+      test: ["CMD", "dotnet", "/app/probe/HealthProbe.dll", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  mysql:
+    <<: *hardening
+    image: mysql:8.4
+    # The image's entrypoint works unprivileged when started as its own user, so no chown/setuid
+    # capabilities are needed.
+    user: mysql
+    read_only: true
+    command:
+      - --skip-log-bin
+      - --innodb-flush-log-at-trx-commit=1
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in deploy/.env}"
+      MYSQL_DATABASE: goldfish
+      MYSQL_USER: goldfish
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:?set MYSQL_PASSWORD in deploy/.env}"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/goldfish.cnf:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/run/mysqld:size=1m,mode=1777
+    networks:
+      - internal
+    healthcheck:
+      # mysqladmin ping exits 0 whenever the server answers, even with "access denied", so it needs
+      # no credentials. TCP (not the socket) so it stays unhealthy while the init-time temporary
+      # server (which has networking off) is running.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=TCP", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  redis:
+    <<: *hardening
+    image: redis:7.4-alpine
+    # Valkey works the same way: image valkey/valkey:8.1-alpine, user valkey, and replace
+    # redis-server/redis-cli with valkey-server/valkey-cli (mount the config wherever you point it).
+    user: redis
+    read_only: true
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env}"
+    # Redis can't read environment variables in its config, so build the ACL file in tmpfs at start
+    # (printf is a shell builtin: the password never appears in a process argument list).
+    command:
+      - sh
+      - -c
+      - |
+        umask 077
+        printf 'user default off\nuser goldfish on >%s ~* &* +@all -@dangerous +info +bgrewriteaof\nuser healthcheck on >healthcheck -@all +ping\n' "$$REDIS_PASSWORD" > /tmp/users.acl
+        exec redis-server /usr/local/etc/redis/redis.conf --aclfile /tmp/users.acl
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+    tmpfs:
+      - /tmp:size=1m,mode=1777
+    networks:
+      - internal
+    healthcheck:
+      # The "healthcheck" ACL user can only PING; its password is intentionally not a secret.
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning --user healthcheck --pass healthcheck ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Non-persistent: no volume, AOF and RDB off. Restarting it only resets rate limits.
+  redis-ephemeral:
+    <<: *hardening
+    image: redis:7.4-alpine
+    user: redis
+    read_only: true
+    environment:
+      REDIS_PASSWORD: "${REDIS_EPHEMERAL_PASSWORD:?set REDIS_EPHEMERAL_PASSWORD in deploy/.env}"
+    command:
+      - sh
+      - -c
+      - |
+        umask 077
+        printf 'user default off\nuser goldfish on >%s ~* &* +@all -@dangerous +info\nuser healthcheck on >healthcheck -@all +ping\n' "$$REDIS_PASSWORD" > /tmp/users.acl
+        exec redis-server /usr/local/etc/redis/redis.conf --aclfile /tmp/users.acl
+    volumes:
+      - ./redis-ephemeral.conf:/usr/local/etc/redis/redis.conf:ro
+    tmpfs:
+      - /tmp:size=1m,mode=1777
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning --user healthcheck --pass healthcheck ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  public:
+    driver: bridge
+    ipam:
+      config:
+        # Change via GOLDFISH_PUBLIC_SUBNET in deploy/.env if it collides with an existing network.
+        # The same value feeds Goldfish__Network__TrustedProxies above.
+        - subnet: "${GOLDFISH_PUBLIC_SUBNET:-172.30.250.0/24}"
+  internal:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+  mysql_data:
+  redis_data:
+
+# Option B (Docker secrets), see the header. Make the file readable by UID 1654 (the image's `app`
+# user), e.g. `sudo chown root:1654 secrets/goldfish.json && sudo chmod 0640 secrets/goldfish.json`
+# (rootless podman: `podman unshare chown 1654:1654 secrets/goldfish.json`).
+# secrets:
+#   goldfish_keys:
+#     file: ./secrets/goldfish.json

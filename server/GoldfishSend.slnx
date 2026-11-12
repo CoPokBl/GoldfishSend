@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GoldfishSend.Api/GoldfishSend.Api.csproj" />
+    <Project Path="src/GoldfishSend.Core/GoldfishSend.Core.csproj" />
+    <Project Path="src/GoldfishSend.Infrastructure/GoldfishSend.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GoldfishSend.Tests/GoldfishSend.Tests.csproj" />
+  </Folder>
+</Solution>

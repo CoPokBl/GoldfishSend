@@ -1,0 +1,18 @@
+# Build context is server/. Only Directory.Build.props, src/ and tools/ are needed.
+**/bin/
+**/obj/
+**/TestResults/
+**/*.user
+**/*.swp
+**/.vs/
+**/.vscode/
+**/.idea/
+tests/
+*.md
+Dockerfile
+.dockerignore
+**/appsettings.Development.json
+**/appsettings.*.local.json
+**/secrets/
+**/*.env
+**/.env

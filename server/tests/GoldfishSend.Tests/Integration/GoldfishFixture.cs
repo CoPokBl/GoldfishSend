@@ -1,0 +1,196 @@
+using System.Buffers.Text;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text.Json;
+using GoldfishSend.Core.Crypto;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using MySqlConnector;
+using StackExchange.Redis;
+
+namespace GoldfishSend.Tests.Integration;
+
+/// <summary>
+/// Runs only when GF_TEST_MYSQL and GF_TEST_REDIS point at disposable instances. The fixture wipes them.
+/// Example: <c>GF_TEST_MYSQL="Server=127.0.0.1;Port=33306;User=root;Password=test;Database=goldfish"</c>
+/// and <c>GF_TEST_REDIS="127.0.0.1:36379"</c>.
+/// </summary>
+public sealed class IntegrationFactAttribute : FactAttribute {
+    public IntegrationFactAttribute() {
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GF_TEST_MYSQL"))
+            || string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GF_TEST_REDIS"))) {
+            Skip = "Set GF_TEST_MYSQL and GF_TEST_REDIS to run integration tests.";
+        }
+    }
+}
+
+[CollectionDefinition(Name)]
+public sealed class GoldfishCollection : ICollectionFixture<GoldfishFixture> {
+    public const string Name = "goldfish";
+}
+
+public sealed class GoldfishFixture : IAsyncLifetime {
+    private WebApplicationFactory<Program>? _factory;
+
+    public FakePushServer Push { get; } = new();
+    public HttpClient Client { get; private set; } = null!;
+    public string MySql { get; } = Environment.GetEnvironmentVariable("GF_TEST_MYSQL") ?? "";
+    public string Redis { get; } = Environment.GetEnvironmentVariable("GF_TEST_REDIS") ?? "";
+    public IServiceProvider Services => _factory!.Services;
+
+    public async Task InitializeAsync() {
+        if (MySql.Length == 0 || Redis.Length == 0) {
+            return;
+        }
+
+        await using (var conn = new MySqlConnection(MySql)) {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DROP TABLE IF EXISTS pending_messages, mailboxes, epoch_keys, schema_migrations";
+            await cmd.ExecuteNonQueryAsync();
+        }
+        await using (var mux = await ConnectionMultiplexer.ConnectAsync(Redis + ",allowAdmin=true")) {
+            await mux.GetServers()[0].FlushAllDatabasesAsync();
+        }
+
+        await Push.StartAsync();
+
+        string Key() => Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(32));
+        var settings = new Dictionary<string, string> {
+            ["ConnectionStrings__MySql"] = MySql,
+            ["ConnectionStrings__Redis"] = Redis,
+            // A separate logical database stands in for the non-persistent ephemeral Redis.
+            ["ConnectionStrings__RedisEphemeral"] = Redis + ",defaultDatabase=1",
+            ["Goldfish__Keys__Pepper"] = Key(),
+            ["Goldfish__Keys__SealSalt"] = Key(),
+            ["Goldfish__Keys__EpochKek"] = Key(),
+            ["Goldfish__Keys__VapidPrivateKey"] = Base64Url.EncodeToString(VapidSigner.GeneratePrivateKey()),
+            ["Goldfish__Keys__VapidSubject"] = "mailto:test@example.com",
+            ["Goldfish__Push__DangerouslyAllowInsecureLoopback"] = "true",
+            ["Goldfish__Pow__BaseDifficulty"] = "8",
+            ["Goldfish__Messages__MaxHeldPerMailbox"] = "3",
+            ["Goldfish__RateLimits__create-net__Limit"] = "100000",
+            ["Goldfish__RateLimits__pow-net__Limit"] = "100000",
+            ["Goldfish__RateLimits__push-host__Limit"] = "100000",
+            ["Goldfish__RateLimits__push-host__Burst"] = "100000",
+            // Everything comes from 127.0.0.1, so loosen per-IP limits. Per-mailbox limits keep their defaults so they can be tested.
+            ["Goldfish__RateLimits__send-ip__Limit"] = "100000",
+            ["Goldfish__RateLimits__send-ip__PeriodSeconds"] = "60",
+            ["Goldfish__RateLimits__send-ip__Burst"] = "100000",
+            ["Goldfish__RateLimits__create-ip__Limit"] = "100000",
+            ["Goldfish__RateLimits__create-ip__PeriodSeconds"] = "60",
+            ["Goldfish__RateLimits__create-ip__Burst"] = "100000",
+            ["Goldfish__RateLimits__owner-ip__Limit"] = "100000",
+            ["Goldfish__RateLimits__owner-ip__PeriodSeconds"] = "60",
+            ["Goldfish__RateLimits__owner-ip__Burst"] = "100000",
+            ["Goldfish__RateLimits__pow-ip__Limit"] = "100000",
+            ["Goldfish__RateLimits__pow-ip__PeriodSeconds"] = "60",
+            ["Goldfish__RateLimits__pow-ip__Burst"] = "100000",
+        };
+        // Program reads configuration before Build(), so pass settings through the environment.
+        foreach (var (key, value) in settings) {
+            Environment.SetEnvironmentVariable(key, value);
+        }
+
+        _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
+        Client = _factory.CreateClient();
+    }
+
+    public async Task DisposeAsync() {
+        Client?.Dispose();
+        if (_factory is not null) {
+            await _factory.DisposeAsync();
+        }
+        await Push.DisposeAsync();
+    }
+
+    // Client helpers that mirror what the Android app does.
+
+    public async Task<(byte[] Challenge, byte[] Nonce)> SolvePowAsync() {
+        var response = await Client.PostAsync("/v1/pow/challenge", null);
+        response.EnsureSuccessStatusCode();
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var challenge = Base64Url.DecodeFromChars(json.GetProperty("challenge").GetString());
+        var nonce = ProofOfWork.Solve(challenge, json.GetProperty("difficulty").GetInt32());
+        return (challenge, nonce);
+    }
+
+    public sealed record Mailbox(byte[] SendSecret, byte[] OwnerSecret, FakeDevice Device) {
+        public object Credential => new { sendSecret = B64(SendSecret), ownerSecret = B64(OwnerSecret) };
+        public byte[] Tag => MailboxCrypto.Tag(SendSecret);
+    }
+
+    public async Task<HttpResponseMessage> RequestMailboxAsync(byte[] sendSecret, byte[] ownerSecret, FakeDevice device, string? url = null) {
+        var (challenge, nonce) = await SolvePowAsync();
+        return await Client.PostAsJsonAsync("/v1/mailboxes", new {
+            pow = new { challenge = B64(challenge), nonce = B64(nonce) },
+            sendSecret = B64(sendSecret),
+            ownerHash = B64(MailboxCrypto.OwnerHash(ownerSecret)),
+            endpoint = url ?? device.Url,
+            p256dh = B64(device.P256dh),
+            auth = B64(device.Auth),
+        });
+    }
+
+    /// <summary>Creates and verifies a mailbox, consuming the verification push.</summary>
+    public async Task<Mailbox> CreateActiveMailboxAsync(FakeDevice? device = null) {
+        device ??= Push.NewDevice();
+        var mailbox = new Mailbox(RandomNumberGenerator.GetBytes(32), RandomNumberGenerator.GetBytes(32), device);
+        var response = await RequestMailboxAsync(mailbox.SendSecret, mailbox.OwnerSecret, device);
+        Assert.Equal(202, (int)response.StatusCode);
+
+        var (type, tag, code) = await device.NextAsync();
+        Assert.Equal(GoldfishSend.Core.Protocol.PushType.Verification, type);
+        Assert.Equal(mailbox.Tag, tag);
+
+        var verify = await VerifyAsync([mailbox], code);
+        Assert.Equal(200, (int)verify.StatusCode);
+        return mailbox;
+    }
+
+    public Task<HttpResponseMessage> VerifyAsync(IEnumerable<Mailbox> mailboxes, byte[] code) {
+        return Client.PostAsJsonAsync("/v1/mailboxes/verify", new {
+            items = mailboxes.Select(m => m.Credential).ToArray(),
+            code = B64(code),
+        });
+    }
+
+    public async Task<HttpResponseMessage> SendAsync(byte[] sendSecret, byte[] body, byte[]? idempotencyKey = null, int? ttl = null) {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/messages") {
+            Content = Octets(body),
+        };
+        request.Headers.Add("GF-Send-Token", B64(sendSecret));
+        if (idempotencyKey is not null) {
+            request.Headers.Add("GF-Idempotency-Key", B64(idempotencyKey));
+        }
+        if (ttl is not null) {
+            request.Headers.Add("GF-TTL", ttl.Value.ToString());
+        }
+        return await Client.SendAsync(request);
+    }
+
+    public async Task<long> ScalarAsync(string sql, object? param = null) {
+        await using var conn = new MySqlConnection(MySql);
+        await conn.OpenAsync();
+        return await Dapper.SqlMapper.ExecuteScalarAsync<long>(conn, sql, param);
+    }
+
+    public static string B64(byte[] value) => Base64Url.EncodeToString(value);
+
+    public static ByteArrayContent Octets(byte[] body) {
+        var content = new ByteArrayContent(body);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        return content;
+    }
+
+    public static async Task EventuallyAsync(Func<Task<bool>> condition, TimeSpan? timeout = null, string? because = null) {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+        while (DateTime.UtcNow < deadline) {
+            if (await condition()) {
+                return;
+            }
+            await Task.Delay(100);
+        }
+        Assert.Fail(because ?? "Condition was not met in time.");
+    }
+}

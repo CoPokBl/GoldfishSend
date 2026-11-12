@@ -1,0 +1,155 @@
+package app.goldfishsend.core
+
+import android.content.Context
+import app.goldfishsend.BuildConfig
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
+enum class NotificationContent { NONE, NAME, NAME_AND_MESSAGE }
+
+/**
+ * Non-secret app configuration, readable while the app is locked (lock settings, theme, wipe triggers).
+ * Secrets never go here. They live in the encrypted DB or the Keystore-wrapped vault.
+ */
+class Prefs(context: Context) {
+    private val sp = context.getSharedPreferences("gf_prefs", Context.MODE_PRIVATE)
+    private val _version = MutableStateFlow(0L)
+
+    /** Bumped on every change, so Compose can recompose. */
+    val version: StateFlow<Long> = _version
+
+    private fun changed() {
+        _version.value = _version.value + 1
+    }
+
+    private fun bool(key: String, def: Boolean) = sp.getBoolean(key, def)
+    private fun setBool(key: String, v: Boolean) {
+        sp.edit().putBoolean(key, v).apply()
+        changed()
+    }
+    private fun int(key: String, def: Int) = sp.getInt(key, def)
+    private fun setInt(key: String, v: Int) {
+        sp.edit().putInt(key, v).apply()
+        changed()
+    }
+    private fun long(key: String, def: Long) = sp.getLong(key, def)
+    private fun setLong(key: String, v: Long) {
+        sp.edit().putLong(key, v).apply()
+        changed()
+    }
+    private fun str(key: String): String? = sp.getString(key, null)
+    private fun setStr(key: String, v: String?) {
+        sp.edit().putString(key, v).apply()
+        changed()
+    }
+
+    var onboarded: Boolean
+        get() = bool("onboarded", false)
+        set(v) = setBool("onboarded", v)
+
+    var serverUrl: String
+        get() = str("server_url") ?: BuildConfig.DEFAULT_SERVER_URL
+        set(v) = setStr("server_url", v)
+
+    var themeMode: ThemeMode
+        get() = ThemeMode.entries[int("theme", 0)]
+        set(v) = setInt("theme", v.ordinal)
+
+    var amoled: Boolean
+        get() = bool("amoled", false)
+        set(v) = setBool("amoled", v)
+
+    var dynamicColor: Boolean
+        get() = bool("dynamic_color", true)
+        set(v) = setBool("dynamic_color", v)
+
+    var screenshotProtection: Boolean
+        get() = bool("flag_secure", true)
+        set(v) = setBool("flag_secure", v)
+
+    var notificationContent: NotificationContent
+        get() = NotificationContent.entries[int("notif_content", 0)]
+        set(v) = setInt("notif_content", v.ordinal)
+
+    var readReceipts: Boolean
+        get() = bool("read_receipts", true)
+        set(v) = setBool("read_receipts", v)
+
+    /** Seconds in the background before the app locks (0 = immediately). Only applies when a passphrase is set. */
+    var lockTimeoutSecs: Int
+        get() = int("lock_timeout", 60)
+        set(v) = setInt("lock_timeout", v)
+
+    var lockOnScreenOff: Boolean
+        get() = bool("lock_screen_off", true)
+        set(v) = setBool("lock_screen_off", v)
+
+    /** Wrong passphrase attempts before everything is wiped (0 = never). */
+    var maxFailedAttempts: Int
+        get() = int("max_failed", 10)
+        set(v) = setInt("max_failed", v)
+
+    var failedAttempts: Int
+        get() = int("failed", 0)
+        set(v) = setInt("failed", v)
+
+    var wipeOnReboot: Boolean
+        get() = bool("wipe_on_reboot", false)
+        set(v) = setBool("wipe_on_reboot", v)
+
+    var lastBootCount: Int
+        get() = int("boot_count", -1)
+        set(v) = setInt("boot_count", v)
+
+    /** Wipe everything if the app isn't unlocked for this many days (0 = off). */
+    var inactivityWipeDays: Int
+        get() = int("inactivity_days", 0)
+        set(v) = setInt("inactivity_days", v)
+
+    var lastUnlockAt: Long
+        get() = long("last_unlock", System.currentTimeMillis())
+        set(v) = sp.edit().putLong("last_unlock", v).apply()
+
+    /** Disappearing timer applied to new chats. */
+    var defaultTimerSecs: Long
+        get() = long("default_timer", 7 * 24 * 3600L)
+        set(v) = setLong("default_timer", v)
+
+    var timerStartsOnRead: Boolean
+        get() = bool("timer_on_read", true)
+        set(v) = setBool("timer_on_read", v)
+
+    var clipboardClearSecs: Int
+        get() = int("clip_clear", 30)
+        set(v) = setInt("clip_clear", v)
+
+    var socksProxy: Boolean
+        get() = bool("socks", false)
+        set(v) = setBool("socks", v)
+
+    var biometricUnlock: Boolean
+        get() = bool("biometric", false)
+        set(v) = setBool("biometric", v)
+
+    /** Public half of the locked-inbox key (messages arriving while locked are sealed to it). */
+    var inboxPublicKey: String?
+        get() = str("inbox_pub")
+        set(v) = setStr("inbox_pub", v)
+
+    /** Human-readable push status for the UI: ok / none / failed / pending. */
+    var pushStatus: String
+        get() = str("push_status") ?: "none"
+        set(v) = setStr("push_status", v)
+
+    /** Host of the current push endpoint (not the full URL), for the security audit. */
+    var pushHost: String?
+        get() = str("push_host")
+        set(v) = setStr("push_host", v)
+
+    fun clear() {
+        sp.edit().clear().commit()
+        changed()
+    }
+}
