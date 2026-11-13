@@ -40,8 +40,13 @@ public sealed class EndToEndTests {
         var id = System.Buffers.Text.Base64Url.DecodeFromChars(
             (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetString());
         Assert.Equal(0, await _f.ScalarAsync("SELECT COUNT(*) FROM pending_messages WHERE id = @id", new { id }));
-        var queue = (Infrastructure.Redis.MessageQueue)_f.Services.GetService(typeof(Infrastructure.Redis.MessageQueue))!;
-        await EventuallyAsync(async () => await queue.LengthAsync() == 0, because: "stream entry should be deleted after delivery");
+        // Other tests (and extra nodes they start) may have entries in flight, so look for this message specifically.
+        await using var mux = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(_f.Redis);
+        var stream = mux.GetDatabase(0);
+        await EventuallyAsync(async () => {
+            var entries = await stream.StreamRangeAsync("gf:q");
+            return !entries.Any(e => e.Values.Any(v => v.Name == "id" && ((byte[])v.Value!).AsSpan().SequenceEqual(id)));
+        }, because: "stream entry should be deleted after delivery");
     }
 
     [IntegrationFact]

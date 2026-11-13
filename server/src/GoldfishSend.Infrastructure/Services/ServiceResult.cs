@@ -13,7 +13,10 @@ public sealed record ServiceError(int Status, string Code, TimeSpan? RetryAfter 
     public static readonly ServiceError TooLarge = new(413, "too_large");
     public static readonly ServiceError UnsupportedMediaType = new(415, "unsupported_media_type");
     public static readonly ServiceError EndpointUnreachable = new(502, "endpoint_unreachable");
-    public static readonly ServiceError MailboxFull = new(507, "mailbox_full", TimeSpan.FromHours(1));
+    /// <summary>This mailbox holds its maximum number of undelivered messages.</summary>
+    public static readonly ServiceError MailboxFull = new(507, "mailbox_full", TimeSpan.FromHours(1), "mailbox");
+    /// <summary>The server-wide held-message quota is reached, and this mailbox would add to the backlog.</summary>
+    public static readonly ServiceError StorageFull = new(507, "mailbox_full", TimeSpan.FromHours(1), "global");
     public static readonly ServiceError Unavailable = new(503, "unavailable");
 
     public static ServiceError RateLimited(RateLimitDecision decision) => new(429, "rate_limited", decision.RetryAfter, decision.Scope);

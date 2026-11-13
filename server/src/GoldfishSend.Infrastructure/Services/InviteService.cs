@@ -27,12 +27,12 @@ public sealed class InviteService {
         if (blob.Length > ProtocolLimits.MaxInviteBytes) {
             return ServiceError.TooLarge;
         }
-        // Per host, then per network, then globally. The global budget bounds the Redis memory invites can take
-        // (5/s × 4 KiB × the max TTL), whatever address space an attacker controls.
+        // Widest first, so a request denied by a wide limit doesn't create narrow buckets. The live-invite cap below is the
+        // hard memory bound. The rates only shape abuse.
         foreach (var (policy, subject) in new[] {
-                     (RatePolicies.InviteCreatePerIp, client.Host),
-                     (RatePolicies.InviteCreatePerNetwork, client.Network),
                      (RatePolicies.InviteCreateGlobal, "global"u8.ToArray()),
+                     (RatePolicies.InviteCreatePerNetwork, client.Network),
+                     (RatePolicies.InviteCreatePerIp, client.Host),
                  }) {
             var limit = await _limiter.CheckAsync(policy, subject, failOpen: false);
             if (!limit.Allowed) {
@@ -41,7 +41,9 @@ public sealed class InviteService {
         }
         var ttl = Math.Clamp(ttlSeconds ?? _options.DefaultTtlSeconds, _options.MinTtlSeconds, _options.MaxTtlSeconds);
         var id = RandomNumberGenerator.GetBytes(ProtocolLimits.InviteIdSize);
-        await _store.PutInviteAsync(id, blob, TimeSpan.FromSeconds(ttl));
+        if (!await _store.PutInviteAsync(id, blob, TimeSpan.FromSeconds(ttl), _options.MaxLiveInvites)) {
+            return ServiceError.RateLimited(new RateLimitDecision(false, TimeSpan.FromMinutes(5), RatePolicies.InviteCreateGlobal));
+        }
         return id;
     }
 
@@ -49,9 +51,14 @@ public sealed class InviteService {
         if (id.Length != ProtocolLimits.InviteIdSize) {
             return ServiceError.NotFound;
         }
-        var limit = await _limiter.CheckAsync(RatePolicies.InviteFetchPerIp, client.Host);
-        if (!limit.Allowed) {
-            return ServiceError.RateLimited(limit);
+        foreach (var (policy, subject) in new[] {
+                     (RatePolicies.InviteFetchPerNetwork, client.Network),
+                     (RatePolicies.InviteFetchPerIp, client.Host),
+                 }) {
+            var limit = await _limiter.CheckAsync(policy, subject);
+            if (!limit.Allowed) {
+                return ServiceError.RateLimited(limit);
+            }
         }
         var blob = await _store.TakeInviteAsync(id);
         return blob is null ? ServiceError.NotFound : blob;

@@ -20,6 +20,14 @@
 
 	servers {
 		protocols h1 h2 h3
+		# Slow-client protection (slowloris and similar). Requests are tiny, so these are generous.
+		timeouts {
+			read_header 10s
+			read_body 10s
+			write 30s
+			idle 2m
+		}
+		max_header_size 16KB
 	}
 
 	# Optional: an ACME account e-mail for expiry notices.
@@ -88,4 +96,17 @@
 http://:8081 {
 	bind {$GOLDFISH_ONION_CADDY_IP:172.30.251.2}
 	import goldfish_routes
+}
+
+# Plain HTTP. Caddy still answers ACME HTTP-01 challenges here automatically. API requests over http:// are refused
+# rather than redirected: a client misconfigured with http:// would otherwise keep sending its secrets in cleartext
+# on every request before each redirect. Browsers asking for anything else get redirected to HTTPS.
+http://{$GOLDFISH_DOMAIN} {
+	@api path /v1/*
+	handle @api {
+		respond "Use HTTPS" 400
+	}
+	handle {
+		redir https://{host}{uri} permanent
+	}
 }

@@ -17,7 +17,8 @@ public sealed record BatchRequest(MailboxCredentialDto[]? Items);
 
 public sealed record StatusResponse(string Status);
 
-public sealed record ExpiresResponse(string ExpiresAt);
+/// <param name="EndpointGone">The server can't reach at least one of these mailboxes' push endpoint: re-register push and rotate.</param>
+public sealed record ExpiresResponse(string ExpiresAt, bool EndpointGone);
 
 public sealed record IdResponse(string Id);
 

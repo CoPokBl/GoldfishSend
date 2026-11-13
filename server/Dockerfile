@@ -20,12 +20,13 @@ WORKDIR /src
 
 # Restore first, from the project files only, so the package layer is cached across source edits.
 COPY Directory.Build.props ./
-COPY src/GoldfishSend.Core/GoldfishSend.Core.csproj src/GoldfishSend.Core/
-COPY src/GoldfishSend.Infrastructure/GoldfishSend.Infrastructure.csproj src/GoldfishSend.Infrastructure/
-COPY src/GoldfishSend.Api/GoldfishSend.Api.csproj src/GoldfishSend.Api/
-COPY tools/HealthProbe/HealthProbe.csproj tools/HealthProbe/
-RUN dotnet restore src/GoldfishSend.Api/GoldfishSend.Api.csproj \
- && dotnet restore tools/HealthProbe/HealthProbe.csproj
+COPY src/GoldfishSend.Core/GoldfishSend.Core.csproj src/GoldfishSend.Core/packages.lock.json src/GoldfishSend.Core/
+COPY src/GoldfishSend.Infrastructure/GoldfishSend.Infrastructure.csproj src/GoldfishSend.Infrastructure/packages.lock.json src/GoldfishSend.Infrastructure/
+COPY src/GoldfishSend.Api/GoldfishSend.Api.csproj src/GoldfishSend.Api/packages.lock.json src/GoldfishSend.Api/
+COPY tools/HealthProbe/HealthProbe.csproj tools/HealthProbe/packages.lock.json tools/HealthProbe/
+# --locked-mode: the build fails if a dependency differs from the committed packages.lock.json files.
+RUN dotnet restore src/GoldfishSend.Api/GoldfishSend.Api.csproj --locked-mode \
+ && dotnet restore tools/HealthProbe/HealthProbe.csproj --locked-mode
 
 COPY src/ src/
 COPY tools/ tools/

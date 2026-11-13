@@ -15,10 +15,15 @@ namespace GoldfishSend.Infrastructure.Push;
 public enum PushStatus {
     /// <summary>The push server accepted the message (2xx). The message has left our hands.</summary>
     Delivered,
-    /// <summary>The subscription no longer exists (404, 410), or the destination is forbidden.</summary>
+    /// <summary>The subscription no longer exists (404, 410).</summary>
     Gone,
-    /// <summary>A temporary failure: timeout, connection error, 429, 5xx, or 401/403 (usually VAPID or clock trouble, retried slowly).</summary>
+    /// <summary>
+    /// A temporary failure that counts as an attempt: timeout, connection error, 3xx, 429, 5xx, 401/403 (usually VAPID or
+    /// clock trouble, retried slowly), or a DNS answer pointing at a forbidden address (possibly spoofed).
+    /// </summary>
     Transient,
+    /// <summary>Not attempted: local gating (circuit open, pacing, in-flight caps, slow lane). Doesn't count as an attempt.</summary>
+    Deferred,
     /// <summary>The push server rejected this particular message (400, 413, other 4xx), so retrying won't help.</summary>
     Rejected,
 }
@@ -63,7 +68,8 @@ public sealed class PushClient : IDisposable {
         _logger = logger;
 
         var push = options.Push;
-        _requestTimeout = TimeSpan.FromSeconds(push.RequestTimeoutSeconds);
+        _requestTimeout = TimeSpan.FromSeconds(Math.Min(
+            push.RequestTimeoutSeconds, push.ConnectTimeoutSeconds + push.ResponseHeadersTimeoutSeconds));
         var handler = new SocketsHttpHandler {
             AllowAutoRedirect = false,
             UseProxy = false,
@@ -91,21 +97,24 @@ public sealed class PushClient : IDisposable {
         _http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("GoldfishSend", "1"));
     }
 
-    public async Task<PushResult> SendAsync(EndpointRecord endpoint, byte[] plaintext, int ttlSeconds, CancellationToken ct) {
+    /// <param name="mailboxId">For the per-mailbox fair share. Null for verification pushes.</param>
+    public async Task<PushResult> SendAsync(
+        EndpointRecord endpoint, byte[] plaintext, int ttlSeconds, CancellationToken ct, byte[]? mailboxId = null) {
         // Re-validate on every send. Stored records were validated at registration, but rules may have tightened since.
         if (!_validator.TryValidate(endpoint.Url, out var uri)) {
             return new PushResult(PushStatus.Gone);
         }
         var host = uri.IdnHost.ToLowerInvariant();
 
-        var gate = await _guards.TryEnterAsync(host);
+        var gate = await _guards.TryEnterAsync(host, mailboxId);
         if (gate.Lease is not { } lease) {
-            return new PushResult(PushStatus.Transient, gate.RetryAfter);
+            return new PushResult(PushStatus.Deferred, gate.RetryAfter ?? TimeSpan.FromSeconds(1));
         }
 
-        var success = false;
-        // One deadline covers connect, headers and body. HttpClient.Timeout alone doesn't bound reading a
-        // response body, so a hostile endpoint could otherwise tarpit a delivery slot forever.
+        var outcome = HostOutcome.HostFailure;
+        var timedOut = false;
+        // One short deadline covers connect, TLS and response headers. The body is never read. Real push services answer
+        // in well under a second, so tarpits lose the slot quickly. HttpClient.Timeout alone wouldn't bound this.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(_requestTimeout);
         try {
@@ -117,7 +126,8 @@ public sealed class PushClient : IDisposable {
             };
             request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             request.Content.Headers.ContentEncoding.Add("aes128gcm");
-            request.Headers.TryAddWithoutValidation("TTL", Math.Max(0, ttlSeconds).ToString(CultureInfo.InvariantCulture));
+            // Coarse TTL: the header must not reveal the message's exact age or the sender's chosen lifetime.
+            request.Headers.TryAddWithoutValidation("TTL", PushTtl.Coarse(ttlSeconds).ToString(CultureInfo.InvariantCulture));
             request.Headers.TryAddWithoutValidation("Urgency", "high");
             request.Headers.TryAddWithoutValidation("Authorization", _vapid.GetAuthorizationHeader(uri, DateTimeOffset.UtcNow));
 
@@ -126,22 +136,26 @@ public sealed class PushClient : IDisposable {
             using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
 
             var result = Classify(response);
-            success = result.Status is PushStatus.Delivered or PushStatus.Gone or PushStatus.Rejected;
+            // Any HTTP answer below 500 means the host works. Refusing one subscription says nothing about the others.
+            outcome = (int)response.StatusCode >= 500 ? HostOutcome.HostFailure : HostOutcome.Healthy;
             if (result.Status != PushStatus.Delivered) {
                 _logger.LogInformation("Push to host {Host} returned {Status} ({Code})",
                     HostGuards.Fingerprint(host), result.Status, (int)response.StatusCode);
             }
             return result;
         } catch (HttpRequestException ex) when (ex.InnerException is ForbiddenDestinationException) {
-            success = true; // The host answered DNS "correctly". This isn't host flakiness.
+            // A forbidden answer may be spoofed, sinkholed or a resolver mishap. Never treat it as proof the subscription is
+            // gone, which would park every mailbox on that host. Retry later instead.
+            outcome = HostOutcome.Healthy;
             _logger.LogWarning("Push host {Host} resolved to a forbidden address", HostGuards.Fingerprint(host));
-            return new PushResult(PushStatus.Gone);
+            return new PushResult(PushStatus.Transient, TimeSpan.FromMinutes(10));
         } catch (Exception ex) when (ex is HttpRequestException or IOException or SocketException
-                                         || (ex is TaskCanceledException && !ct.IsCancellationRequested)) {
-            _logger.LogInformation("Push to host {Host} failed: {Error}", HostGuards.Fingerprint(host), ex.GetType().Name);
+                                         || (ex is TaskCanceledException or OperationCanceledException && !ct.IsCancellationRequested)) {
+            timedOut = ex is TaskCanceledException or OperationCanceledException;
+            _logger.LogInformation("Push to host {Host} failed: {Error}", HostGuards.Fingerprint(host), timedOut ? "Timeout" : ex.GetType().Name);
             return new PushResult(PushStatus.Transient);
         } finally {
-            await lease.ExitAsync(success);
+            await lease.ExitAsync(outcome, endpoint.Url, timedOut);
         }
     }
 
@@ -152,6 +166,8 @@ public sealed class PushClient : IDisposable {
             404 or 410 => new PushResult(PushStatus.Gone),
             // Usually our VAPID key or clock. Never treat it as a dead subscription; retry slowly.
             401 or 403 => new PushResult(PushStatus.Transient, TimeSpan.FromHours(1)),
+            // Redirects are never followed (SSRF). Treat them as temporary rather than dropping the message.
+            >= 300 and < 400 => new PushResult(PushStatus.Transient, TimeSpan.FromMinutes(30)),
             429 or 408 or 425 => new PushResult(PushStatus.Transient, ParseRetryAfter(response)),
             >= 500 => new PushResult(PushStatus.Transient, ParseRetryAfter(response)),
             _ => new PushResult(PushStatus.Rejected),

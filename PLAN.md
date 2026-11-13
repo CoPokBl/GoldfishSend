@@ -419,4 +419,5 @@ The exact wire format lives in `docs/protocol.md`.
 | M5 | Android: UP registration, mailbox lifecycle, QR exchange, libsignal sessions, send/receive, SQLCipher key hierarchy, per-message keys, outbox and receipts | Two phones chat through a self-hosted ntfy |
 | M6 | Security controls: disappearing messages and view-once, app lock, wrong-PIN, duress and panic wipe, notification and screen hardening | Forensic test: no deleted plaintext or keys recoverable from a DB or file dump |
 | M7 | Hardening: padding, chunking, pinning, Baseline Profiles, external security review | Review findings closed |
+| Future | Abuse resistance: a memory-hard PoW (e.g. Equi-X/Argon2-based) or Privacy Pass (RFC 9576/9578) tokens. SHA-256 hashcash costs a GPU milliseconds but a phone tens of seconds. Changing it is a protocol change for clients. | n/a |
 | M8+ | Groups (client fan-out first, MLS later), attachments, multi-device, Privacy Pass, onion service | n/a |
