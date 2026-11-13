@@ -10,7 +10,7 @@ This is the contract between the server (`server/`) and the Android client (`and
   | scope | Limited subject | Client reaction |
   |---|---|---|
   | `ip` | this client's IPv4 /32 or IPv6 /64 | On `POST /v1/messages` only: solve a PoW and retry once with `GF-PoW`. Elsewhere, wait `Retry-After`. |
-  | `network` | this client's IPv4 /24 or IPv6 /48 | Wait `Retry-After`. |
+  | `network` | this client's IPv4 /24 or IPv6 /48 | On `POST /v1/messages` only: solve a PoW and retry once with `GF-PoW` (shared networks, Tor exits, onion services). Elsewhere, wait `Retry-After`. |
   | `mailbox` | the target mailbox (protects the recipient) | Wait `Retry-After`. PoW does **not** help. |
   | `global` | the whole server | Wait `Retry-After`. |
 - `‖` means concatenation. String literals are UTF-8 bytes with no terminator.
@@ -46,12 +46,17 @@ byte 1      type      = 0x01 message | 0x02 verification
 bytes 2..9  mailboxTag (8 B)
 bytes 10..  body
 ```
-- `type = 0x02`: body is the 16-byte verification `code`.
+- `type = 0x02`: the verification `code` is the **first 16 bytes** of the body. The rest is random padding (the body is
+  1024 bytes today) so that verification pushes look like ordinary messages to the push service. Clients must read
+  only the first 16 bytes and ignore the rest, whatever the length.
 - `type = 0x01`: body is the sender's E2E blob, passed through unchanged.
 
 The server encrypts this with RFC 8291 `aes128gcm` (a single record, `rs = 4096`) to the device's `p256dh`/`auth`, and signs
 with VAPID (RFC 8292, ES256, `Authorization: vapid t=<jwt>, k=<b64u P-256 public key>`). The UnifiedPush Android connector 3.x
 decrypts it. The client must register with the server's VAPID public key from `/v1/info`.
+
+The `TTL` header sent to the push service is rounded **down** to one of 60 s, 10 min, 1 h, 6 h, 1 d, 3 d, 7 d or 14 d, so it
+doesn't reveal a message's exact age or the sender's chosen lifetime. A push never outlives its message.
 
 **Size budget**: 4096 total, minus 86 B content-coding header, 16 B tag and 1 B delimiter, which leaves **3993 B of push plaintext**.
 Subtract the 10 B envelope header and the result is **`maxMessageBytes = 3983`**.
@@ -80,7 +85,7 @@ No body. Response as above. Rate limited per IP.
 { "items": [ { "sendSecret": "...", "ownerSecret": "..." } ], "code": "b64u 16B" }
 ```
 - Confirms a new mailbox, or a pending endpoint rotation, for **every** item listed. Allows at most 5 attempts per mailbox.
-- `200 { "expiresAt": "YYYY-MM-DD" }`. Errors: `403 verification_failed`, `404 not_found`.
+- `200 { "expiresAt": "YYYY-MM-DD", "endpointGone": false }`. Errors: `403 verification_failed`, `404 not_found`.
 - On success, any held (undelivered) messages for those mailboxes are flushed immediately.
 
 ### `PUT /v1/mailboxes/endpoint`: rotate the push endpoint (batch, up to 100 items)
@@ -95,7 +100,11 @@ No body. Response as above. Rate limited per IP.
   and space them out.
 
 ### `POST /v1/mailboxes/refresh` (batch, up to 100)
-`{ "items": [...] }` → `200 { "expiresAt": "YYYY-MM-DD" }`. Extends expiry by the configured lifetime (default 90 days).
+`{ "items": [...] }` → `200 { "expiresAt": "YYYY-MM-DD", "endpointGone": bool }`. Extends expiry by the configured lifetime
+(default 90 days). `endpointGone: true` means the push service told the server (404/410) that the endpoint of at least
+one listed mailbox no longer exists. Messages for it are being held. The client should re-register with its UnifiedPush
+distributor and rotate (`PUT /v1/mailboxes/endpoint`). The server also re-probes such endpoints with backoff, and
+resumes on its own if one starts accepting again. Clients that call refresh periodically get this signal for free.
 
 ### `POST /v1/mailboxes/delete` (batch, up to 100)
 `{ "items": [...] }` → `204`. Deletes the mailboxes and any held messages. Used for "block contact" and "delete contact".
@@ -104,20 +113,26 @@ No body. Response as above. Rate limited per IP.
 - Body: raw bytes, 1 to `maxMessageBytes` (the E2E blob). **`Content-Type: application/octet-stream` is required** (`415` otherwise).
 - Headers:
   - `GF-Send-Token: b64u(sendSecret)`, required.
-  - `GF-Idempotency-Key: b64u(16 B)`, optional but recommended. Duplicates within 24 h return the original `202`.
+  - `GF-Idempotency-Key: b64u(16 B)`, optional but recommended. A duplicate within about 1 hour returns the original id.
+    Delivery is at-least-once: in rare crash windows the same message may be pushed twice, and clients must drop
+    duplicates (a repeated Signal ciphertext is rejected anyway). Retry with the same key and body.
   - `GF-TTL: seconds`, optional. The default is `defaultTtlSeconds`, clamped to `[60, maxTtlSeconds]`.
   - `GF-PoW: <challenge b64u>.<nonce b64u>`, optional. A solved `/v1/pow/challenge` that pays for this request after a
-    `429` with `"scope": "ip"` (shared IPs, Tor). It doesn't bypass any other scope.
+    `429` with `"scope": "ip"` or `"network"` (shared IPs, Tor). It doesn't bypass `mailbox` or `global`.
 - Responses: `202 { "id": b64u(16 B) }`, `404 not_found` (unknown, expired or deleted mailbox), `413 too_large`,
-  `415 unsupported_media_type`, `429 rate_limited` (with `Retry-After`), and `507 mailbox_full` (with `Retry-After`).
-  `507` means the recipient's device has been unreachable long enough that the server holds its maximum number of undelivered
-  messages for this mailbox (default 500). Keep the message in the outbox and retry later.
+  `415 unsupported_media_type`, `429 rate_limited` (with `Retry-After`), and `507 mailbox_full` (with `Retry-After` and a `scope`).
+  `507` with `"scope": "mailbox"` means the recipient's device has been unreachable long enough that the server holds its
+  maximum number of undelivered messages for this mailbox (default 500). `"scope": "global"` means the server's overall
+  held-message quota is reached and this recipient is already backlogged. Either way, keep the message in the outbox and
+  retry later. Messages to a recipient whose endpoint is gone are held for at most 3 days (server default), even if a
+  longer `GF-TTL` was asked for.
 - A `202` means the server accepted the message durably. It holds the message until the push server accepts it, or the TTL expires.
 
 ### `POST /v1/invites`: upload a one-time invite blob
 - Body: raw bytes, 1 to `maxInviteBytes`, with **`Content-Type: application/octet-stream`** (`415` otherwise). Header `GF-TTL` is
   60 to 86400 seconds (default 900).
-- `201 { "id": b64u(16 B) }`. Rate limited per IP.
+- `201 { "id": b64u(16 B) }`. Rate limited per IP, per network and globally. When the server's live-invite cap is reached,
+  it answers `429` with `"scope": "global"`.
 
 ### `GET /v1/invites/{id}`: fetch an invite blob and delete it atomically
 - `200` with raw bytes, or `404 not_found`. **Fetching deletes it**: an invite works exactly once.

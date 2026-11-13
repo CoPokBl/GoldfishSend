@@ -86,7 +86,7 @@ You need the .NET 10 SDK and podman or docker.
 ```bash
 # MySQL and Redis on localhost only
 podman run -d --name gf-mysql -p 127.0.0.1:3306:3306 \
-  -e MYSQL_ROOT_PASSWORD=dev -e MYSQL_DATABASE=goldfish -e MYSQL_USER=goldfish -e MYSQL_PASSWORD=dev \
+  -e MYSQL_RANDOM_ROOT_PASSWORD=yes -e MYSQL_DATABASE=goldfish -e MYSQL_USER=goldfish -e MYSQL_PASSWORD=dev \
   docker.io/library/mysql:8.4 --skip-log-bin
 podman run -d --name gf-redis -p 127.0.0.1:6379:6379 \
   docker.io/library/redis:7.4-alpine redis-server --appendonly yes --requirepass dev
@@ -161,8 +161,11 @@ All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api key
 | `MaxTtlSeconds` | `1209600` (14 d) | Upper clamp for `GF-TTL`. It also sets epoch key retention (`ceil(MaxTtl / 1 day) + 1` days), so it bounds how long a held message's key exists. |
 | `MinTtlSeconds` | `60` | Lower clamp for `GF-TTL`. |
 | `DeliveryParallelism` | `32` | Concurrent deliveries per worker process, for both the stream and retry workers. |
-| `IdempotencyWindowSeconds` | `86400` (24 h) | How long a `GF-Idempotency-Key` is remembered. The key and the message are written in one atomic Redis script. |
-| `MaxHeldPerMailbox` | `500` | The most undelivered messages held per mailbox. Further sends get `507 mailbox_full`. This bounds the storage a dead endpoint or hostile contact can use. |
+| `IdempotencyWindowSeconds` | `3600` (1 h, ±10% jitter) | How long a `GF-Idempotency-Key` is remembered, in the **ephemeral** Redis only, under an HMAC of mailbox id ‖ key. It's reserved as "pending", then the message is queued, then it's marked "done". A retry that finds "pending" queues again under the same id. So sends are at-least-once, never a false success: the worst case is a duplicate push of identical ciphertext, which the client's Signal session drops. |
+| `MaxHeldPerMailbox` | `500` | The most undelivered messages held per mailbox. Further sends get `507 mailbox_full` with scope `mailbox`. This bounds the storage a dead endpoint or hostile contact can use. |
+| `MaxHeldTotal` | `500000` | Server-wide held-message quota (rows, about 4.3 KiB each). Once reached, sends to mailboxes that are already holding messages (or whose endpoint is gone) get `507 mailbox_full` with scope `global`. Healthy mailboxes keep working, and messages that fail after acceptance are still held (a small overshoot), so nothing accepted is dropped. `0` = unlimited. |
+| `GoneMaxTtlSeconds` | `259200` (3 d) | TTL ceiling for messages accepted for a mailbox whose endpoint is gone. |
+| `MaxStreamLength` | `50000` | Bound on the hot Redis stream. Beyond it, or if Redis reports out-of-memory, new messages go straight to MySQL `pending_messages` (due now) and are delivered by the retry worker. A backlog or Redis memory pressure never fails sends. |
 
 ### `Goldfish:Mailboxes`
 
@@ -191,10 +194,16 @@ All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api key
 | `BlockedHosts` | `[]` | Hostnames (and their subdomains) that may never be endpoints. Put this server's own names here; the compose file adds `GOLDFISH_DOMAIN`. |
 | `ExtraBlockedRanges` | `[]` | Extra CIDRs to refuse at connect time, for example this server's public addresses. Private, loopback, link-local, CGNAT, multicast, ULA, NAT64, 6to4, Teredo and documentation ranges are always refused. |
 | `ConnectTimeoutSeconds` | `5` | TCP + TLS connect timeout. |
-| `RequestTimeoutSeconds` | `10` | Hard deadline per push request, covering connect, headers and response. The body is never read. Each worker job gets this plus 15 s. |
-| `MaxConnectionsPerHost` | `16` | Connection pool size per push host. In-flight requests per host are capped at 4× this. |
-| `CircuitBreakerFailures` | `5` | Failures for one push host, **across the cluster**, within 1 minute that open its circuit. |
-| `CircuitBreakerOpenSeconds` | `30` | How long an open circuit stays open. Every node honours it. |
+| `ResponseHeadersTimeoutSeconds` | `3` | How long a push service may take to answer once connected. The push deadline is `min(RequestTimeoutSeconds, ConnectTimeoutSeconds + ResponseHeadersTimeoutSeconds)` (8 s by default). The response body is never read. A timeout puts the host's base domain in the slow lane for 10 minutes. |
+| `RequestTimeoutSeconds` | `10` | Upper bound on the push deadline above. Each worker job gets the deadline plus 15 s. |
+| `MaxConnectionsPerHost` | `16` | Connection pool size per push host. |
+| `MaxInFlightPerHost` | `4` | Concurrent pushes to one host per process, well below `DeliveryParallelism`, so one slow host can't take every slot. Extra jobs are deferred (retried within a second, not counted as an attempt). |
+| `MaxInFlightPerMailbox` | `4` | Concurrent pushes to one mailbox, cluster-wide. A burst to one contact still goes out in parallel, but one mailbox (say, one pointing at a tarpit) can't hold more slots. |
+| `SlowLaneSlots` | `4` | Concurrent pushes per process to hosts whose base domain (`a1.evil.example` → `evil.example`) recently timed out. Tarpits spread across wildcard subdomains share these few slots. |
+| `CircuitBreakerMinVolume` | `20` | Breaker: minimum pushes to a host within a minute before it can open. |
+| `CircuitBreakerFailureRatio` | `0.5` | Breaker: share of those pushes that must be **host** failures (connection errors, timeouts, 5xx). 4xx, 429 and 401/403 refuse one subscription and never count, so one subscriber can't pause a shared push service. |
+| `CircuitBreakerMinEndpoints` | `3` | Breaker: the failures must come from at least this many distinct endpoints. |
+| `CircuitBreakerOpenSeconds` | `30` | How long an open circuit stays open. Every node honours it. Deferred pushes don't count as attempts. |
 | `DangerouslyAllowInsecureLoopback` | `false` | Testing only: allows `http://` and loopback endpoints and relaxes the SSRF filter. Startup fails outside the Development environment. |
 
 ### `Goldfish:Invites`
@@ -204,12 +213,19 @@ All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api key
 | `DefaultTtlSeconds` | `900` | Invite lifetime when no `GF-TTL` is sent. |
 | `MinTtlSeconds` | `60` | Lower clamp. |
 | `MaxTtlSeconds` | `86400` | Upper clamp. |
+| `MaxLiveInvites` | `20000` | Invites stored at once (each at most 4 KiB, so about 80 MiB). Uploads beyond it get `429` with scope `global`. |
 
 ### `Goldfish:Network`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `TrustedProxies` | `[]` | IPs or CIDRs whose `X-Forwarded-For` is trusted (one hop). Empty means XFF is ignored and the TCP peer is the client. Behind Caddy in compose, this is set to the caddy/api network's subnet. |
+| `TrustedProxies` | `[]` | IPs or CIDRs whose `X-Forwarded-For` is trusted (one hop). Empty means XFF is ignored and the TCP peer is the client. Behind Caddy in compose, this is set to the caddy/api network's IPv4 and IPv6 subnets. If a forwarded client address ever falls *inside* these networks, the API logs a warning (at most every 10 minutes): the container runtime is collapsing clients into one address. |
+
+### `Goldfish` (other)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `EpochKeyStore` | `MySql` | Where the wrapped daily epoch keys live. `MySql`: held messages survive any restart, but a deleted key row can linger in InnoDB redo, undo and free pages until overwritten (see "Data on disk"). `Ephemeral`: keys live only in the non-persistent ephemeral Redis, so shredding is real and nothing is on disk. But restarting that Redis drops every queued and held message (their keys are gone). |
 
 ### `Goldfish:RateLimits`
 
@@ -235,7 +251,19 @@ allocation from multiplying its quota by rotating addresses.
 | `invite-create-net` | client network | 100 / 3600 s, burst 30 | `POST /v1/invites` (fails closed) |
 | `invite-create-global` | whole server | 5 / 1 s, burst 50 | `POST /v1/invites`. Bounds the Redis memory invites can take, at most 5/s × 4 KiB × `Invites:MaxTtlSeconds`. |
 | `invite-fetch-ip` | client IP | 60 / 60 s, burst 20 | `GET /v1/invites/{id}` |
-| `push-host` | push-service host | 50 / 1 s, burst 50 | Outbound pushes to one push host, from all workers together |
+| `push-host` | push-service host | 200 / 1 s, burst 200 | Outbound pushes to one push host, from all workers together |
+| `push-mailbox` | mailbox | 2 / 1 s, burst 10 | Outbound pushes per mailbox, in front of `push-host`, so a few mailboxes can't take a shared push service's budget |
+| `send-net` | client network | 600 / 60 s, burst 200 | `POST /v1/messages`, checked before `send-ip`. A valid `GF-PoW` pays for either. |
+| `send-lookup-global` | whole server | 3000 / 1 s, burst 6000 | `POST /v1/messages` before the mailbox lookup. It caps how many token lookups reach MySQL. |
+| `create-global` | whole server | 3000 / 3600 s, burst 300 | `POST /v1/mailboxes` (after the PoW, fails closed) |
+| `newhost-global` | whole server | 120 / 3600 s, burst 30 | Verification pushes to push hosts no mailbox has used in 30 days. It stops the server being used to POST to arbitrary sites. |
+| `owner-net` | client network | 300 / 60 s, burst 100 | Owner operations. Always charged. (`owner-ip` is only charged on **failed** ownership or verification, so junk from a shared address can't lock out real owners.) |
+| `invite-fetch-net` | client network | 300 / 60 s, burst 100 | `GET /v1/invites/{id}`, checked before `invite-fetch-ip` |
+
+Order: for every request, the widest scope (global, then network) is checked before the narrowest, so a request a
+wide limit refuses never creates narrow buckets. For mailbox creation, the proof of work is redeemed **before** any
+address budget is charged. Budgets with a period of an hour or more are keyed with a stable cluster secret (in
+the ephemeral Redis) instead of the daily key, so the key rotation at UTC midnight doesn't reset them.
 
 Example: `Goldfish__RateLimits__send-ip__Limit=120`, `…__PeriodSeconds=60`, `…__Burst=40`.
 
@@ -263,7 +291,7 @@ dumps disabled.
 
 ### Steps
 
-1. **DNS and firewall.** Point an A (and AAAA) record for your domain at the host. Open 80/tcp, 443/tcp and
+1. **DNS and firewall.** Point an A record (and an AAAA record, if IPv6 is enabled on the `public` network, which is the default) for your domain at the host. Open 80/tcp, 443/tcp and
    443/udp.
 2. **Configure.**
    ```bash
@@ -310,9 +338,10 @@ Environment variables are visible to anyone who can run `docker inspect`. To kee
 ### Real client IPs
 
 Rate limiting needs the real client address at Caddy:
-- **Rootful Docker:** with IPv6 traffic and no IPv6 on the bridge network, `docker-proxy` forwards IPv6
-  clients from the bridge gateway address, so they all share one rate-limit bucket. Enable IPv6 on the `public`
-  network (`enable_ipv6: true` plus an IPv6 subnet) or don't publish on IPv6.
+- **IPv6:** the compose file enables IPv6 on the `public` network (ULA subnet `GOLDFISH_PUBLIC_SUBNET6`), so IPv6
+  clients reach Caddy with their real address. Without it, `docker-proxy` (or rootless port forwarding) forwards
+  IPv6 clients from the bridge gateway's address, and they'd all share one rate-limit bucket (the API warns when it
+  sees that). If your Docker can't do IPv6, set `GOLDFISH_ENABLE_IPV6=false` and publish only an A record.
 - **Rootless Podman:** use the `pasta` network backend (the default since Podman 5), which preserves source
   addresses. `slirp4netns` with the default port handler does not.
 
@@ -327,7 +356,7 @@ backup is useless without them (by design).
 | Key | If it's lost or changed | If it leaks |
 |---|---|---|
 | `Pepper` | **Every mailbox is orphaned.** Ids no longer match, so sends return 404 and owners can't manage mailboxes. Every user has to re-pair with every contact. | Together with a DB dump, someone who also holds a `sendSecret` can find its row. On its own it reveals nothing. |
-| `SealSalt` | **Every mailbox is orphaned.** Endpoints can't be unsealed, so nothing can be delivered. Every user has to re-pair. | Endpoints still need each mailbox's `sendSecret` to unseal. |
+| `SealSalt` | **Every mailbox is orphaned.** Endpoints can't be unsealed, so nothing can be delivered. Every user has to re-pair. | On its own, nothing: unsealing an endpoint needs that mailbox's `sendSecret`, **or** a held-message row (which carries the mailbox's seal key) plus `EpochKek`. See "Data on disk". |
 | `EpochKek` | **All queued and held messages are lost.** The stored epoch keys can't be unwrapped. The current code also fails at startup when the `epoch_keys` rows don't match the KEK. To recover, run `DELETE FROM epoch_keys; DELETE FROM pending_messages;` and restart. Mailboxes are unaffected. | Together with a DB dump that still holds the epoch keys, held messages can be unwrapped to their E2E ciphertext (still end-to-end encrypted). |
 | `VapidPrivateKey` | Distributors that pin the server's VAPID key (the client registers it with them) **reject every push** until each client re-registers its endpoint with the new key. Distributors without VAPID pinning keep working. | Anyone who also has an endpoint URL can push to it as this server. Endpoints are sealed, so this needs a second leak. |
 
@@ -372,21 +401,40 @@ flow logs. Don't put a CDN or WAF in front of the server. It would see every cli
 
 ### Data on disk
 
-- **MySQL** deletes rows on delivery and expiry, but InnoDB pages, redo and undo logs and free blocks can keep
-  old bytes for a while. Crypto-shredding covers this: held messages are encrypted under daily keys that
-  are deleted `ceil(MaxTtl / 1 day) + 1` days later.
-  **Limitation:** epoch keys are wrapped by the static `EpochKek` and stored in the same MySQL. Someone who has both
-  an old disk image or backup *and* the KEK can still recover shredded epochs. Shredding protects against later
-  compromise of storage alone. So keep the KEK out of backups, and keep database backups no longer than `MaxTtl`.
+- **MySQL** deletes rows on delivery and expiry, but InnoDB pages, redo and undo logs, the doublewrite buffer and
+  free blocks keep old bytes until overwritten. Held messages are encrypted under daily epoch keys that are deleted
+  `ceil(MaxTtl / 1 day) + 1` days later ("crypto-shredding"). **Be clear about what that buys with the default
+  `EpochKeyStore=MySql`:** the epoch keys are wrapped by the static `EpochKek` and stored in the *same* InnoDB files.
+  A deleted key row can survive in redo, undo or free pages on the current disk. The KEK is in `goldfish.env` and in
+  the container's config on the same host. So **one image of an unencrypted disk can recover recently "shredded"
+  epochs.** Each held row also contains its mailbox's seal key (that's how the worker reaches the endpoint without
+  the `sendSecret`). A DB dump plus `EpochKek` therefore unseals the push endpoints of every mailbox with held
+  messages, and identical endpoint URLs then link one device's mailboxes. Mitigations, strongest first:
+  1. `Goldfish__EpochKeyStore=Ephemeral`: keys only in the non-persistent Redis, so shredding is real. The cost:
+     restarting that Redis drops held messages.
+  2. InnoDB redo and undo log encryption with the keyring on a different device (see `deploy/mysql/my.cnf`).
+  3. Full-disk encryption on the host, `EpochKek` delivered as a Docker secret rather than an env file, and
+     database backups kept no longer than `MaxTtl` (or without `epoch_keys` and `pending_messages`).
 - **Ephemeral Redis** (rate limits, PoW, breakers) has no persistence at all, so it leaves nothing on disk.
 - **Redis AOF** (main instance) is an append-only log. Deleted queue entries (opaque mailbox ids, ciphertext and
-  timestamps) and invite blobs stay in the AOF until the next rewrite. Rewrites happen automatically as the file grows, but on a quiet server that can
+  timestamps) and invite blobs stay in the AOF until the next rewrite. Idempotency markers are **not** here (they're
+  in the ephemeral Redis), so the AOF has no per-mailbox send counter. Rewrites happen automatically as the file grows, but on a quiet server that can
   take days, so compact it hourly from the host's crontab:
   ```cron
   0 * * * * cd /path/to/deploy && docker compose exec -T redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --no-auth-warning --user goldfish BGREWRITEAOF' >/dev/null
   ```
 - Deleted files aren't wiped from the underlying disk. Use **full-disk encryption** (LUKS) on the host, plus
   encrypted swap or no swap, since keys live in process memory. Core dumps are disabled in the containers.
+
+### Delivery semantics
+
+Delivery is **at-least-once**: a crash between a push and its acknowledgement, an expired retry lease, or a
+reclaimed stream entry can push the same message twice. Clients drop duplicates (a repeated Signal ciphertext is
+rejected), so nothing is shown twice. Retry leases are 5× the job timeout, and stream entries are reclaimed only
+after 4× the job timeout (at least a minute), so a slow-but-alive node isn't normally duplicated. Messages to a
+mailbox whose endpoint returned 404/410 are parked, not retried hourly. They're woken by verification or rotation,
+by a successful push of a newer message, or by a re-probe that retries the oldest held message after 1 h, 2 h, 4 h …
+(capped at 24 h). `refresh` and `verify` responses carry `endpointGone`, so clients re-register.
 
 ### Scaling (distributed)
 

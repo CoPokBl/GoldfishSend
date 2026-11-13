@@ -39,6 +39,9 @@ x-hardening: &hardening
     - no-new-privileges:true
   cap_drop:
     - ALL
+  # Resource ceilings: a runaway or attacked container can't take the host down. Each service also sets
+  # mem_limit/cpus below. Tune them to your host.
+  pids_limit: 512
   logging:
     driver: json-file
     options:
@@ -47,7 +50,10 @@ x-hardening: &hardening
 
 # Shared environment for api and worker. Passwords come from deploy/.env via interpolation.
 x-goldfish-env: &goldfish-env
-  ConnectionStrings__MySql: "Server=mysql;Port=3306;Database=goldfish;User ID=goldfish;Password=${MYSQL_PASSWORD:?set MYSQL_PASSWORD in deploy/.env};SslMode=Required"
+  # Maximum Pool Size × (api + worker replicas) must stay below max_connections in mysql/my.cnf (400 by default, so
+  # up to 7 processes at 50). SslMode=Required encrypts but doesn't verify MySQL's self-signed certificate. That's fine
+  # on this private network. If MySQL moves to another host, provision real certificates and use SslMode=VerifyFull.
+  ConnectionStrings__MySql: "Server=mysql;Port=3306;Database=goldfish;User ID=goldfish;Password=${MYSQL_PASSWORD:?set MYSQL_PASSWORD in deploy/.env};SslMode=Required;Maximum Pool Size=50"
   # $$CONFIG= tells StackExchange.Redis that CONFIG is disabled on the server (see redis.conf).
   ConnectionStrings__Redis: "redis:6379,user=goldfish,password=${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env},abortConnect=false,$$CONFIG="
   # Rate limits, PoW and circuit breakers live in a separate Redis that never writes to disk (see redis-ephemeral.conf).
@@ -91,6 +97,8 @@ services:
   caddy:
     <<: *hardening
     image: caddy:2.10-alpine
+    mem_limit: 256m
+    cpus: 1.0
     # Runs as root inside the container only to bind 80/443; every capability except
     # NET_BIND_SERVICE is dropped and the root filesystem is read-only.
     cap_add:
@@ -115,6 +123,8 @@ services:
 
   api:
     <<: *goldfish-app
+    mem_limit: 512m
+    cpus: 2.0
     environment:
       <<: *goldfish-env
       Goldfish__Roles: "api"
@@ -122,6 +132,7 @@ services:
       # (Docker's bridge gateway, i.e. the host itself, is also in this range; the api port is not
       # published, so only caddy and the host can reach it.)
       Goldfish__Network__TrustedProxies__0: "${GOLDFISH_PUBLIC_SUBNET:-172.30.250.0/24}"
+      Goldfish__Network__TrustedProxies__1: "${GOLDFISH_PUBLIC_SUBNET6:-fd47:6f6c:6466:6973::/64}"
     networks:
       - public
       - internal
@@ -134,6 +145,8 @@ services:
 
   worker:
     <<: *goldfish-app
+    mem_limit: 512m
+    cpus: 2.0
     environment:
       <<: *goldfish-env
       Goldfish__Roles: "worker"
@@ -151,6 +164,8 @@ services:
   mysql:
     <<: *hardening
     image: mysql:8.4
+    mem_limit: 1g
+    cpus: 2.0
     # The image's entrypoint works unprivileged when started as its own user, so no chown/setuid
     # capabilities are needed.
     user: mysql
@@ -159,7 +174,8 @@ services:
       - --skip-log-bin
       - --innodb-flush-log-at-trx-commit=1
     environment:
-      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in deploy/.env}"
+      # The root password is random and printed once to the container log at first start. Nothing here needs root.
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
       MYSQL_DATABASE: goldfish
       MYSQL_USER: goldfish
       MYSQL_PASSWORD: "${MYSQL_PASSWORD:?set MYSQL_PASSWORD in deploy/.env}"
@@ -183,7 +199,12 @@ services:
 
   redis:
     <<: *hardening
+    # 7.4.6 or newer is required (CVE-2025-49844 and other Lua fixes). The app uses EVAL. The floating 7.4 tag tracks
+    # the latest patch release. For reproducible deploys, pin a digest (redis:7.4-alpine@sha256:...).
     image: redis:7.4-alpine
+    # maxmemory in redis.conf is 512mb. Leave room for AOF rewrites (fork, copy-on-write).
+    mem_limit: 768m
+    cpus: 1.0
     # Valkey works the same way: image valkey/valkey:8.1-alpine, user valkey, and replace
     # redis-server/redis-cli with valkey-server/valkey-cli (mount the config wherever you point it).
     user: redis
@@ -218,6 +239,9 @@ services:
   redis-ephemeral:
     <<: *hardening
     image: redis:7.4-alpine
+    # maxmemory in redis-ephemeral.conf is 256mb.
+    mem_limit: 384m
+    cpus: 0.5
     user: redis
     read_only: true
     environment:
@@ -245,11 +269,17 @@ services:
 networks:
   public:
     driver: bridge
+    # IPv6 on the public network, so IPv6 clients reach Caddy with their real address. Without it, Docker's userland
+    # proxy (or rootless port forwarding) hands every IPv6 client to Caddy as the bridge gateway's IPv4 address, and
+    # they all share one rate-limit bucket (the API logs a warning when it sees that). If your Docker can't do IPv6,
+    # set GOLDFISH_ENABLE_IPV6=false and publish only an A record (no AAAA).
+    enable_ipv6: ${GOLDFISH_ENABLE_IPV6:-true}
     ipam:
       config:
-        # Change via GOLDFISH_PUBLIC_SUBNET in deploy/.env if it collides with an existing network.
-        # The same value feeds Goldfish__Network__TrustedProxies above.
+        # Change via GOLDFISH_PUBLIC_SUBNET(6) in deploy/.env if they collide with an existing network.
+        # The same values feed Goldfish__Network__TrustedProxies above.
         - subnet: "${GOLDFISH_PUBLIC_SUBNET:-172.30.250.0/24}"
+        - subnet: "${GOLDFISH_PUBLIC_SUBNET6:-fd47:6f6c:6466:6973::/64}"
   internal:
     driver: bridge
     internal: true
