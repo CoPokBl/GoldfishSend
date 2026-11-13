@@ -10,8 +10,10 @@ import kotlinx.serialization.Serializable
 /** InviteBundle JSON (protocol.md). */
 @Serializable
 data class InviteBundle(
-    val v: Int = 1,
+    val v: Int = 2,
     val server: String,
+    /** The fingerprint (b64u) of [server]'s identity key. */
+    val serverKey: String? = null,
     val sendSecret: String,
     val registrationId: Int,
     val deviceId: Int = 1,
@@ -38,22 +40,25 @@ private val BundleJson = kotlinx.serialization.json.Json {
     explicitNulls = false
 }
 
-/** `gfsend://invite#v=1&s=<server>&i=<id>&k=<key>` */
-data class InviteLink(val server: String, val id: String, val key: ByteArray) {
+/**
+ * `gfsend://invite#v=2&s=<server>&f=<server fingerprint>&i=<id>&k=<key>`. [serverKey] pins the inviter's server before
+ * anything is fetched from it.
+ */
+data class InviteLink(val server: String, val serverKey: String, val id: String, val key: ByteArray) {
     fun toUri(): String {
         val s = URLEncoder.encode(server, "UTF-8")
-        return "$SCHEME_PREFIX#v=1&s=$s&i=$id&k=${B64.enc(key)}"
+        return "$SCHEME_PREFIX#v=2&s=$s&f=$serverKey&i=$id&k=${B64.enc(key)}"
     }
 
     override fun equals(other: Any?): Boolean =
-        other is InviteLink && other.server == server && other.id == id && other.key.contentEquals(key)
+        other is InviteLink && other.server == server && other.serverKey == serverKey && other.id == id && other.key.contentEquals(key)
 
     override fun hashCode(): Int = server.hashCode() * 31 + id.hashCode()
 
     companion object {
         const val SCHEME_PREFIX = "gfsend://invite"
 
-        fun parse(raw: String): InviteLink? {
+        private fun params(raw: String): Map<String, String>? {
             val text = raw.trim()
             if (!text.startsWith(SCHEME_PREFIX)) {
                 return null
@@ -62,21 +67,29 @@ data class InviteLink(val server: String, val id: String, val key: ByteArray) {
             if (hash < 0) {
                 return null
             }
-            val params = text.substring(hash + 1).split('&').mapNotNull {
+            return text.substring(hash + 1).split('&').mapNotNull {
                 val eq = it.indexOf('=')
                 if (eq <= 0) null else it.substring(0, eq) to it.substring(eq + 1)
             }.toMap()
-            if (params["v"] != "1") {
+        }
+
+        /** A link from an app version before server identity keys. It can't be accepted: ask for a new one. */
+        fun isOutdated(raw: String): Boolean = params(raw)?.get("v") == "1"
+
+        fun parse(raw: String): InviteLink? {
+            val params = params(raw) ?: return null
+            if (params["v"] != "2") {
                 return null
             }
             return try {
                 val server = URLDecoder.decode(params["s"] ?: return null, "UTF-8")
+                val fp = params["f"] ?: return null
                 val id = params["i"] ?: return null
                 val key = B64.dec(params["k"] ?: return null)
-                if (key.size != 32 || B64.dec(id).size != 16) {
+                if (key.size != 32 || B64.dec(id).size != 16 || fp.length != 43 || B64.dec(fp).size != 32) {
                     return null
                 }
-                InviteLink(server, id, key)
+                InviteLink(server, fp, id, key)
             } catch (e: IllegalArgumentException) {
                 null
             }

@@ -9,6 +9,7 @@ import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.OutboxItem
 import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.net.ApiException
+import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
@@ -120,7 +121,7 @@ object Outbox {
                             backoff(s, item, null)
                             return false
                         }
-                        Content.Hello(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), s.repo.displayName).encode()
+                        Content.Hello(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), s.repo.displayName, Graph.ownServerKey()).encode()
                     }
                     else -> s.repo.openOutboxContent(item) ?: run {
                         s.repo.outboxDelete(item.seq)
@@ -140,7 +141,7 @@ object Outbox {
                     return true
                 }
             }
-            val api = Graph.api(server)
+            val api = Graph.api(server, contactPin(s, contact, server))
             try {
                 api.sendMessage(secret, blob, item.idem, null)
             } catch (e: ApiException) {
@@ -195,6 +196,28 @@ object Outbox {
             }
         }
     }
+
+    /**
+     * A contact's server, pinned to the fingerprint they gave us. A different key holds this contact's queue (the chat
+     * shows a notice) until the user trusts it or the contact announces it in an E2E `mailbox` message. It clears by
+     * itself if the server authenticates under the pinned key again (for example once an interception stops).
+     */
+    private fun contactPin(s: Session, contact: app.goldfishsend.db.Contact, server: String) = ServerPin(
+        expected = contact.outServerKey,
+        onFirstUse = { fp -> s.repo.learnOutServerKey(contact.id, server, fp) },
+        onMismatch = { fp ->
+            if (s.repo.contact(contact.id)?.pendingServerKey != fp) {
+                s.repo.setPendingServerKey(contact.id, fp)
+                s.db.notifyChanged()
+            }
+        },
+        onVerified = {
+            if (s.repo.contact(contact.id)?.pendingServerKey != null) {
+                s.repo.setPendingServerKey(contact.id, null)
+                s.db.notifyChanged()
+            }
+        },
+    )
 
     /**
      * Solves a server's challenge, treating an absurd difficulty or a timeout as a server failure (retried later) rather

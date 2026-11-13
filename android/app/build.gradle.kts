@@ -44,6 +44,13 @@ android {
         // Verifiers must build with the same -Pgf.defaultServer as the release (or none for the default).
         val defaultServer = (project.findProperty("gf.defaultServer") as String?) ?: "https://relay.goldfishsend.app"
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"$defaultServer\"")
+        // The default server's identity fingerprint (b64u, from the server's `fingerprint` command). Empty means the app
+        // trusts that server's key on first use. Verifiers must use the same value as the release.
+        val defaultServerKey = (project.findProperty("gf.defaultServerKey") as String?) ?: ""
+        require(defaultServerKey.isEmpty() || Regex("^[A-Za-z0-9_-]{43}$").matches(defaultServerKey)) {
+            "gf.defaultServerKey must be a 43-character base64url fingerprint"
+        }
+        buildConfigField("String", "DEFAULT_SERVER_KEY", "\"$defaultServerKey\"")
         // Only the arm64 / x86_64 native libs (libsignal, sqlcipher) are shipped.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {

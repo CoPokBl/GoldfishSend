@@ -5,6 +5,7 @@ import app.goldfishsend.db.Mailbox
 import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.OutboxKind
+import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Chunker
@@ -136,7 +137,10 @@ object Messenger {
                 if (secret == null || secret.size != 32 || !ServerApi.isValidContactServer(c.server)) {
                     return
                 }
-                s.repo.updateContactOutbound(cid, c.server, secret)
+                if (c.serverKey != null && !Gateway.isFingerprint(c.serverKey)) {
+                    return
+                }
+                s.repo.updateContactOutbound(cid, c.server, secret, c.serverKey)
                 val contact = s.repo.contact(cid)
                 val name = Sanitize.name(c.name)
                 if (name != null && contact?.name == Invites.DEFAULT_NAME) {
@@ -170,8 +174,12 @@ object Messenger {
             }
             is Content.Mailbox -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
-                if (secret != null && secret.size == 32 && ServerApi.isValidContactServer(c.server)) {
-                    s.repo.updateContactOutbound(cid, c.server, secret)
+                val keyOk = c.serverKey == null || Gateway.isFingerprint(c.serverKey)
+                if (secret != null && secret.size == 32 && keyOk && ServerApi.isValidContactServer(c.server)) {
+                    // E2E-authenticated by the contact, so a new server fingerprint here resolves a pending identity change.
+                    s.repo.updateContactOutbound(cid, c.server, secret, c.serverKey)
+                    s.db.notifyChanged()
+                    Outbox.kick()
                 }
             }
         }

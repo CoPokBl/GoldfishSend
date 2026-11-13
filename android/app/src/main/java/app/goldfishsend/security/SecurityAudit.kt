@@ -27,6 +27,7 @@ enum class Severity(val weight: Int) { CRITICAL(25), WARNING(10), INFO(2), NOTE(
 
 /** One-tap fixes the app can apply itself, or system screens it can open. */
 enum class Fix {
+    REVIEW_SERVER_IDENTITY,
     SYSTEM_UPDATE,
     SECURITY_SETTINGS,
     DEVELOPER_SETTINGS,
@@ -351,6 +352,14 @@ object SecurityAudit {
         val onionServer = runCatching {
             app.goldfishsend.net.NetRules.isValidV3Onion(java.net.URI(prefs.serverUrl).host ?: "")
         }.getOrDefault(false)
+        prefs.serverKeyChanged?.let {
+            out += Finding(
+                "server_identity", Severity.CRITICAL, "Your server's identity changed",
+                "Its identity key isn't the one GoldfishSend remembered, so nothing is sent to it. The server may have been " +
+                    "replaced, or someone may be intercepting your connection.",
+                Fix.REVIEW_SERVER_IDENTITY, "Review",
+            )
+        }
         if (!prefs.serverUrl.startsWith("https://") && !onionServer) {
             out += Finding(
                 "tls", Severity.CRITICAL, "Server connection isn't encrypted",

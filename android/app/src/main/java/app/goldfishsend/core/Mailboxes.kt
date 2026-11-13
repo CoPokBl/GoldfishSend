@@ -238,7 +238,7 @@ object Mailboxes {
         val cid = m.contactId ?: return
         val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
         s.repo.bindMailbox(fresh.id, cid)
-        Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret)))
+        Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
     }
 
     /**
@@ -269,10 +269,41 @@ object Mailboxes {
             val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
             s.repo.bindMailbox(fresh.id, cid)
             s.repo.markReplaced(old.id, now)
-            Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret)))
+            Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
         }
         if (due.isNotEmpty()) {
             Graph.scope.launchSafe { ensurePool(s) }
+        }
+    }
+
+    /**
+     * The user trusted a new identity key for our own server. Tell every contact, through the E2E `mailbox` message (same
+     * mailbox, new `serverKey`), so their pins follow and their messages keep reaching us.
+     */
+    fun announceServerKey(s: Session, serverKey: String) {
+        if (s.decoy) {
+            return
+        }
+        for (c in s.repo.contacts()) {
+            val mb = s.repo.mailboxForContact(c.id) ?: continue
+            Messenger.sendControl(s, c.id, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), serverKey))
+        }
+    }
+
+    /**
+     * Trusts the new identity key [presented] for our own server (after the user reviewed it and re-authenticated), and
+     * announces it to every contact.
+     */
+    fun trustNewServerKey(s: Session, presented: String) {
+        if (s.decoy) {
+            return
+        }
+        Graph.prefs.serverKey = presented
+        Graph.prefs.serverKeyChanged = null
+        announceServerKey(s, presented)
+        Graph.scope.launchSafe {
+            runCatching { cleanup(s) }
+            runCatching { ensurePool(s) }
         }
     }
 

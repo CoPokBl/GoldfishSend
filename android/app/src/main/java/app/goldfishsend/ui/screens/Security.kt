@@ -119,6 +119,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
             Fix.ENABLE_WIPE_ON_RESTART -> p.wipeOnReboot = true
             Fix.CHANGE_PUSH -> pushPicker = true
             Fix.OPEN_CHATS -> openChats()
+            Fix.REVIEW_SERVER_IDENTITY -> ServerIdentityState.snoozed = null
         }
     }
 

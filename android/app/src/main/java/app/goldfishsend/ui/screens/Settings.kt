@@ -83,6 +83,7 @@ import app.goldfishsend.core.TIMER_CHOICES
 import app.goldfishsend.core.ThemeMode
 import app.goldfishsend.core.launchSafe
 import app.goldfishsend.core.timerLabel
+import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.push.PushHub
 import app.goldfishsend.security.Wiper
@@ -541,6 +542,7 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var url by remember { mutableStateOf(Graph.prefs.serverUrl) }
+    var fingerprint by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     val hasContacts by rememberQuery(s) { it.repo.contacts().isNotEmpty() }
     AlertDialog(
@@ -557,6 +559,8 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                     Text("Advanced: only change this if you run your own GoldfishSend server.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(12.dp))
                     SecureTextField(url, { url = it; error = null }, Modifier.fillMaxWidth(), hint = "https://", kind = FieldKind.URI)
+                    Spacer(Modifier.height(8.dp))
+                    SecureTextField(fingerprint, { fingerprint = it; error = null }, Modifier.fillMaxWidth(), hint = "Server fingerprint (optional)")
                     error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                 }
             }
@@ -567,12 +571,29 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                     error = "Use a secure https:// address."
                     return@TextButton
                 }
+                val typed = fingerprint.trim()
+                val fp = if (typed.isEmpty()) null else app.goldfishsend.net.Gateway.parseFingerprintInput(typed)
+                if (typed.isNotEmpty() && fp == null) {
+                    error = "That isn't a server fingerprint. Check it with the server's operator."
+                    return@TextButton
+                }
+                val target = url.trim().trimEnd('/')
                 scope.launch {
-                    val ok = withContext(Dispatchers.IO) {
-                        runCatching { Graph.api(url.trim().trimEnd('/')).info() }.isSuccess
+                    // Verify the server before switching: against the typed fingerprint, the built-in one, or the key it
+                    // presents now (remembered from here on).
+                    var learned: String? = null
+                    val expected = fp ?: app.goldfishsend.core.Prefs.builtInServerKey(target)
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            Graph.api(target, app.goldfishsend.net.ServerPin(expected, onFirstUse = { learned = it })).info()
+                        }
                     }
-                    if (!ok) {
-                        error = "Couldn't reach that server."
+                    result.exceptionOrNull()?.let { e ->
+                        error = if ((e as? ApiException)?.code == "server_identity_changed") {
+                            "That server's fingerprint doesn't match. Check it with the server's operator."
+                        } else {
+                            "Couldn't reach that server."
+                        }
                         return@launch
                     }
                     withContext(Dispatchers.IO) {
@@ -581,7 +602,9 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                             s.repo.deleteMailboxRow(m.id)
                         }
                     }
-                    Graph.prefs.serverUrl = url.trim().trimEnd('/')
+                    Graph.prefs.serverUrl = target
+                    Graph.prefs.serverKey = fp ?: learned
+                    Graph.prefs.serverKeyChanged = null
                     Graph.scope.launchSafe { PushHub.register(ctx) }
                     onDismiss()
                 }

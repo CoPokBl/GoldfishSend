@@ -3,6 +3,7 @@ package app.goldfishsend.net
 import app.goldfishsend.BuildConfig
 import app.goldfishsend.proto.B64
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -71,6 +72,9 @@ data class IdResponse(val id: String)
 @Serializable
 private data class ErrorBody(val error: String = "unknown", val scope: String? = null)
 
+@Serializable
+private data class SkewBody(val error: String? = null, val serverTime: Long? = null)
+
 /**
  * A failed server call. [code] is the protocol error code (or "network"/"http_<n>"), and [human] is a
  * friendly sentence that's safe to show users. Callers decide whether to retry using [retryable].
@@ -82,6 +86,8 @@ class ApiException(
     cause: Throwable? = null,
     /** For `rate_limited`: which limit was hit, one of `ip`, `network`, `mailbox` or `global` (docs/protocol.md). */
     val scope: String? = null,
+    /** For `server_identity_changed`: the fingerprint (b64u) the server presents now. It's never pinned automatically. */
+    val presentedKey: String? = null,
 ) : IOException("api error $code ($status)", cause) {
     /**
      * On sends, the per-IP and per-network limits can be paid off with a proof of work (shared IPs, Tor, CGNAT).
@@ -111,16 +117,91 @@ class ApiException(
             "tor_required" -> "This contact's server is a Tor (.onion) address. Turn on Tor in Settings › Connection to reach it."
             "tor_connecting" -> "Connecting to Tor…"
             "server_key_changed" -> "This server's identity changed. Check Settings › Connection before continuing."
+            "server_identity_changed" -> "Couldn't verify this server's identity, so nothing was sent. It may have been replaced, or someone may be intercepting the connection."
+            "clock_skew" -> "Your phone's clock looks wrong. Check the date and time settings."
             else -> "Something went wrong. We'll try again."
         }
     }
 }
 
-/** One client per server base URL. All calls are suspend functions and run on Dispatchers.IO. */
-class ServerApi(baseUrl: String, private val http: OkHttpClient) {
+/**
+ * How the transport treats one server's identity key (docs/protocol.md, "Server key").
+ *
+ * @param expected the pinned fingerprint (b64u), or null to trust the first key fetched.
+ * @param onFirstUse called with the fingerprint when [expected] is null and a key was fetched (trust on first use).
+ * @param onMismatch called with the presented fingerprint when it doesn't match [expected]. It's never pinned.
+ * @param onVerified called after a response authenticated under the pinned key.
+ */
+class ServerPin(
+    val expected: String?,
+    val onFirstUse: (String) -> Unit = {},
+    val onMismatch: (String) -> Unit = {},
+    val onVerified: () -> Unit = {},
+)
+
+/** Verified server key blobs (per fingerprint) and per-server clock offsets. */
+interface GatewayState {
+    fun blob(fp: String): ByteArray?
+
+    fun putBlob(fp: String, blob: ByteArray)
+
+    fun dropBlob(fp: String)
+
+    fun clockOffset(server: String): Long
+
+    fun setClockOffset(server: String, seconds: Long)
+
+    /** In memory only (tests, and the default before the app's persistent store is wired in). */
+    class Memory : GatewayState {
+        private val blobs = ConcurrentHashMap<String, ByteArray>()
+        private val offsets = ConcurrentHashMap<String, Long>()
+
+        override fun blob(fp: String): ByteArray? = blobs[fp]
+
+        override fun putBlob(fp: String, blob: ByteArray) {
+            blobs[fp] = blob
+        }
+
+        override fun dropBlob(fp: String) {
+            blobs.remove(fp)
+        }
+
+        override fun clockOffset(server: String): Long = offsets[server] ?: 0L
+
+        override fun setClockOffset(server: String, seconds: Long) {
+            offsets[server] = seconds
+        }
+    }
+}
+
+/**
+ * One client per server base URL. All calls are suspend functions and run on Dispatchers.IO.
+ *
+ * Every call goes through the encrypted gateway (`POST /v1/gw`, docs/protocol.md): the request is sealed to the server's
+ * hybrid ML-KEM-768 + P-256 key, which is pinned by fingerprint ([pin]). Only the holder of that key can read the request
+ * or produce a response that opens, so a forged TLS certificate or a TLS-terminating proxy learns nothing.
+ */
+class ServerApi(
+    baseUrl: String,
+    private val http: OkHttpClient,
+    private val pin: ServerPin = ServerPin(null),
+    private val state: GatewayState = defaultState,
+    private val clock: () -> Long = { System.currentTimeMillis() },
+) {
     private val base: HttpUrl = parseBase(baseUrl)
+    private val serverId: String = base.toString()
+
+    /** The fingerprint trusted on first use, so one instance stays consistent afterwards. */
+    @Volatile
+    private var learned: String? = null
 
     suspend fun info(): ServerInfo = get("v1/info", ServerInfo.serializer())
+
+    /**
+     * Fetches and verifies the server's key without making a call, and returns its fingerprint (b64u). With no pin, this
+     * is the trust-on-first-use step.
+     */
+    suspend fun identity(): String = withContext(Dispatchers.IO) { serverKey(force = false).fingerprintB64 }
 
     suspend fun powChallenge(): PowChallenge = postJson("v1/pow/challenge", null, PowChallenge.serializer())
 
@@ -148,34 +229,29 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
      */
     suspend fun sendMessage(sendSecret: ByteArray, blob: ByteArray, idempotencyKey: ByteArray, ttlSeconds: Long?, pow: String? = null): String =
         withContext(Dispatchers.IO) {
-            val b = Request.Builder()
-                .url(url("v1/messages"))
-                .header("GF-Send-Token", B64.enc(sendSecret))
-                .header("GF-Idempotency-Key", B64.enc(idempotencyKey))
-                .post(blob.toRequestBody(OCTET))
+            val headers = mutableListOf(
+                "content-type" to OCTET_TYPE,
+                "gf-send-token" to B64.enc(sendSecret),
+                "gf-idempotency-key" to B64.enc(idempotencyKey),
+            )
             if (ttlSeconds != null) {
-                b.header("GF-TTL", ttlSeconds.toString())
+                headers += "gf-ttl" to ttlSeconds.toString()
             }
             if (pow != null) {
-                b.header("GF-PoW", pow)
+                headers += "gf-pow" to pow
             }
-            execute(b.build()) { r -> decode(r, IdResponse.serializer()).id }
+            exchange("POST", "v1/messages", headers, blob) { r -> decode(r, IdResponse.serializer()).id }
         }
 
     suspend fun uploadInvite(blob: ByteArray, ttlSeconds: Long): String = withContext(Dispatchers.IO) {
-        val req = Request.Builder()
-            .url(url("v1/invites"))
-            .header("GF-TTL", ttlSeconds.toString())
-            .post(blob.toRequestBody(OCTET))
-            .build()
-        execute(req) { r -> decode(r, IdResponse.serializer()).id }
+        val headers = listOf("content-type" to OCTET_TYPE, "gf-ttl" to ttlSeconds.toString())
+        exchange("POST", "v1/invites", headers, blob) { r -> decode(r, IdResponse.serializer()).id }
     }
 
     /** Returns the invite blob, or null if it was already used or has expired. */
     suspend fun fetchInvite(id: String): ByteArray? = withContext(Dispatchers.IO) {
-        val req = Request.Builder().url(url("v1/invites/$id")).get().build()
         try {
-            execute(req) { r -> readCapped(r) }
+            exchange("GET", "v1/invites/$id", emptyList(), ByteArray(0)) { r -> r.body }
         } catch (e: ApiException) {
             if (e.status == 404) null else throw e
         }
@@ -186,7 +262,7 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
     private fun url(path: String): HttpUrl = base.resolve(path)!!
 
     private suspend fun <T> get(path: String, ser: KSerializer<T>): T = withContext(Dispatchers.IO) {
-        execute(Request.Builder().url(url(path)).get().build()) { decode(it, ser) }
+        exchange("GET", path, emptyList(), ByteArray(0)) { decode(it, ser) }
     }
 
     private suspend fun <T> postJson(path: String, json: String?, ser: KSerializer<T>?): T =
@@ -195,35 +271,159 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
     @Suppress("UNCHECKED_CAST")
     private suspend fun <T> send(path: String, method: String, json: String?, ser: KSerializer<T>?): T =
         withContext(Dispatchers.IO) {
-            val body = (json ?: "").toRequestBody(JSON)
-            execute(Request.Builder().url(url(path)).method(method, body).build()) { r ->
+            val body = (json ?: "").toByteArray(Charsets.UTF_8)
+            exchange(method, path, listOf("content-type" to JSON_TYPE), body) { r ->
                 if (ser == null) Unit as T else decode(r, ser)
             }
         }
 
-    private fun <T> execute(req: Request, onOk: (Response) -> T): T {
+    /**
+     * One API call through the gateway. It retries once after `421 unknown_key` (re-fetching the key, which must still match
+     * the pin) and once after an authenticated `clock_skew` (adopting the server's clock).
+     */
+    private fun <T> exchange(
+        method: String,
+        path: String,
+        headers: List<Pair<String, String>>,
+        body: ByteArray,
+        onOk: (GatewayCodec.InnerResponse) -> T,
+    ): T {
+        var forceKey = false
+        var refetched = false
+        var skewRetried = false
+        var replayRetried = false
+        while (true) {
+            val key = serverKey(forceKey)
+            forceKey = false
+            val inner = try {
+                GatewayCodec.encodeRequest(
+                    GatewayCodec.InnerRequest(
+                        GatewayCodec.methodCode(method),
+                        clock() / 1000 + state.clockOffset(serverId),
+                        "/" + path.trimStart('/'),
+                        headers,
+                        body,
+                    ),
+                )
+            } catch (e: GatewayCodec.FormatException) {
+                throw ApiException("too_large", 413, cause = e)
+            }
+            val sealed = Gateway.seal(key, inner)
+            val req = Request.Builder().url(url("v1/gw")).post(sealed.body.toRequestBody(OCTET)).build()
+            val plaintext: ByteArray? = try {
+                call(req) { r ->
+                    when {
+                        r.code == 421 && !refetched -> null
+                        r.code != 200 -> throw untrusted(r)
+                        else -> try {
+                            Gateway.openResponse(sealed.respSecret, readCapped(r))
+                        } catch (e: ApiException) {
+                            throw e
+                        } catch (e: Exception) {
+                            throw ApiException("bad_server", 502, retryAfterSeconds = 60, cause = e)
+                        }
+                    }
+                }
+            } finally {
+                sealed.respSecret.fill(0)
+            }
+            if (plaintext == null) {
+                // 421 is unauthenticated: re-fetch the key, which must still match the pin. It never re-pins.
+                refetched = true
+                state.dropBlob(key.fingerprintB64)
+                forceKey = true
+                continue
+            }
+            val resp = try {
+                GatewayCodec.decodeResponse(plaintext)
+            } catch (e: GatewayCodec.FormatException) {
+                throw ApiException("bad_server", 502, retryAfterSeconds = 60, cause = e)
+            }
+            // The response opened under the pinned key, so it really came from the server.
+            pin.onVerified()
+            if (resp.status == 400 && !skewRetried) {
+                val skew = runCatching { lenient.decodeFromString(SkewBody.serializer(), resp.body.toString(Charsets.UTF_8)) }.getOrNull()
+                if (skew?.error == "clock_skew" && skew.serverTime != null) {
+                    state.setClockOffset(serverId, skew.serverTime - clock() / 1000)
+                    skewRetried = true
+                    continue
+                }
+            }
+            if (resp.status in 200..299) {
+                return onOk(resp)
+            }
+            val err = try {
+                lenient.decodeFromString(ErrorBody.serializer(), resp.body.toString(Charsets.UTF_8))
+            } catch (e: Exception) {
+                ErrorBody("http_${resp.status}")
+            }
+            if (resp.status == 409 && err.error == "replay" && !replayRetried) {
+                // OkHttp may resend a request after a dropped connection. Seal it afresh: sends carry an idempotency key,
+                // so a request the server did process isn't applied twice.
+                replayRetried = true
+                continue
+            }
+            throw ApiException(err.error, resp.status, resp.header("retry-after")?.toLongOrNull(), scope = err.scope)
+        }
+    }
+
+    /**
+     * The server's key: from the cache when the pin is known, otherwise fetched from `GET /v1/key` and checked against the
+     * pin. A different key fails closed with `server_identity_changed`.
+     */
+    private fun serverKey(force: Boolean): ServerKey {
+        val expected = pin.expected ?: learned
+        if (expected != null && !force) {
+            state.blob(expected)?.let { cached ->
+                ServerKey.parse(cached)?.takeIf { it.fingerprintB64 == expected }?.let { return it }
+                state.dropBlob(expected)
+            }
+        }
+        val blob = call(Request.Builder().url(url("v1/key")).get().build()) { r ->
+            if (r.code != 200) {
+                throw untrusted(r)
+            }
+            readCapped(r, MAX_KEY_BYTES)
+        }
+        val key = ServerKey.parse(blob) ?: throw ApiException("bad_server", 502, retryAfterSeconds = 300)
+        val fp = key.fingerprintB64
+        if (expected == null) {
+            learned = fp
+            pin.onFirstUse(fp)
+        } else if (fp != expected) {
+            pin.onMismatch(fp)
+            throw ApiException("server_identity_changed", 0, presentedKey = fp)
+        }
+        state.putBlob(fp, key.blob)
+        return key
+    }
+
+    /** Runs one plain HTTP request, mapping transport failures. */
+    private fun <T> call(req: Request, onResponse: (Response) -> T): T {
         val resp = try {
             http.newCall(req).execute()
         } catch (e: BlockedRequestException) {
-            // Refused by our own network policy (Tor required or starting, server key changed). Nothing was sent.
+            // Refused by our own network policy (Tor required or starting, TLS key changed). Nothing was sent.
             throw ApiException(e.reason, 0, cause = e)
         } catch (e: IOException) {
             throw ApiException("network", 0, cause = e)
         }
-        resp.use { r ->
-            if (r.isSuccessful) {
-                return onOk(r)
-            }
-            val body = try {
-                lenient.decodeFromString(ErrorBody.serializer(), readCapped(r).toString(Charsets.UTF_8))
-            } catch (e: Exception) {
-                ErrorBody("http_${r.code}")
-            }
-            throw ApiException(body.error, r.code, r.header("Retry-After")?.toLongOrNull(), scope = body.scope)
-        }
+        return resp.use(onResponse)
     }
 
-    private fun <T> decode(r: Response, ser: KSerializer<T>): T = lenient.decodeFromString(ser, readCapped(r).toString(Charsets.UTF_8))
+    /**
+     * An error from outside the gateway. Anyone on the path (a proxy, or an attacker) can produce one, so only its status
+     * is used, never its body. In particular a plaintext 404 is not the server's `not_found` and can't make us drop a contact.
+     */
+    private fun untrusted(r: Response): ApiException = when {
+        r.code == 413 -> ApiException("too_large", 413)
+        r.code == 429 -> ApiException("rate_limited", 429, r.header("Retry-After")?.toLongOrNull()?.coerceIn(1, 3600) ?: 30)
+        r.code >= 500 -> ApiException("http_${r.code}", r.code)
+        else -> ApiException("bad_server", 502, retryAfterSeconds = 300)
+    }
+
+    private fun <T> decode(r: GatewayCodec.InnerResponse, ser: KSerializer<T>): T =
+        lenient.decodeFromString(ser, r.body.toString(Charsets.UTF_8))
 
     companion object {
         /**
@@ -231,6 +431,13 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
          * server (for example a contact's) can't stream gigabytes into memory.
          */
         const val MAX_RESPONSE_BYTES = 64 * 1024L
+
+        /** A key blob is 1250 bytes. */
+        const val MAX_KEY_BYTES = 4096L
+
+        /** Replaced by the app at startup with a store that keeps verified keys across launches. */
+        @Volatile
+        var defaultState: GatewayState = GatewayState.Memory()
 
         /** Reads at most [max] bytes of the body, failing instead of buffering anything larger. */
         fun readCapped(r: Response, max: Long = MAX_RESPONSE_BYTES): ByteArray {
@@ -253,9 +460,11 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
             return buf.readByteArray()
         }
 
-        private val JSON = "application/json".toMediaType()
-        /** Required verbatim by POST /v1/messages and /v1/invites. */
-        val OCTET = "application/octet-stream".toMediaType()
+        private const val JSON_TYPE = "application/json"
+
+        /** Required verbatim by POST /v1/messages, /v1/invites and /v1/gw. */
+        private const val OCTET_TYPE = "application/octet-stream"
+        val OCTET = OCTET_TYPE.toMediaType()
         private val lenient = Json { ignoreUnknownKeys = true }
 
         /**
@@ -300,9 +509,9 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
         }
 
         /**
-         * Routing (Direct, Orbot or built-in Tor) and server-key pinning are applied per request by [NetStack]. Cleartext
-         * is enabled at the OkHttp level only so http onion services work. [NetStack.RouteInterceptor] and the network
-         * security config both refuse plain http to anything else (outside debug builds).
+         * Routing (Direct, Orbot or built-in Tor) and optional TLS-key pinning are applied per request by [NetStack].
+         * Cleartext is enabled at the OkHttp level only so http onion services work. [NetStack.RouteInterceptor] and the
+         * network security config both refuse plain http to anything else (outside debug builds).
          */
         fun buildClient(): OkHttpClient {
             val modern = ConnectionSpec.Builder(ConnectionSpec.RESTRICTED_TLS)

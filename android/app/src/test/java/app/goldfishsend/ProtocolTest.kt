@@ -173,29 +173,45 @@ class InviteTest {
     private val key = Rand.bytes(32)
     private val id = B64.enc(Rand.bytes(16))
 
+    private val fp = B64.enc(Rand.bytes(32))
+
     @Test
     fun uriRoundTrip() {
         for (server in listOf("https://relay.example.org", "https://h.example:8443/sub/path", "http://10.0.2.2:5000")) {
-            val link = InviteLink(server, id, key)
+            val link = InviteLink(server, fp, id, key)
             val uri = link.toUri()
-            assertTrue(uri.startsWith("gfsend://invite#v=1&s="))
+            assertTrue(uri.startsWith("gfsend://invite#v=2&s="))
+            assertTrue(uri.contains("&f=$fp&"))
             assertEquals(link, InviteLink.parse(uri))
+            assertTrue(!InviteLink.isOutdated(uri))
         }
     }
 
     @Test
     fun parseRejectsBadInput() {
-        val good = InviteLink("https://x.example", id, key).toUri()
-        assertNull(InviteLink.parse("https://x.example/#v=1"))
-        assertNull(InviteLink.parse(good.replace("v=1", "v=2")))
-        assertNull(InviteLink.parse("gfsend://invite#v=1&s=https%3A%2F%2Fx&i=$id&k=${B64.enc(ByteArray(16))}"))
-        assertNull(InviteLink.parse("gfsend://invite#v=1&s=https%3A%2F%2Fx&i=abc&k=${B64.enc(key)}"))
+        val good = InviteLink("https://x.example", fp, id, key).toUri()
+        assertNull(InviteLink.parse("https://x.example/#v=2"))
+        assertNull(InviteLink.parse(good.replace("v=2", "v=3")))
+        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&f=$fp&i=$id&k=${B64.enc(ByteArray(16))}"))
+        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&f=$fp&i=abc&k=${B64.enc(key)}"))
+        // The server fingerprint is required, and must be 32 bytes.
+        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&i=$id&k=${B64.enc(key)}"))
+        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&f=${B64.enc(ByteArray(16))}&i=$id&k=${B64.enc(key)}"))
         assertNull(InviteLink.parse("gfsend://invite"))
         assertNotNull(InviteLink.parse("  $good  "))
     }
 
+    @Test
+    fun v1LinksAreOutdated() {
+        val v1 = "gfsend://invite#v=1&s=https%3A%2F%2Fx.example&i=$id&k=${B64.enc(key)}"
+        assertNull(InviteLink.parse(v1))
+        assertTrue(InviteLink.isOutdated(v1))
+        assertTrue(!InviteLink.isOutdated("https://example.org/#v=1"))
+    }
+
     private fun bundle() = InviteBundle(
         server = "https://relay.example.org",
+        serverKey = fp,
         sendSecret = B64.enc(Rand.bytes(32)),
         registrationId = 1234,
         identityKey = B64.enc(Rand.bytes(33)),
@@ -244,7 +260,7 @@ class InviteTest {
     @Test
     fun bundleJsonFieldNames() {
         val json = bundle().encode().toString(Charsets.UTF_8)
-        for (f in listOf("\"v\":1", "\"server\"", "\"sendSecret\"", "\"registrationId\"", "\"deviceId\":1", "\"identityKey\"", "\"signedPreKeyId\"",
+        for (f in listOf("\"v\":2", "\"server\"", "\"serverKey\":\"$fp\"", "\"sendSecret\"", "\"registrationId\"", "\"deviceId\":1", "\"identityKey\"", "\"signedPreKeyId\"",
             "\"signedPreKey\"", "\"signedPreKeySig\"", "\"kyberPreKeyId\"", "\"kyberPreKey\"", "\"kyberPreKeySig\"", "\"name\"")) {
             assertTrue("missing $f in $json", json.contains(f))
         }
@@ -258,6 +274,10 @@ class ContentTest {
     fun roundTripsAllTypes() {
         rt(Content.Hello("https://s.example", "abc", "Bob"))
         rt(Content.Hello("https://s.example", "abc"))
+        rt(Content.Hello("https://s.example", "abc", "Bob", "Zm9v"))
+        rt(Content.Mailbox("https://s.example", "abc", "Zm9v"))
+        assertTrue(Content.Mailbox("https://s", "a", "Zm9v").encode().toString(Charsets.UTF_8).contains("\"serverKey\":\"Zm9v\""))
+        assertTrue(Content.Hello("https://s", "a", null, "Zm9v").encode().toString(Charsets.UTF_8).contains("\"serverKey\":\"Zm9v\""))
         rt(Content.Text("id1", "hello \"world\" 🐟", 1700000000000, 3600, true, 0, 2))
         rt(Content.Text("id2", "plain", 1))
         rt(Content.Receipt(listOf("a", "b"), Content.Receipt.READ))

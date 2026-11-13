@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    private const val VERSION = 3
+    const val VERSION = 4
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -204,9 +204,22 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 4) {
+                for (s in V4) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Server identity pins (gateway v1). */
+    internal val V4 = listOf(
+        // The pinned identity fingerprint (b64u) of the contact's server. Null: trusted on first use.
+        "ALTER TABLE contacts ADD COLUMN out_server_key TEXT",
+        // A different fingerprint that server presented, waiting for review. Messages to this contact wait meanwhile.
+        "ALTER TABLE contacts ADD COLUMN pending_server_key TEXT",
+    )
 
     /** Time-bucketed message keys, and invite-to-prekey binding. */
     private val V3 = listOf(

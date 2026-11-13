@@ -203,7 +203,9 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                 .fillMaxSize()
                 .imePadding(),
         ) {
-            if (c != null && c.unreachable) {
+            if (c != null && c.pendingServerKey != null) {
+                Banner("Can't verify ${c.name}'s server. Messages will wait until it's sorted out. Tap to review.", onClick = openInfo)
+            } else if (c != null && c.unreachable) {
                 Banner("This contact can't be reached right now. They may have removed you.")
             } else if (c != null && !c.verified) {
                 Banner("Not verified. Compare safety numbers in contact info.", onClick = openInfo)
