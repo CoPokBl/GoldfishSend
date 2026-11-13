@@ -50,7 +50,7 @@ class MainActivity : FragmentActivity() {
      */
     private fun handleIntent(intent: Intent?) {
         val data = intent?.dataString
-        if (data != null && InviteLink.parse(data) != null) {
+        if (data != null && (InviteLink.parse(data) != null || InviteLink.isOutdated(data))) {
             pendingLink.value = data
         }
         if (intent != null && (intent.data != null || intent.extras != null)) {

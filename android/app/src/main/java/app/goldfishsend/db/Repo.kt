@@ -22,6 +22,10 @@ data class Contact(
     /** A changed identity key that hasn't been reviewed yet. Sending is paused while it's set. */
     val pendingIdentity: ByteArray? = null,
     val hidden: Boolean = false,
+    /** The pinned identity fingerprint (b64u) of [outServer], or null to trust it on first use. */
+    val outServerKey: String? = null,
+    /** A different fingerprint [outServer] presented. Messages to this contact wait until it's resolved. */
+    val pendingServerKey: String? = null,
 ) {
     val ready: Boolean
         get() = outServer != null && outSecret != null
@@ -151,27 +155,57 @@ class Repo(val db: Db, private val vault: MessageVault) {
         unread = c.getInt(11),
         pendingIdentity = if (c.isNull(12)) null else c.getBlob(12),
         hidden = c.getInt(13) != 0,
+        outServerKey = if (c.isNull(14)) null else c.getString(14),
+        pendingServerKey = if (c.isNull(15)) null else c.getString(15),
     )
 
     private val contactCols =
         "id, name, identity_key, verified, timer_secs, out_server, out_secret, received_any, unreachable, created_at, last_activity, unread, " +
-            "pending_identity, hidden"
+            "pending_identity, hidden, out_server_key, pending_server_key"
 
     fun contact(id: Long): Contact? = db.queryOne("SELECT $contactCols FROM contacts WHERE id = ?", id, map = ::contact)
 
     fun contacts(): List<Contact> = db.query("SELECT $contactCols FROM contacts ORDER BY last_activity DESC", map = ::contact)
 
-    fun createContact(name: String, verified: Boolean, timerSecs: Long, outServer: String?, outSecret: ByteArray?): Long {
+    fun createContact(
+        name: String,
+        verified: Boolean,
+        timerSecs: Long,
+        outServer: String?,
+        outSecret: ByteArray?,
+        outServerKey: String? = null,
+    ): Long {
         val now = System.currentTimeMillis()
         return db.insert(
-            "INSERT INTO contacts (name, verified, timer_secs, out_server, out_secret, created_at, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            Sanitize.name(name) ?: "Contact", verified, timerSecs, outServer, outSecret, now, now,
+            "INSERT INTO contacts (name, verified, timer_secs, out_server, out_secret, out_server_key, created_at, last_activity) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            Sanitize.name(name) ?: "Contact", verified, timerSecs, outServer, outSecret, outServerKey, now, now,
         )
     }
 
-    fun updateContactOutbound(id: Long, server: String, secret: ByteArray) {
-        db.exec("UPDATE contacts SET out_server = ?, out_secret = ?, unreachable = 0 WHERE id = ?", server, secret, id)
+    /**
+     * Where to reach a contact, from their E2E-authenticated `hello` or `mailbox` message. [serverKey] replaces the pin
+     * (and resolves a pending identity change). Without one, the pin is kept if the server didn't change, or is
+     * learned on first use if it did.
+     */
+    fun updateContactOutbound(id: Long, server: String, secret: ByteArray, serverKey: String?) {
+        val current = contact(id)
+        val key = serverKey ?: current?.outServerKey?.takeIf { current.outServer == server }
+        db.exec(
+            "UPDATE contacts SET out_server = ?, out_secret = ?, out_server_key = ?, pending_server_key = NULL, unreachable = 0 WHERE id = ?",
+            server, secret, key, id,
+        )
     }
+
+    /** Trust on first use: records [key] only if the contact still uses [server] and has no pin yet. */
+    fun learnOutServerKey(id: Long, server: String, key: String) =
+        db.exec("UPDATE contacts SET out_server_key = ? WHERE id = ? AND out_server = ? AND out_server_key IS NULL", key, id, server)
+
+    fun setPendingServerKey(id: Long, key: String?) = db.exec("UPDATE contacts SET pending_server_key = ? WHERE id = ?", key, id)
+
+    /** The user reviewed and trusted the new identity of this contact's server. */
+    fun trustPendingServerKey(id: Long, key: String) =
+        db.exec("UPDATE contacts SET out_server_key = ?, pending_server_key = NULL WHERE id = ? AND pending_server_key = ?", key, id, key)
 
     fun setContactIdentity(id: Long, key: ByteArray) = db.exec("UPDATE contacts SET identity_key = ? WHERE id = ?", key, id)
 

@@ -90,7 +90,17 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
             .onSuccess { id -> nav.navigate("chat/$id") { popUpTo("home") } }
             .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't add that contact.") }
     }
-    confirmLink?.let { raw ->
+    // Our own server presented a different identity key: explain, and let the user trust it (after re-authenticating).
+    app.goldfishsend.ui.screens.ServerIdentityChangedDialog(s)
+    confirmLink?.takeIf { InviteLink.isOutdated(it) }?.let {
+        AlertDialog(
+            onDismissRequest = { confirmLink = null },
+            title = { Text("This invite is out of date") },
+            text = { Text("It was made by an older version of GoldfishSend. Ask them to update the app and send you a new one.") },
+            confirmButton = { TextButton(onClick = { confirmLink = null }) { Text("OK") } },
+        )
+    }
+    confirmLink?.takeUnless { InviteLink.isOutdated(it) }?.let { raw ->
         val host = InviteLink.parse(raw)?.server?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: "an unknown server"
         AlertDialog(
             onDismissRequest = { confirmLink = null },

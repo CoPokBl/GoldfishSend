@@ -116,6 +116,35 @@ object NetPrefs {
     fun clear() {
         sp.edit().clear().commit()
         _mismatch.value = null
+        offsets.clear()
         changed()
+    }
+
+    private const val SERVER_KEY_PREFIX = "skey:"
+    private val offsets = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Verified server identity key blobs, by fingerprint, so the app doesn't fetch `GET /v1/key` on every launch. They're
+     * public keys; a blob is only ever used if it still hashes to the pinned fingerprint. Clock offsets stay in memory.
+     */
+    val gatewayState: app.goldfishsend.net.GatewayState = object : app.goldfishsend.net.GatewayState {
+        override fun blob(fp: String): ByteArray? =
+            sp.getString(SERVER_KEY_PREFIX + fp, null)?.let { runCatching { app.goldfishsend.proto.B64.dec(it) }.getOrNull() }
+
+        override fun putBlob(fp: String, blob: ByteArray) {
+            if (sp.getString(SERVER_KEY_PREFIX + fp, null) == null) {
+                sp.edit().putString(SERVER_KEY_PREFIX + fp, app.goldfishsend.proto.B64.enc(blob)).apply()
+            }
+        }
+
+        override fun dropBlob(fp: String) {
+            sp.edit().remove(SERVER_KEY_PREFIX + fp).apply()
+        }
+
+        override fun clockOffset(server: String): Long = offsets[server] ?: 0L
+
+        override fun setClockOffset(server: String, seconds: Long) {
+            offsets[server] = seconds
+        }
     }
 }

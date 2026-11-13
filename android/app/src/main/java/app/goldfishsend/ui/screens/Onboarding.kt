@@ -181,6 +181,8 @@ private fun PushStep(next: () -> Unit) {
     var advanced by remember { mutableStateOf(false) }
     var server by remember { mutableStateOf(Graph.prefs.serverUrl) }
     var serverError by remember { mutableStateOf<String?>(null) }
+    var fingerprint by remember { mutableStateOf("") }
+    var fingerprintError by remember { mutableStateOf<String?>(null) }
     var networkSettings by remember { mutableStateOf(false) }
     LifecycleResumeEffect(Unit) {
         dists = PushHub.distributors(ctx)
@@ -235,6 +237,15 @@ private fun PushStep(next: () -> Unit) {
                     Spacer(Modifier.height(6.dp))
                     SecureTextField(server, { server = it; serverError = null }, Modifier.fillMaxWidth(), hint = "https://", kind = FieldKind.URI)
                     serverError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                    Spacer(Modifier.height(12.dp))
+                    Text("Server fingerprint (optional)", style = MaterialTheme.typography.labelLarge)
+                    Spacer(Modifier.height(6.dp))
+                    SecureTextField(fingerprint, { fingerprint = it; fingerprintError = null }, Modifier.fillMaxWidth(), hint = "From the server's operator")
+                    Text(
+                        fingerprintError ?: "If you have it, GoldfishSend checks the server against it. Otherwise it remembers the server's identity on first connection.",
+                        color = if (fingerprintError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     Spacer(Modifier.height(8.dp))
                     // Tor (built-in or Orbot) and key pinning, needed before setup for an .onion server.
                     TextButton(onClick = { networkSettings = true }) { Text("Connection: ${connectionSummary()}") }
@@ -258,7 +269,20 @@ private fun PushStep(next: () -> Unit) {
                             serverError = "That doesn't look like a secure server address (https://… or a Tor .onion address)."
                             return@Button
                         }
-                        Graph.prefs.serverUrl = server.trim().trimEnd('/')
+                        val typed = fingerprint.trim()
+                        val fp = if (typed.isEmpty()) null else app.goldfishsend.net.Gateway.parseFingerprintInput(typed)
+                        if (typed.isNotEmpty() && fp == null) {
+                            advanced = true
+                            fingerprintError = "That isn't a server fingerprint. Check it with the server's operator."
+                            return@Button
+                        }
+                        val url = server.trim().trimEnd('/')
+                        if (url != Graph.prefs.serverUrl || fp != null) {
+                            // A different server (or an explicit fingerprint): start from that pin, or trust on first use.
+                            Graph.prefs.serverUrl = url
+                            Graph.prefs.serverKey = fp
+                            Graph.prefs.serverKeyChanged = null
+                        }
                         PushHub.select(ctx, selected!!)
                         next()
                     },

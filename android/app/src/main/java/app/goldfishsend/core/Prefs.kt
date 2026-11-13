@@ -61,6 +61,22 @@ class Prefs(context: Context) {
         get() = str("server_url") ?: BuildConfig.DEFAULT_SERVER_URL
         set(v) = setStr("server_url", v)
 
+    /**
+     * The pinned identity fingerprint (b64u) of our own server. For the built-in default server it's built into the app;
+     * otherwise it's trusted on first use or typed in at setup. Null until known.
+     */
+    var serverKey: String?
+        get() = str("server_key") ?: builtInServerKey(serverUrl)
+        set(v) = setStr("server_key", v)
+
+    /**
+     * A different fingerprint our server presented, waiting for the user to decide (docs/protocol.md "Server key"). While
+     * it's set, the app doesn't talk to the server unless a response authenticates under the pinned key again.
+     */
+    var serverKeyChanged: String?
+        get() = str("server_key_changed")
+        set(v) = setStr("server_key_changed", v)
+
     var themeMode: ThemeMode
         get() = ThemeMode.entries[int("theme", 0)]
         set(v) = setInt("theme", v.ordinal)
@@ -253,5 +269,11 @@ class Prefs(context: Context) {
     fun clear() {
         sp.edit().clear().commit()
         changed()
+    }
+
+    companion object {
+        /** The fingerprint built in with `-Pgf.defaultServerKey`, which applies only to the built-in default server. */
+        fun builtInServerKey(url: String): String? =
+            BuildConfig.DEFAULT_SERVER_KEY.takeIf { it.isNotEmpty() && url.trimEnd('/') == BuildConfig.DEFAULT_SERVER_URL.trimEnd('/') }
     }
 }

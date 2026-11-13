@@ -94,6 +94,11 @@ private fun Throwable.friendly(): String = when (this) {
  * Shared by the scanner, "Paste link" and gfsend:// deep links.
  */
 suspend fun acceptInvite(s: Session, raw: String, viaQr: Boolean): Result<Long> = withContext(Dispatchers.IO) {
+    if (InviteLink.isOutdated(raw)) {
+        return@withContext Result.failure(
+            InviteException("This invite was made by an older version of GoldfishSend. Ask them to update the app and send a new one."),
+        )
+    }
     val link = InviteLink.parse(raw) ?: return@withContext Result.failure(InviteException("That's not a GoldfishSend code."))
     try {
         Result.success(Invites.accept(s, link, viaQr))

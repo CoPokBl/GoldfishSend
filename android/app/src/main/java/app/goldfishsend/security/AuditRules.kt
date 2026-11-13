@@ -60,6 +60,7 @@ object AuditRules {
         severity == Severity.OK -> false
         id == "screenlock" -> false // nothing protects the device or its storage keys
         id == "tls" -> false // plaintext connection to the server
+        id == "server_identity" -> false // our server can't be verified, so nothing gets through until it's resolved
         id == "encryption" -> false // unencrypted device storage
         id == "push" && severity == Severity.CRITICAL -> false // push not working: messages won't arrive
         id == "ime" && severity == Severity.CRITICAL -> false // keyboard known to send keystrokes off the device

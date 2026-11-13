@@ -55,6 +55,10 @@ import app.goldfishsend.ui.components.SecureTextField
 import app.goldfishsend.ui.components.SettingRow
 import app.goldfishsend.ui.components.SwitchRow
 import app.goldfishsend.ui.components.rememberQuery
+import androidx.activity.compose.LocalActivity
+import androidx.fragment.app.FragmentActivity
+import app.goldfishsend.ui.components.blockWhenObscured
+import app.goldfishsend.ui.components.rememberReAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.signal.libsignal.protocol.IdentityKey
@@ -80,6 +84,8 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     var confirmAccept by remember { mutableStateOf(false) }
+    val activity = LocalActivity.current as FragmentActivity
+    val reauth = rememberReAuth(s, activity)
     val c = contact ?: return
     val newSafety by rememberQuery(s, c.pendingIdentity?.size) { q -> c.pendingIdentity?.let { safetyNumber(q, it) } }
 
@@ -123,6 +129,40 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                 },
             )
             Spacer(Modifier.height(16.dp))
+
+            c.pendingServerKey?.let { presented ->
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = MaterialTheme.shapes.large,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                ) {
+                    Column(Modifier.padding(20.dp)) {
+                        Text("Can't verify ${c.name}'s server", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Its identity key changed. $SERVER_IDENTITY_EXPLANATION Messages to ${c.name} wait until this is sorted " +
+                                "out. It also resolves by itself if ${c.name} tells your app about the new key.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        FingerprintPair(c.outServerKey, presented)
+                        Spacer(Modifier.height(12.dp))
+                        Button(
+                            onClick = {
+                                reauth.require("Trusting a new server identity.") {
+                                    scope.launch(Dispatchers.IO) {
+                                        s.repo.trustPendingServerKey(contactId, presented)
+                                        s.db.notifyChanged()
+                                        app.goldfishsend.core.Outbox.kick()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.blockWhenObscured(),
+                        ) { Text("Trust new identity") }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
 
             if (c.pendingIdentity != null) {
                 Surface(
@@ -206,7 +246,8 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                 // Their server is their own choice: showing it lets you notice an unexpected one.
                 SettingRow(
                     "Their server",
-                    c.outServer?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: "Not known yet",
+                    (c.outServer?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: "Not known yet") +
+                        (c.outServerKey?.let { "\nIdentity " + app.goldfishsend.net.Gateway.displayFingerprint(it) } ?: ""),
                     Icons.Rounded.Dns,
                 )
                 SettingRow(

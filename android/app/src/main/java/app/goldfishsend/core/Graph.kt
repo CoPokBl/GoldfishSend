@@ -11,6 +11,7 @@ import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.Repo
 import app.goldfishsend.net.ServerApi
+import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.Rand
@@ -81,6 +82,7 @@ object Graph {
 
     fun init(application: Application) {
         app = application
+        ServerApi.defaultState = NetPrefs.gatewayState
     }
 
     fun httpClient(): OkHttpClient = http ?: synchronized(this) {
@@ -93,7 +95,41 @@ object Graph {
         http = null
     }
 
-    fun api(server: String = prefs.serverUrl): ServerApi = ServerApi(server, httpClient())
+    /**
+     * Our own server, pinned to [Prefs.serverKey]. On first use the fingerprint is recorded; a different key sets
+     * [Prefs.serverKeyChanged] (shown in the Security tab and as a dialog) and nothing is sent until it's resolved.
+     */
+    fun api(): ServerApi {
+        val url = prefs.serverUrl
+        return ServerApi(url, httpClient(), ownPin(url))
+    }
+
+    private fun ownPin(url: String) = ServerPin(
+        expected = prefs.serverKey,
+        onFirstUse = { fp ->
+            synchronized(this) {
+                if (prefs.serverUrl == url && prefs.serverKey == null) {
+                    prefs.serverKey = fp
+                }
+            }
+        },
+        onMismatch = { fp ->
+            if (prefs.serverUrl == url) {
+                prefs.serverKeyChanged = fp
+            }
+        },
+        onVerified = {
+            if (prefs.serverUrl == url && prefs.serverKeyChanged != null) {
+                prefs.serverKeyChanged = null
+            }
+        },
+    )
+
+    /** Some other server (a contact's, or one being checked before switching), with an explicit [pin]. */
+    fun api(server: String, pin: ServerPin): ServerApi = ServerApi(server, httpClient(), pin)
+
+    /** Our own server's fingerprint, fetching it (trust on first use) if it isn't known yet. */
+    suspend fun ownServerKey(): String = prefs.serverKey ?: api().identity()
 
     val isUnlocked: Boolean
         get() = _session.value != null

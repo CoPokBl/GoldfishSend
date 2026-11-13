@@ -10,7 +10,7 @@ import kotlinx.serialization.json.Json
 sealed class Content {
     @Serializable
     @SerialName("hello")
-    data class Hello(val server: String, val sendSecret: String, val name: String? = null) : Content()
+    data class Hello(val server: String, val sendSecret: String, val name: String? = null, val serverKey: String? = null) : Content()
 
     @Serializable
     @SerialName("text")
@@ -43,7 +43,7 @@ sealed class Content {
 
     @Serializable
     @SerialName("mailbox")
-    data class Mailbox(val server: String, val sendSecret: String) : Content()
+    data class Mailbox(val server: String, val sendSecret: String, val serverKey: String? = null) : Content()
 
     fun encode(): ByteArray = ProtoJson.encodeToString(serializer(), this).utf8()
 

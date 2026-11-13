@@ -43,7 +43,9 @@ import androidx.compose.ui.window.DialogProperties
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.NetPrefs
 import app.goldfishsend.core.PinMismatch
+import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.NetStack
+import app.goldfishsend.security.ClipboardGuard
 import app.goldfishsend.net.PinPolicy
 import app.goldfishsend.net.ProxyMode
 import app.goldfishsend.net.TorManager
@@ -56,7 +58,7 @@ fun connectionSummary(): String = when (NetPrefs.proxyMode) {
     ProxyMode.DIRECT -> "Direct connection"
     ProxyMode.EMBEDDED_TOR -> "Built-in Tor"
     ProxyMode.ORBOT -> "Tor through Orbot"
-} + if (NetPrefs.pinServers) " · server keys pinned" else ""
+} + if (NetPrefs.pinServers) " · TLS keys pinned" else ""
 
 private fun modeTitle(m: ProxyMode) = when (m) {
     ProxyMode.DIRECT -> "Direct"
@@ -140,11 +142,35 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                     )
                 }
 
-                SectionHeader("Server keys")
+                SectionHeader("Server identity")
+                val prefsVersion by Graph.prefs.version.collectAsState()
+                @Suppress("UNUSED_EXPRESSION") prefsVersion
+                val own = Graph.prefs.serverKey
+                Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp)) {
+                    Text(runCatching { java.net.URI(Graph.prefs.serverUrl).host }.getOrNull() ?: Graph.prefs.serverUrl, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        own?.let { Gateway.displayFingerprint(it) } ?: "Recorded the first time the app connects.",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = if (own != null) FontFamily.Monospace else null,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (own != null) {
+                        TextButton(onClick = { ClipboardGuard.copy(ctx, Gateway.displayFingerprint(own)) }) { Text("Copy") }
+                    }
+                }
+                Text(
+                    "GoldfishSend always checks this identity key and encrypts every request to it, whatever the connection. " +
+                        "Compare it with the fingerprint your server's operator publishes.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                )
+
+                SectionHeader("TLS keys (optional)")
                 SwitchRow(
-                    "Pin server keys",
-                    "Remember each server's key the first time you connect, and refuse to connect if it ever changes. " +
-                        "Protects against interception, but you'll be asked what to do whenever a server changes its key.",
+                    "Pin TLS keys",
+                    "An extra layer on top of the identity check: also remember each server's TLS certificate key and refuse to " +
+                        "connect if it changes. You'll be asked what to do whenever a server renews its certificate with a new key.",
                     Icons.Rounded.Key,
                     NetPrefs.pinServers,
                 ) {

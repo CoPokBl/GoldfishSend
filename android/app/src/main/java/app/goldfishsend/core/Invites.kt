@@ -3,7 +3,9 @@ package app.goldfishsend.core
 import app.goldfishsend.db.Mailbox
 import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.net.ApiException
+import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.ServerApi
+import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.InviteBundle
@@ -59,6 +61,12 @@ object Invites {
         }
         val mb = Mailboxes.take(s, purpose)
             ?: throw InviteException("Still getting things ready. This only takes a moment the first time.")
+        val serverKey = try {
+            Graph.ownServerKey()
+        } catch (e: ApiException) {
+            s.repo.releasePoolMailbox(mb.id)
+            throw InviteException(e.human)
+        }
         val ttl = if (purpose == Mailbox.PURPOSE_LINK) LINK_TTL_SECS else QR_TTL_SECS
         var issued: Pair<Int, Int>? = null
         val bundle = s.lock.withLock {
@@ -77,6 +85,7 @@ object Invites {
                 issued = spkId to kyberId
                 InviteBundle(
                     server = Graph.prefs.serverUrl,
+                    serverKey = serverKey,
                     sendSecret = B64.enc(mb.sendSecret),
                     registrationId = s.signal.localRegistrationId,
                     deviceId = 1,
@@ -113,7 +122,7 @@ object Invites {
         val expiresAt = System.currentTimeMillis() + ttl * 1000
         s.repo.markInviteUsed(mb.id, expiresAt)
         Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
-        val created = Created(InviteLink(Graph.prefs.serverUrl, id, key), mb.id, expiresAt)
+        val created = Created(InviteLink(Graph.prefs.serverUrl, serverKey, id, key), mb.id, expiresAt)
         if (purpose == Mailbox.PURPOSE_QR) {
             cachedQr = created
         }
@@ -131,10 +140,18 @@ object Invites {
         if (!ServerApi.isValidContactServer(link.server)) {
             throw InviteException("This invite points to a server that isn't secure.")
         }
+        // The link carries the inviter's server fingerprint, so the fetch is verified from the start (no trust on first use).
         val blob = try {
-            Graph.api(link.server).fetchInvite(link.id)
+            Graph.api(link.server, ServerPin(link.serverKey)).fetchInvite(link.id)
         } catch (e: ApiException) {
-            throw InviteException(if (e.code == "network") "Couldn't reach the server. Check your connection and try again." else e.human)
+            throw InviteException(
+                when (e.code) {
+                    "network" -> "Couldn't reach the server. Check your connection and try again."
+                    "server_identity_changed" ->
+                        "Couldn't verify the server this invite points to. Someone may be intercepting your connection, or the server was replaced."
+                    else -> e.human
+                },
+            )
         } ?: throw InviteException("This code was already used or has expired. Ask for a new one.")
         val bundle = try {
             InviteCrypto.decrypt(link.key, blob)
@@ -143,6 +160,10 @@ object Invites {
         }
         if (!ServerApi.isValidContactServer(bundle.server)) {
             throw InviteException("This invite points to a server that isn't secure.")
+        }
+        val bundleKey = bundle.serverKey
+        if (bundle.v < 2 || !Gateway.isFingerprint(bundleKey) || (bundle.server == link.server && bundleKey != link.serverKey)) {
+            throw InviteException("This code doesn't look right. Ask for a new one.")
         }
         val contactId = s.lock.withLock {
             s.db.tx {
@@ -153,6 +174,7 @@ object Invites {
                     timerSecs = timer,
                     outServer = bundle.server,
                     outSecret = B64.dec(bundle.sendSecret),
+                    outServerKey = bundleKey,
                 )
                 val identity = IdentityKey(B64.dec(bundle.identityKey))
                 val pk = PreKeyBundle(

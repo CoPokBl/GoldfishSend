@@ -94,6 +94,9 @@ object Wiper {
         val s = Graph.realSession
         val remote = s?.let { runCatching { it.repo.allMailboxes().map(Mailboxes::item) }.getOrNull() }.orEmpty()
         val server = Graph.prefs.serverUrl
+        // Captured before the settings go: the deletes still verify the server's identity. Without a pin they're skipped
+        // (they'd only reveal the secrets to whoever answers).
+        val serverKey = Graph.prefs.serverKey
         Graph.lock()
         Graph.vault.destroyAll()
         app.goldfishsend.crypto.BucketKeys.destroyAll()
@@ -121,12 +124,12 @@ object Wiper {
                 android.os.Process.killProcess(android.os.Process.myPid())
             }
         }
-        if (remote.isNotEmpty()) {
+        if (remote.isNotEmpty() && serverKey != null) {
             GlobalScope.launch {
                 try {
                     withTimeoutOrNull(15_000) {
                         runCatching {
-                            val api = Graph.api(server)
+                            val api = Graph.api(server, app.goldfishsend.net.ServerPin(serverKey))
                             for (batch in remote.chunked(100)) {
                                 api.delete(batch)
                             }
