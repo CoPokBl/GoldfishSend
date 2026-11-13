@@ -70,6 +70,12 @@ import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Mailboxes
 import app.goldfishsend.core.Session
 import app.goldfishsend.db.ChatSummary
+import app.goldfishsend.db.groupRefs
+import app.goldfishsend.core.Groups
+import app.goldfishsend.group.GroupModel
+import app.goldfishsend.ui.components.GroupAvatar
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.rounded.GroupAdd
 import app.goldfishsend.ui.components.Avatar
 import app.goldfishsend.ui.components.StatusLine
 import app.goldfishsend.ui.components.StatusTicks
@@ -85,6 +91,7 @@ fun HomeScreen(
     openChat: (Long) -> Unit,
     addContact: () -> Unit,
     openPassphrase: () -> Unit,
+    newGroup: () -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     Scaffold(
@@ -109,7 +116,7 @@ fun HomeScreen(
         Box(Modifier.padding(bottom = pad.calculateBottomPadding())) {
             AnimatedContent(tab, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "tab") { t ->
                 when (Tab.entries[t]) {
-                    Tab.CHATS -> ChatList(s, openChat, addContact)
+                    Tab.CHATS -> ChatList(s, openChat, addContact, newGroup)
                     Tab.SECURITY -> SecurityScreen(s, openPassphrase = openPassphrase, openChats = { tab = 0 })
                     Tab.SETTINGS -> SettingsScreen(s, openPassphrase)
                 }
@@ -120,11 +127,22 @@ fun HomeScreen(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
-    val allChats by rememberQuery(s) { it.repo.chatSummaries(System.currentTimeMillis()) }
+fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGroup: () -> Unit = {}) {
+    val allChats by rememberQuery(s) { q ->
+        val groups = q.repo.groupRefs().associateBy { it.cid }
+        q.repo.chatSummaries(System.currentTimeMillis()).map { c ->
+            val ref = groups[c.contact.id]
+            val sender = if (ref != null && !c.lastOutgoing && c.lastSender != null) {
+                Groups.memberName(q, Groups.model(q, ref.cid), c.lastSender).name
+            } else {
+                null
+            }
+            ChatEntry(c, ref?.state, sender)
+        }
+    }
     val revealed by s.hiddenRevealed.collectAsState()
     // Hidden chats stay out of the list until the hidden-chats PIN was entered in this session.
-    val chats = allChats?.filter { !it.contact.hidden || revealed }
+    val chats = allChats?.filter { !it.summary.contact.hidden || revealed }
     var askHiddenPin by remember { mutableStateOf(false) }
     val busy by Mailboxes.busy.collectAsState()
     val prefsVersion by Graph.prefs.version.collectAsState()
@@ -142,6 +160,9 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
                         Modifier.combinedClickable(onClick = {}, onLongClick = { askHiddenPin = true }, indication = null,
                             interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }),
                     )
+                },
+                actions = {
+                    IconButton(onClick = newGroup) { Icon(Icons.Rounded.GroupAdd, "New group") }
                 },
                 scrollBehavior = scroll,
             )
@@ -165,8 +186,8 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
                 EmptyChats(addContact)
             } else {
                 LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 96.dp)) {
-                    items(list.orEmpty(), key = { it.contact.id }) { c ->
-                        ChatRow(c, Modifier.animateItem()) { openChat(c.contact.id) }
+                    items(list.orEmpty(), key = { it.summary.contact.id }) { c ->
+                        ChatRow(c, Modifier.animateItem()) { openChat(c.summary.contact.id) }
                     }
                 }
             }
@@ -190,13 +211,20 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
     }
 }
 
+/** A chat list row: the summary, plus for groups our membership state and the last message's sender. */
+private data class ChatEntry(val summary: ChatSummary, val groupState: Int?, val sender: String?)
+
 @Composable
-private fun ChatRow(c: ChatSummary, modifier: Modifier, onClick: () -> Unit) {
+private fun ChatRow(e: ChatEntry, modifier: Modifier, onClick: () -> Unit) {
+    val c = e.summary
     val unread = c.contact.unread
+    val invited = e.groupState == GroupModel.INVITED
     ListItem(
         modifier = modifier.clickable(onClick = onClick).padding(horizontal = 4.dp),
         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        leadingContent = { Avatar(c.contact.name, c.contact.id, 52.dp) },
+        leadingContent = {
+            if (c.contact.isGroup) GroupAvatar(c.contact.id, 52.dp) else Avatar(c.contact.name, c.contact.id, 52.dp)
+        },
         headlineContent = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -206,7 +234,7 @@ private fun ChatRow(c: ChatSummary, modifier: Modifier, onClick: () -> Unit) {
                     fontWeight = if (unread > 0) FontWeight.SemiBold else FontWeight.Normal,
                     modifier = Modifier.weight(1f, fill = false),
                 )
-                if (c.contact.verified) {
+                if (c.contact.verified && !c.contact.isGroup) {
                     Spacer(Modifier.width(4.dp))
                     Icon(Icons.Rounded.Verified, "Verified", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                 }
@@ -224,13 +252,20 @@ private fun ChatRow(c: ChatSummary, modifier: Modifier, onClick: () -> Unit) {
                 }
                 Text(
                     when {
+                        invited -> "Invitation to join"
+                        e.groupState == GroupModel.REMOVED -> "You were removed"
                         c.contact.unreachable -> "Can't be reached right now"
+                        c.lastBody != null && e.sender != null -> "${e.sender}: ${c.lastBody}"
                         c.lastBody != null -> c.lastBody
                         else -> "Say hi 👋"
                     },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    color = if (unread > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = when {
+                        invited -> MaterialTheme.colorScheme.primary
+                        unread > 0 -> MaterialTheme.colorScheme.onSurface
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
             }
         },

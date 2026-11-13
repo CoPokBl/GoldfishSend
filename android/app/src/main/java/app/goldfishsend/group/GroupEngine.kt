@@ -402,8 +402,22 @@ class GroupEngine(
                     publish(m, op)
                 }
             }
-            RosterRules.Decision.Keep -> store.addHistory(c.g, signed)
-            is RosterRules.Decision.Ignore -> Unit
+            RosterRules.Decision.Keep -> {
+                store.addHistory(c.g, signed)
+                enforceDeparture(m, r)
+            }
+            is RosterRules.Decision.Ignore -> if (d.reason != "same") enforceDeparture(m, r)
+        }
+    }
+
+    /**
+     * A roster signed by someone that leaves them out means "I'm leaving" (or declining), whatever its version. If it lost
+     * a tie or arrived too late to apply, the leaver won't try again, so an admin removes them (docs/groups.md, rule 3).
+     */
+    private fun enforceDeparture(m: GroupModel, r: Roster) {
+        val cur = m.roster?.roster ?: return
+        if (r.role(r.by) == null && cur.role(r.by) != null && r.by != me && m.state == GroupModel.JOINED && cur.isAdmin(me)) {
+            publish(m, RosterOp.Remove(listOf(r.by)))
         }
     }
 

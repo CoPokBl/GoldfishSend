@@ -132,7 +132,11 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
                     openChat = { nav.navigate("chat/$it") },
                     addContact = { nav.navigate("add") },
                     openPassphrase = { nav.navigate("passphrase") },
+                    newGroup = { nav.navigate("newgroup") },
                 )
+            }
+            composable("newgroup") {
+                app.goldfishsend.ui.screens.NewGroupScreen(s, back = { nav.popBackStack() }, openChat = { id -> nav.navigate("chat/$id") { popUpTo("home") } })
             }
             composable("chat/{id}", arguments = listOf(navArgument("id") { type = NavType.LongType })) { e ->
                 val id = e.arguments!!.getLong("id")
@@ -140,7 +144,12 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
             }
             composable("contact/{id}", arguments = listOf(navArgument("id") { type = NavType.LongType })) { e ->
                 val id = e.arguments!!.getLong("id")
-                ContactInfoScreen(s, id, back = { nav.popBackStack() }, onDeleted = { nav.popBackStack("home", inclusive = false) })
+                val isGroup by app.goldfishsend.ui.components.rememberQuery(s, id) { it.repo.contact(id)?.isGroup }
+                when (isGroup) {
+                    true -> app.goldfishsend.ui.screens.GroupInfoScreen(s, id, back = { nav.popBackStack() }, onDeleted = { nav.popBackStack("home", inclusive = false) })
+                    false -> ContactInfoScreen(s, id, back = { nav.popBackStack() }, onDeleted = { nav.popBackStack("home", inclusive = false) })
+                    null -> Unit
+                }
             }
             composable("add") {
                 AddContactScreen(s, back = { nav.popBackStack() }, openChat = { id -> nav.navigate("chat/$id") { popUpTo("home") } })

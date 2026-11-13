@@ -65,7 +65,7 @@ import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.fingerprint.NumericFingerprintGenerator
 
 /** Signal-style safety number: 60 digits, identical on both phones. */
-private fun safetyNumber(s: Session, remote: ByteArray): String? = runCatching {
+internal fun safetyNumber(s: Session, remote: ByteArray): String? = runCatching {
     val local = s.signal.identityKeyPair.publicKey
     val remoteKey = IdentityKey(remote)
     NumericFingerprintGenerator(5200)

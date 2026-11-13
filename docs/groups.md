@@ -25,6 +25,9 @@ links here.
 - `groupId`: 32 random bytes, b64u. Chosen by the creator.
 - **Member id:** the member's libsignal identity public key (33 B, b64u). A member is their identity key; a reinstall
   is a new member.
+- **Sessions:** one libsignal session per remote identity, shared by every group that person is in, and separate from
+  any 1:1 session with them (the app's address is `"m" ‖ b64u(SHA-256(identityKey))[0..22]`, device 1). It's dropped
+  once they're in no group any more.
 
 ## Per-member data
 
@@ -70,41 +73,67 @@ For a received roster R, with current roster C:
    - If `R.ver == C.ver + 1` and `R.prev == hash(C)`, accept.
    - If `R.ver == C.ver` and `hash(R) != hash(C)` (two admins changed it at once), keep the one with the larger hash.
      If C loses and we authored it, re-apply our change on top of R as `ver + 1`.
-   - If `R.ver > C.ver + 1` (we missed some), accept only if `R.by` is an admin in C, then ask for the missing history
-     with `gsync`.
+   - If `R.ver > C.ver` but it doesn't chain onto C (we missed some versions, or it builds on a concurrent sibling we
+     never saw), accept only if `R.by` is an admin in C, then ask that admin for the missing history with `gsync`.
    - Otherwise ignore it.
+   - **Departures can't be lost.** A roster signed by X that doesn't list X means "X is leaving" (or declining),
+     whatever its version. If it lost a tie or arrived too late to apply, the leaver won't try again, so an admin who
+     sees it while X is still in C publishes a roster removing X.
 4. **Diff against the old roster:**
-   - **Removed members:** delete their card, stop sending to them, and drop their sessions for this group.
+   - **Removed members:** stop sending to them. Their card is kept only until what's already queued to them (the roster
+     that removed them) is delivered, then deleted, and so is their session once they're in no other group.
    - **If we were removed:** mark the group "You were removed" and stop sending.
    - **If anyone was removed:** rotate our group inbox (a new mailbox and a new card with a new `hintKey`), send the
      new card to the remaining members, and delete the old mailbox after a 15-day drain.
+
+#### Relaying
+Members only reach the members whose cards they have, and a member's view can lag (an invitee only has the cards the
+admin forwarded when inviting them). Admins, who keep every card, close the gaps:
+- **Rosters by non-admins** (accepting, leaving, declining, or a rename when `adminsOnly` is off): an admin who accepts
+  one sends it on to every member whose card they have.
+- **A newcomer's first card:** an admin who receives a member's first card sends it on to every other member.
+- **Invited members** have no inbox yet: rosters reach them only over 1:1, from an author who has them as a contact.
+  On joining they send `gsync` to their inviter.
+
+Duplicates are harmless: a roster already held is ignored, and a card with a `seq` already held is ignored.
 
 ## Message format
 
 ### Blob
 The E2E blob to a group member is `type ‖ hint ‖ ciphertext`:
 - `type`: `0x13` (PreKey) or `0x12` (normal), the 1:1 type values with `0x10` set.
-- `hint = nonce(16) ‖ HMAC-SHA256(recipient.hintKey, "gf/group-hint/v1" ‖ nonce ‖ senderId)[0..16]`.
+- `hint = nonce(16) ‖ HMAC-SHA256(recipient.hintKey, "gf/group-hint/v1" ‖ nonce ‖ senderId)[0..16]`, where `senderId`
+  is the sender's 33-byte serialized identity key.
 - `ciphertext`: the libsignal ciphertext.
 
-The recipient computes the HMAC for every member of every group whose inbox this is, to find the sender. That's cheap,
-and the server can't link two messages from the same sender, because the nonce is random. A blob with no matching
-member is dropped. PreKey messages from an identity that isn't a member (or isn't yet) are held for up to 7 days
-waiting for a roster that adds it, then dropped.
+The recipient computes the HMAC for every member of the group whose inbox this is (with that inbox's own hint key: a
+rotated inbox keeps its old one while it drains), to find the sender. That's cheap, and the server can't link two
+messages from the same sender, because the nonce is random. A blob with no matching member is dropped. A PreKey message
+whose hint matches the identity inside it, but who isn't a member yet, is held for up to 7 days waiting for a roster
+that adds them, then dropped.
 
-The plaintext uses the same padding and chunking (`part`/`parts`) as 1:1 messages. Chunking applies to any content
-type, not only `text`.
+The plaintext uses the same padding as 1:1 messages, at most **2048 B padded** for every group message: content is
+encrypted once per member, and any member's session may still be at the PreKey stage.
+
+### Chunking
+Content too large for one message (any type: long texts, cards, rosters) is sent as `chunk` parts, in groups and 1:1:
+```json
+{ "t": "chunk", "id": "b64u 12 B", "part": 0, "parts": 3, "data": "b64u slice of the content's JSON bytes" }
+```
+`parts` is 2 to 64. Each slice except the last is a multiple of 3 bytes, so the parts' `data` strings concatenate to the
+b64u of the whole content. Parts are reassembled per sender (and, in groups, per member), then handled as the content
+they carry. A chunk never contains a chunk. In 1:1 chats, `text` keeps its own `part`/`parts` fields as before.
 
 ### Content types (JSON `t`), all with `g` = groupId
 | t | Fields | Sender | Meaning |
 |---|---|---|---|
-| `gtext` | `id`, `body`, `ts`, `exp?`, `once?`, `part?`, `parts?` | member | A chat message |
-| `greceipt` | `ids[]`, `kind` | member | Delivered/read receipts. Sent only to the message's author, and only if read receipts are on. |
+| `gtext` | `id`, `body`, `ts`, `exp?`, `once?` | member | A chat message (long ones go as `chunk` parts) |
+| `greceipt` | `ids[]`, `kind` (`read`) | member | Read receipts, batched per author, sent only to the message's author and only if read receipts are on. Groups send no delivery receipts: that would be a push to the author per member per message. An outgoing message shows "read" once every member it went to has read it. |
 | `gdelete` | `ids[]` | author of those messages | Delete for everyone |
-| `groster` | `roster` (b64u bytes), `sig` | admin, or self for leave/accept | A new roster, sent to every member in the old and new roster, invited members included |
+| `groster` | `roster` (b64u bytes), `sig` | admin, or self for leave/accept | A new roster, sent to every member in the old and new roster (see "Relaying") |
 | `gcard` | `card` (b64u bytes), `sig` | anyone forwarding a valid card | A member card |
-| `gsync` | `have` (`ver`) | member | "Send me the roster and cards." Any admin who receives it answers with the latest roster, its history back to `have`, and all cards. |
-| `gleave` | | member | "I'm leaving". Receivers stop sending to that member at once. Any admin then publishes a roster without them. |
+| `gsync` | `have` (`ver`) | member | "Send me the roster and cards." Any admin who receives it answers with the rosters after `have` (at most 50, oldest first, including the current one), and all cards. |
+| `gleave` | | member | "I'm leaving". Receivers stop sending to that member at once. The leaver's own self-removal roster updates the roster (with the departure rule as a backstop). |
 
 ## Flows
 
@@ -119,12 +148,15 @@ all current cards over the 1:1 session.
 
 ### Accept or decline
 The invitee sees "Alice added you to <name>", with Join or Decline.
-- **Join:** create the group inbox, prekeys and card. Publish the self-accept roster (`invited` to `member`) and send it
-  with the card to every member, starting PQXDH sessions from their bundles.
-- **Decline:** publish the self-removal roster.
+- **Join:** create the group inbox, prekeys and card. Publish the self-accept roster (`invited` to `member`), then send
+  the card, to every member whose card we have (starting PQXDH sessions from their bundles), then `gsync` to the inviter.
+  Admins relay the roster and the card to everyone else.
+- **Decline:** publish the self-removal roster. It also goes to the inviter over 1:1, which still arrives if the chat is
+  deleted right away.
 
 ### Leave
-Send `gleave` to all, publish the self-removal roster, and delete the group inbox (no drain needed).
+Send `gleave` to all, publish the self-removal roster, delete the group inbox (no drain needed) and this group's
+prekeys. The chat stays (read-only) until the user deletes it.
 - **The last admin can't leave** without promoting someone; the UI requires it.
 - **If the last admin's app is gone,** the roster can't change any more; members can only leave. That limitation is
   stated in the UI.
@@ -134,8 +166,8 @@ Publish a roster, as above. The removed member gets the roster too, so they know
 
 ## Rules and limits
 
-- **Per-member checks:** a `gtext`, `greceipt` or `gdelete` is accepted only from a current member (not `invited`) with a
-  valid card.
+- **Per-member checks:** a `gtext`, `greceipt` or `gdelete` is accepted only from a current member (not `invited`),
+  identified by the hint and authenticated by their session (a PreKey message must carry the roster's identity key).
 - **Who changes name and timer:** admins, or anyone if `adminsOnly` is false. The change is sent as a new roster, so
   only admins can sign it. A non-admin's change, allowed when `adminsOnly` is false, is a `groster` they author
   themselves, accepted under rule 2 only for those two fields.
@@ -144,7 +176,13 @@ Publish a roster, as above. The removed member gets the roster too, so they know
   their self-chosen name, marked as unverified. Safety numbers can be compared per member.
 - **Identity changes:** a member's identity key never changes inside a group. A reinstalled member must be removed and
   added again.
-- **Hidden chats, the decoy profile and wipes** treat groups like chats.
+- **Hidden chats, the decoy profile and wipes** treat groups like chats. Wiping messages keeps queued rosters and cards
+  (they aren't messages), so the group stays consistent.
+- **Inbox rotation** also happens on the mailbox-rotation schedule (if enabled) and when our own server's identity key
+  changes (the new card carries the new `serverKey`).
+- **A member's server presents a different identity key** than their card says: only that member's deliveries wait,
+  until they send a new card (E2E-authenticated) or the server proves the pinned key again. There's no manual
+  override per member.
 
 ## Server: batch send
 
@@ -169,4 +207,8 @@ per item: sendSecret(32) ‖ idempotencyKey(16) ‖ u32 ttlSeconds (0 = default)
   - **Per batch:** the per-IP and per-network buckets are charged `ceil(count / 8)` tokens for the whole batch. A batch
     leaks nothing new: the server already sees fan-out as N sends from one IP at one moment. If the bucket can't cover
     the cost, the whole batch gets `429`.
-- **Fallback:** if the server doesn't have the endpoint (`404` for the path), clients fall back to single sends.
+- **Fallback:** if the server doesn't have the endpoint (`404` for the path), clients fall back to single sends. Through
+  the gateway that's an inner `404` with no JSON error code (unlike a send's `not_found`). The app remembers it per
+  server for 6 hours.
+- **Client batching:** one batch per member server, at most 32 items and 16 KiB of body, each member's head row only
+  (per-member order is kept). Per-item `404` means that member's inbox is gone: their rows wait for their next card.

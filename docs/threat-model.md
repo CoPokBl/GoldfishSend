@@ -105,6 +105,28 @@ adversary.
 - **Defence:** blocking deletes their mailbox on the server, so their sends fail. A changed safety number is held for
   review before any message is accepted.
 
+### Groups
+Groups (`docs/groups.md`) are pairwise libsignal sessions to each member plus a signed member list (roster) and signed
+member cards. There's no group state on any server.
+- **The server** sees one ordinary mailbox per member per group, and N sends from the sender's IP when a message fans
+  out (as N 1:1 messages would). It can't tell group traffic from 1:1 traffic, see who's in a group, or link two
+  messages from the same member: the sender hint is a random-nonce HMAC only members can check.
+- **Members** see each other's identity keys, self-chosen names and group inboxes (each member's own server and a
+  `sendSecret` only for that group). Members who aren't your contacts are marked unverified; you can compare safety
+  numbers with each of them. A member can do what any contact can: keep what's said, and send junk to your group inbox
+  (dropped unless it decrypts from a current member).
+- **Admins** decide membership. A malicious admin can add anyone, including someone impersonating a person (an
+  identity key the admin vouches for), remove people, or rename the group. Everyone sees these changes as signed
+  system lines, and the added person's safety number can be compared. Admins can't read anything sent before the new
+  member joined, and can't forge messages from other members.
+- **Non-admins** can only leave, accept or decline (and rename or set the timer if the group allows it). A forged or
+  modified roster is rejected unless an admin of the current roster signed it.
+- **Removed members** stop receiving at once (nobody encrypts to them any more), and every remaining member moves to a
+  new inbox, so they can't even send noise for long. What they received before stays with them. Their old sessions
+  carry nothing new.
+- **Residual:** concurrent changes converge but can briefly differ between members; membership is eventually
+  consistent. If every admin loses their phone, membership can't change any more (members can still leave).
+
 ### Strangers and abusers
 Anyone without a capability.
 - **Can't:** message you at all. Sending needs that mailbox's `sendSecret`, which only your contact has.
@@ -171,6 +193,8 @@ Malware with root, accessibility or notification access, or a keyboard that uplo
 - **Proof of work:** it isn't memory-hard.
 - **Server key:** `ServerKey` never expires. If it leaks, someone who can also intercept TLS can impersonate the server
   until you replace it, and replacing it warns every user.
+- **Group members who aren't contacts** are vouched for by an admin. Until you compare safety numbers with them, a
+  malicious admin could slip in an impostor.
 
 ## Advice for users
 - Scan QR codes in person when you can. Compare safety numbers for important contacts.

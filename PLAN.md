@@ -18,7 +18,9 @@ the recipient's device through UnifiedPush, and forgets it.
 - A fast native Android client (Kotlin and Jetpack Compose, with a native crypto core).
 
 **Non-goals (v1)**
-- Multi-device per user, groups, attachments, and message history sync. These are covered in phase 6.
+- Multi-device per user, attachments, and message history sync. These are covered in phase 6.
+- Groups were a non-goal for v1 and are now built: pairwise fan-out over libsignal sessions with signed rosters and
+  cards (`docs/groups.md`). MLS remains a possible later step.
 - Contact discovery. It's deliberately impossible.
 
 ---
@@ -421,4 +423,5 @@ The exact wire format lives in `docs/protocol.md`.
 | M6 | Security controls: disappearing messages and view-once, app lock, wrong-PIN, duress and panic wipe, notification and screen hardening | Forensic test: no deleted plaintext or keys recoverable from a DB or file dump |
 | M7 | Hardening: padding, chunking, pinning, Baseline Profiles, external security review | Review findings closed |
 | Future | Abuse resistance: a memory-hard PoW (e.g. Equi-X/Argon2-based) or Privacy Pass (RFC 9576/9578) tokens. SHA-256 hashcash costs a GPU milliseconds but a phone tens of seconds. Changing it is a protocol change for clients. | n/a |
-| M8+ | Groups (client fan-out first, MLS later), attachments, multi-device, Privacy Pass, onion service | n/a |
+| M8 | Groups: pairwise fan-out, signed rosters and cards, sender hints, inbox rotation on removal, batch send (`docs/groups.md`) | Done: multi-party simulation, device tests, live batch send |
+| M9+ | Attachments, multi-device, Privacy Pass, group invite links, MLS (maybe) | n/a |

@@ -1,5 +1,6 @@
 package app.goldfishsend.ui.components
 
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -80,6 +81,24 @@ private val avatarPalette = listOf(
     Color(0xFFE57373), Color(0xFFF06292), Color(0xFFBA68C8), Color(0xFF7986CB), Color(0xFF4FC3F7),
     Color(0xFF4DB6AC), Color(0xFF81C784), Color(0xFFFFB74D), Color(0xFFA1887F), Color(0xFF90A4AE),
 )
+
+/** A stable color per group member (identity key), from the avatar palette. */
+fun memberColor(member: String): Color = avatarPalette[Math.floorMod(member.hashCode(), avatarPalette.size)]
+
+/** A group's avatar: the palette circle with a group icon. */
+@Composable
+fun GroupAvatar(seed: Long, size: Dp = 48.dp) {
+    val c = avatarPalette[Math.floorMod(seed, avatarPalette.size.toLong()).toInt()]
+    Box(
+        Modifier.size(size).background(c.copy(alpha = 0.22f), CircleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        androidx.compose.material3.Icon(
+            androidx.compose.material.icons.Icons.Rounded.Groups, null,
+            tint = c, modifier = Modifier.size(size * 0.55f),
+        )
+    }
+}
 
 @Composable
 fun Avatar(name: String, seed: Long, size: Dp = 48.dp) {
