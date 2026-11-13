@@ -316,6 +316,67 @@ Rate limiting needs the real client address at Caddy:
 - **Rootless Podman:** use the `pasta` network backend (the default since Podman 5), which preserves source
   addresses. `slirp4netns` with the default port handler does not.
 
+### Onion service (optional)
+
+Clients can use the app's built-in Tor (or Orbot) to hide their IP address from the server. You can also give
+the server a v3 onion address, so Tor users never leave the Tor network:
+
+```bash
+cd deploy
+docker compose --profile onion up -d --build
+docker compose --profile onion exec tor cat /var/lib/tor/goldfish/hostname   # → <56 chars>.onion
+```
+
+Users then set their server to `http://<that address>.onion` with Tor turned on. Plain `http` is correct here:
+the onion address authenticates the server, and Tor encrypts the connection end to end. Invites carry the
+server URL, so contacts on an onion server work too, and the app asks their contacts to turn on Tor if needed.
+
+How it's wired:
+- The `tor` container (profile `onion`, read-only, all capabilities dropped, non-root) publishes the onion and
+  forwards its port 80 to Caddy's onion-only listener (`:8081`, bound to Caddy's fixed address on the dedicated
+  `onion` network). The same routes, 16 KiB body limit and health-endpoint blocking apply as on the public site.
+- The `onion` network is **not** a trusted proxy network. Tor never talks to the api directly, so it can't inject
+  `X-Forwarded-For`.
+- Tor's built-in introduction-point DoS defence and onion-service proof-of-work defence are on.
+- **Back up the `tor_data` volume.** `/var/lib/tor/goldfish` holds the onion service's private key, which *is* the
+  address. Lose it and the address is gone. Leak it and someone else can impersonate the server. Treat it like the
+  Goldfish keys.
+
+**Rate limiting for onion clients.** Every onion client reaches the api from the tor container's single address,
+so the server sees all onion users as **one IP** (and one /24 network). That's inherent to onion services: there's
+no client address to see, and Tor circuits are free to create, so per-circuit limits wouldn't stop anyone.
+What this means in practice:
+- The per-IP and per-network limits (`send-ip`, `create-ip`, `create-net`, `pow-ip`, `pow-net`, `owner-ip`,
+  `invite-*-ip`, `invite-create-net`) are **shared by all onion users**.
+- Sends hitting `send-ip` get `429` with `"scope": "ip"`, and the client automatically pays with a proof of work
+  (`GF-PoW` header) and retries, so onion users can still send under load. Per-mailbox and global limits apply to
+  everyone as usual.
+- Mailbox creation already needs a PoW, but `create-ip`/`create-net` still cap the total. A server with many onion
+  users should raise those limits, plus `pow-ip`, `pow-net`, `owner-ip` and the invite limits, for example
+  `Goldfish__RateLimits__create-ip__Limit=200`. Partial overrides keep the other fields' defaults. Clear-net
+  users get the same higher per-IP limits, so raise them only as far as you need.
+
+Push delivery is unaffected: notifications still reach phones through each user's UnifiedPush distributor,
+which Tor doesn't cover.
+
+### Publishing your TLS key fingerprint (for client key pinning)
+
+Clients can turn on **Pin server keys**: the app remembers the SHA-256 of your certificate's public key (SPKI)
+on first connection and refuses to connect if it changes. The Caddyfile sets `reuse_private_keys`, so renewals keep
+the same key and pinned clients aren't disturbed. Publish the fingerprint somewhere users can check it (your
+website, an announcement channel):
+
+```bash
+openssl s_client -connect push.example.com:443 -servername push.example.com </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | openssl enc -base64
+```
+
+The app shows exactly this value under Settings › Connection. **To rotate the key** (suspected compromise, or
+policy), remove `reuse_private_keys` for one renewal (or delete the key under `caddy_data`), restore it, and
+announce the new fingerprint *before* users see the "server identity changed" warning. Pinned clients block the
+server until each user accepts the new key, so do this rarely and deliberately.
+
 ## Operations
 
 ### Keys and what losing them means

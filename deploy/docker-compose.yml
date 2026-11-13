@@ -23,6 +23,14 @@
 #   egress    worker only. Gives the worker outbound internet to reach push servers (ntfy, FCM
 #             distributors, ...) without putting it on the network caddy faces. Outbound requests are
 #             SSRF-filtered in the app (private, loopback, link-local, metadata ranges are refused).
+#   onion     caddy + the optional tor container (profile "onion"). Not internal, because tor needs to
+#             reach the Tor network. Deliberately NOT in TrustedProxies: tor talks to Caddy's onion-only
+#             listener, never to the api, so it can't spoof X-Forwarded-For.
+#
+# Optional onion service
+#   docker compose --profile onion up -d --build
+#   docker compose --profile onion exec tor cat /var/lib/tor/goldfish/hostname
+#   Clients then use http://<that address>.onion with Tor turned on. See server/README.md, "Onion service".
 #
 # Secrets
 #   Option A (default): deploy/goldfish.env, loaded with env_file into api and worker.
@@ -102,6 +110,8 @@ services:
       - "443:443/udp" # HTTP/3
     environment:
       GOLDFISH_DOMAIN: "${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}"
+      # Caddy's fixed address on the onion network. Its onion-only listener (:8081) binds here.
+      GOLDFISH_ONION_CADDY_IP: "${GOLDFISH_ONION_CADDY_IP:-172.30.251.2}"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data # certificates and ACME account: back this up or re-issue on loss
@@ -109,9 +119,32 @@ services:
     tmpfs:
       - /tmp:size=8m
     networks:
-      - public
+      public: {}
+      onion:
+        ipv4_address: "${GOLDFISH_ONION_CADDY_IP:-172.30.251.2}"
     depends_on:
       - api
+
+  # Optional Tor onion service: only started with `--profile onion`. It forwards the onion's port 80 to
+  # Caddy's onion-only listener, so the same routes, body limits and health-endpoint blocking apply.
+  tor:
+    <<: *hardening
+    profiles: ["onion"]
+    image: localhost/goldfishsend-tor:latest
+    build:
+      context: ./tor
+    read_only: true
+    environment:
+      GOLDFISH_ONION_CADDY_IP: "${GOLDFISH_ONION_CADDY_IP:-172.30.251.2}"
+    volumes:
+      # Hidden-service keys: this IS the onion address. Back it up, and keep it secret.
+      - tor_data:/var/lib/tor
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    networks:
+      - onion
+    depends_on:
+      - caddy
 
   api:
     <<: *goldfish-app
@@ -255,12 +288,19 @@ networks:
     internal: true
   egress:
     driver: bridge
+  onion:
+    driver: bridge
+    ipam:
+      config:
+        # Change via GOLDFISH_ONION_SUBNET (and GOLDFISH_ONION_CADDY_IP inside it) in deploy/.env if it collides.
+        - subnet: "${GOLDFISH_ONION_SUBNET:-172.30.251.0/24}"
 
 volumes:
   caddy_data:
   caddy_config:
   mysql_data:
   redis_data:
+  tor_data:
 
 # Option B (Docker secrets), see the header. Make the file readable by UID 1654 (the image's `app`
 # user), e.g. `sudo chown root:1654 secrets/goldfish.json && sudo chmod 0640 secrets/goldfish.json`
