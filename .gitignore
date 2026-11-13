@@ -34,3 +34,7 @@ android/captures/
 
 # --- Claude Code local state (agent worktrees) ---
 .claude/
+
+# Release signing (never commit)
+android/keystore.properties
+keystore.properties
