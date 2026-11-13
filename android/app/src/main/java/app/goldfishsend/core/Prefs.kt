@@ -15,7 +15,11 @@ enum class NotificationContent { NONE, NAME, NAME_AND_MESSAGE }
  */
 enum class PanicResponse { OFF, LOCK, WIPE_MESSAGES, WIPE_EVERYTHING }
 
-enum class DuressAction { WIPE_ALL, HIDE_HIDDEN_CHATS, DELETE_HIDDEN_CHATS }
+/**
+ * What the duress PIN does. WIPE_ALL erases everything. DECOY opens a separate, independent decoy profile, while the real
+ * data stays encrypted and untouched (the duress PIN can't decrypt it).
+ */
+enum class DuressAction { WIPE_ALL, DECOY }
 
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("gf_prefs", Context.MODE_PRIVATE)
@@ -204,7 +208,12 @@ class Prefs(context: Context) {
 
     /** What the duress PIN does. WIPE_ALL keeps the original behaviour. The others open the app without hidden chats. */
     var duressAction: DuressAction
-        get() = runCatching { DuressAction.valueOf(str("duress_action") ?: "") }.getOrDefault(DuressAction.WIPE_ALL)
+        get() = when (val v = str("duress_action")) {
+            null -> DuressAction.WIPE_ALL
+            // Older non-erasing choices (they needed the real key) become the decoy profile.
+            "HIDE_HIDDEN_CHATS", "DELETE_HIDDEN_CHATS" -> DuressAction.DECOY
+            else -> runCatching { DuressAction.valueOf(v) }.getOrDefault(DuressAction.WIPE_ALL)
+        }
         set(v) = setStr("duress_action", v.name)
 
     /** Whether hidden chats post notifications at all (generic ones, never contents). Off by default. */

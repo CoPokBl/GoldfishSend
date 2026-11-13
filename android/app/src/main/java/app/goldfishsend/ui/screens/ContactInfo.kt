@@ -1,5 +1,6 @@
 package app.goldfishsend.ui.screens
 
+import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -202,6 +203,12 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                         onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setHidden(contactId, v); s.db.notifyChanged() } },
                     )
                 }
+                // Their server is their own choice: showing it lets you notice an unexpected one.
+                SettingRow(
+                    "Their server",
+                    c.outServer?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: "Not known yet",
+                    Icons.Rounded.Dns,
+                )
                 SettingRow(
                     "Disappearing messages",
                     timerLabel(c.timerSecs),

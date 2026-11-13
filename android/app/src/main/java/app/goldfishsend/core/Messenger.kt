@@ -39,10 +39,11 @@ object Messenger {
 
     /** Entry point for every decrypted UnifiedPush payload. */
     suspend fun onPushPayload(bytes: ByteArray) {
-        val s = Graph.session.value ?: Graph.tryAutoUnlock()
+        val s = Graph.realSession ?: Graph.tryAutoUnlock()
         if (s == null) {
             LockedInbox.put(LockedInbox.KIND_PUSH, bytes)
-            if (PushEnvelope.parse(bytes) is PushEnvelope.Message) {
+            // Kept for the next real unlock. No notification while a decoy profile is on screen: it would give it away.
+            if (PushEnvelope.parse(bytes) is PushEnvelope.Message && Graph.session.value?.decoy != true) {
                 Notifier.newMessage(Graph.app, null, null)
             }
             return
@@ -355,6 +356,21 @@ object Messenger {
         s.repo.deleteMessage(messageId)
         s.db.notifyChanged()
         Notifier.cancel(Graph.app)
+    }
+
+    /**
+     * Opens a received view-once message exactly once: the body is read into memory, then the row and its key are
+     * deleted before anything is displayed. Returns null if it was already viewed.
+     */
+    fun consumeViewOnce(s: Session, messageId: String): String? {
+        val m = s.repo.message(messageId) ?: return null
+        if (!m.viewOnce || m.outgoing) {
+            return null
+        }
+        s.repo.deleteMessage(messageId)
+        s.db.notifyChanged()
+        Notifier.cancel(Graph.app)
+        return m.body
     }
 
     fun deleteForMe(s: Session, messageId: String) {

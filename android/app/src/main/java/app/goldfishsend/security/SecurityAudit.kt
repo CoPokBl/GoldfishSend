@@ -94,6 +94,8 @@ data class AuditReport(private val findings: List<Finding>, private val dismisse
  * On-device security and privacy audit (PLAN.md §11.7). Everything runs locally, and nothing is reported anywhere.
  */
 object SecurityAudit {
+    private const val NTFY = "io.heckel.ntfy"
+
     /**
      * Android support table, by API level. Google ships security bulletins for roughly the four latest releases.
      * As of late 2026: API 36 (16) and 35 (15) are fully supported, 34 (14) is supported but nearing its end,
@@ -167,6 +169,11 @@ object SecurityAudit {
                 "push", Severity.INFO, "Notifications go through Mozilla",
                 "Contents are encrypted, and Mozilla only sees delivery timing.",
             )
+            dist == NTFY && installerOf(ctx.packageManager, NTFY) !in KeyboardTrust.FDROID_INSTALLERS -> out += Finding(
+                "push-ntfy", Severity.INFO, "Your ntfy app may use Google",
+                "The Google Play build of ntfy can relay notifications through Google's Firebase. The F-Droid build never does. " +
+                    "Message contents stay encrypted either way, but Google could see when you receive messages.",
+            )
             else -> out += Finding("push", Severity.OK, "Notifications avoid big tech", "Delivered via ${dist?.let { PushHub.label(ctx, it) } ?: "your push app"}.")
         }
         if (dist != null) {
@@ -224,8 +231,19 @@ object SecurityAudit {
         }
 
         // --- Root / bootloader ---
-        val boot = getprop("ro.boot.verifiedbootstate")
-        val flashLocked = getprop("ro.boot.flash.locked")
+        // Hardware key attestation first (properties are easy to spoof on rooted phones), then system properties.
+        val rot = Attestation.rootOfTrust()
+        val boot = when (rot?.verifiedBootState) {
+            Attestation.RootOfTrust.VERIFIED -> "green"
+            Attestation.RootOfTrust.SELF_SIGNED -> "yellow"
+            Attestation.RootOfTrust.UNVERIFIED, Attestation.RootOfTrust.FAILED -> "orange"
+            else -> getprop("ro.boot.verifiedbootstate")
+        }
+        val flashLocked = when (rot?.deviceLocked) {
+            true -> "1"
+            false -> "0"
+            null -> getprop("ro.boot.flash.locked")
+        }
         val rooted = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su", "/system/app/Superuser.apk", "/data/adb/magisk")
             .any { File(it).exists() } || Build.TAGS?.contains("test-keys") == true
         when {
@@ -274,6 +292,15 @@ object SecurityAudit {
             Finding(
                 "strongbox", Severity.INFO, "No dedicated security chip",
                 "Keys are protected by the processor's trusted environment instead of a separate secure element.",
+            )
+        }
+
+        // --- Fingerprint unlock ---
+        if (prefs.biometricUnlock && Graph.vault.hasBiometric) {
+            out += Finding(
+                "biometric", Severity.INFO, "Fingerprint unlock is on",
+                "It's convenient, but someone can force your finger onto the sensor. In some places the law treats a fingerprint " +
+                    "differently from a PIN, too. Turn it off before situations where you might be made to unlock your phone.",
             )
         }
 

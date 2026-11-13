@@ -93,19 +93,18 @@ object AppLock {
                     prefs.failedAttempts = failed - 1
                     return@withLock UnlockResult.DeviceLocked
                 }
-                // Always check the duress slot too, so timing doesn't reveal whether a duress PIN exists.
-                val duress = vault.unlockWithDuress(passphrase)
+                // Always check the duress verifier too, so timing doesn't reveal whether a duress PIN exists.
+                val duress = real == null && vault.isDuress(passphrase)
                 when {
                     real != null -> {
-                        duress?.wipe()
                         prefs.failedAttempts = 0
                         afterUnlock(Graph.openSession(real))
                         Wiper.recordPresence()
                         UnlockResult.Ok
                     }
-                    duress != null -> {
+                    duress -> {
                         prefs.failedAttempts = 0
-                        onDuress(duress)
+                        onDuress(passphrase)
                     }
                     else -> {
                         val max = prefs.maxFailedAttempts
@@ -123,25 +122,16 @@ object AppLock {
         }
     }
 
-    /** The duress PIN was entered. Depending on the user's choice: erase everything, or open a decoy view without hidden chats. */
-    private suspend fun onDuress(mk: ByteArray): UnlockResult {
-        val action = Graph.prefs.duressAction
-        if (action == DuressAction.WIPE_ALL) {
-            mk.wipe()
+    /**
+     * The duress PIN was entered. It can't decrypt anything real. Either everything is erased, or the separate decoy
+     * profile opens (keyed by the duress PIN alone), and the real data stays encrypted and untouched.
+     */
+    private suspend fun onDuress(pin: CharArray): UnlockResult {
+        if (Graph.prefs.duressAction == DuressAction.WIPE_ALL) {
             Wiper.wipeEverything(Graph.app)
             return UnlockResult.Wiped
         }
-        val s = Graph.openSession(mk)
-        s.decoy = true
-        s.hiddenRevealed.value = false
-        if (action == DuressAction.DELETE_HIDDEN_CHATS) {
-            for (cid in s.repo.hiddenContactIds()) {
-                runCatching { Messenger.deleteContact(s, cid) }
-            }
-            Graph.vault.setHiddenPin(null)
-            s.repo.kvPutString(KV_HIDDEN_ON, null)
-        }
-        afterUnlock(s)
+        Graph.openDecoySession(Graph.vault.decoyKey(pin))
         return UnlockResult.Ok
     }
 
@@ -153,6 +143,10 @@ object AppLock {
 
     /** Catch-up work once the DB is open: locked inbox, expiry sweep, outbox, mailbox pool. */
     fun afterUnlock(s: Session) {
+        // A decoy session never touches real data or the server.
+        if (s.decoy) {
+            return
+        }
         Graph.scope.launchSafe {
             LockedInbox.drain(s)
             if (Graph.prefs.inboxRotatePending) {

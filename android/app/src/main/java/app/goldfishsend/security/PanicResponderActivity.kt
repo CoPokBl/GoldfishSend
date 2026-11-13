@@ -54,7 +54,7 @@ class PanicResponderActivity : Activity() {
         }
         when (response) {
             PanicResponse.WIPE_MESSAGES -> Wiper.wipeMessages()
-            PanicResponse.WIPE_EVERYTHING -> Wiper.wipeEverything(applicationContext)
+            PanicResponse.WIPE_EVERYTHING -> Wiper.wipeEverything(applicationContext, killProcess = true)
             else -> Unit
         }
     }

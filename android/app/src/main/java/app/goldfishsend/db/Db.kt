@@ -82,6 +82,16 @@ class Db private constructor(private val sql: SQLiteDatabase) {
         runCatching { sql.close() }
     }
 
+    /** Re-encrypts the whole database under a key derived from [newMk] (SQLCipher PRAGMA rekey, atomic). */
+    fun rekey(newMk: ByteArray) {
+        val key = keyBlob(newMk)
+        try {
+            sql.changePassword(key)
+        } finally {
+            key.wipe()
+        }
+    }
+
     private fun bind(st: net.zetetic.database.sqlcipher.SQLiteStatement, args: Array<out Any?>) {
         args.forEachIndexed { i, a ->
             val idx = i + 1
@@ -100,22 +110,32 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 
     companion object {
         private const val NAME = "goldfish.db"
+
+        /** The duress PIN's decoy profile: a separate database with its own key, identity and message root. */
+        const val DECOY_NAME = "decoy.db"
         private var libLoaded = false
 
-        fun file(context: Context): File = context.getDatabasePath(NAME)
+        fun file(context: Context, name: String = NAME): File = context.getDatabasePath(name)
 
-        fun open(context: Context, mk: ByteArray): Db {
+        fun open(context: Context, mk: ByteArray, name: String = NAME): Db {
             if (!libLoaded) {
                 System.loadLibrary("sqlcipher")
                 libLoaded = true
             }
             val keyBytes = keyBlob(mk)
-            val f = file(context)
+            val f = file(context, name)
             f.parentFile?.mkdirs()
             val sql = try {
                 SQLiteDatabase.openOrCreateDatabase(f, keyBytes, null, null, null)
             } finally {
                 keyBytes.wipe()
+            }
+            try {
+                // Fails here (not later) if the key is wrong, so callers can try another key.
+                sql.rawQuery("SELECT count(*) FROM sqlite_master", null).use { it.moveToFirst() }
+            } catch (e: Exception) {
+                runCatching { sql.close() }
+                throw e
             }
             sql.rawExecSQL("PRAGMA cipher_memory_security = ON")
             sql.rawExecSQL("PRAGMA secure_delete = ON")
@@ -151,8 +171,8 @@ class Db private constructor(private val sql: SQLiteDatabase) {
         }
 
         /** Deletes the DB file and its journals. */
-        fun deleteFiles(context: Context) {
-            val f = file(context)
+        fun deleteFiles(context: Context, name: String = NAME) {
+            val f = file(context, name)
             for (suffix in listOf("", "-journal", "-wal", "-shm")) {
                 File(f.path + suffix).delete()
             }

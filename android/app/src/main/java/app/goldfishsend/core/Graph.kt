@@ -28,7 +28,7 @@ import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.signal.libsignal.protocol.ecc.ECPrivateKey
 
 /** Everything that exists while the app is unlocked. Closing it wipes the keys from RAM. */
-class Session(val db: Db, private val mk: ByteArray, val messages: MessageVault) {
+class Session(val db: Db, private var mk: ByteArray, val messages: MessageVault) {
     val signal = SignalStore(db)
     val repo = Repo(db, messages)
 
@@ -46,6 +46,12 @@ class Session(val db: Db, private val mk: ByteArray, val messages: MessageVault)
     var decoy = false
 
     fun masterKeyCopy(): ByteArray = mk.copyOf()
+
+    /** After a master-key rotation. Takes ownership of [newMk]. */
+    fun replaceMasterKey(newMk: ByteArray) {
+        mk.wipe()
+        mk = newMk
+    }
 
     fun close() {
         db.close()
@@ -92,13 +98,65 @@ object Graph {
     val isUnlocked: Boolean
         get() = _session.value != null
 
+    /**
+     * The open *real* session, or null. A decoy session (duress PIN) is visible to the UI through [session], but every
+     * background path (pushes, outbox, mailboxes, workers, sweeps) uses this, so real data is never processed with,
+     * written into, or dropped by the decoy. While a decoy is open, the app behaves as locked for real data: pushes go
+     * to the locked inbox and are delivered at the next real unlock.
+     */
+    val realSession: Session?
+        get() = _session.value?.takeUnless { it.decoy }
+
+    /**
+     * Opens the decoy profile with a key derived only from the duress PIN. It has its own database, Signal identity and
+     * message root (kept inside the decoy DB, never under the real Keystore aliases), and persists across duress unlocks.
+     */
+    suspend fun openDecoySession(decoyKey: ByteArray): Session = unlockMutex.withLock {
+        _session.value?.let {
+            decoyKey.wipe()
+            return it
+        }
+        val db = try {
+            Db.open(app, decoyKey, Db.DECOY_NAME)
+        } catch (e: Exception) {
+            // A different duress PIN than the one that made this decoy: start a fresh one.
+            Db.deleteFiles(app, Db.DECOY_NAME)
+            Db.open(app, decoyKey, Db.DECOY_NAME)
+        }
+        val boot = Repo(db, MessageVault(ByteArray(32)))
+        val mrk = boot.kvGet("decoy_mrk") ?: Rand.bytes(32).also { boot.kvPut("decoy_mrk", it) }
+        val s = Session(db, decoyKey, MessageVault(mrk))
+        s.decoy = true
+        _session.value = s
+        s
+    }
+
     /** Opens the DB with MK. Takes ownership of [mk]. */
     suspend fun openSession(mk: ByteArray): Session = unlockMutex.withLock {
         _session.value?.let {
             mk.wipe()
             return it
         }
-        val db = Db.open(app, mk)
+        var key = mk
+        val db = try {
+            Db.open(app, key)
+        } catch (e: Exception) {
+            // An unlock-method change died after the rekey but before it was recorded: the old MK unwraps a link to the new one.
+            val next = if (vault.hasPendingRotation) vault.recoverRotation(key) else null
+            if (next == null) {
+                key.wipe()
+                throw e
+            }
+            val d = Db.open(app, next)
+            key.wipe()
+            key = next
+            vault.promoteRotation()
+            d
+        }
+        if (vault.hasPendingRotation) {
+            // The rekey never happened: discard the staged wrapping.
+            vault.abortRotation()
+        }
         val tmpVault = MessageVault(ByteArray(32))
         val bootstrapRepo = Repo(db, tmpVault)
         var shredded = false
@@ -119,7 +177,7 @@ object Graph {
             bootstrapRepo.kvPut("inbox_priv", kp.privateKey.serialize())
             prefs.inboxPublicKey = B64.enc(kp.publicKey.serialize())
         }
-        val s = Session(db, mk, MessageVault(mrk, BucketKeys.DbStore(db)))
+        val s = Session(db, key, MessageVault(mrk, BucketKeys.DbStore(db)))
         if (shredded) {
             for (c in s.repo.contacts()) {
                 s.repo.insertMessage(
@@ -130,6 +188,41 @@ object Graph {
         }
         _session.value = s
         s
+    }
+
+    /**
+     * Changes how the app is unlocked, with a brand-new master key (see KeyVault "master-key rotation"). [target] is the
+     * new method. The DB is rekeyed, the duress slot follows, and the biometric shortcut must be set up again.
+     */
+    suspend fun changeUnlock(s: Session, target: KeyVault.Target) {
+        // Never from a decoy session: its key isn't the real master key.
+        if (s.decoy) {
+            return
+        }
+        val oldMk = s.masterKeyCopy()
+        val newMk = Rand.bytes(32)
+        try {
+            vault.stageRotation(oldMk, newMk, target)
+            try {
+                s.lock.withLock {
+                    s.db.rekey(newMk)
+                }
+            } catch (e: Exception) {
+                // The database still uses the old key: drop the staged wrapping, nothing changed.
+                vault.abortRotation()
+                throw e
+            }
+            vault.promoteRotation()
+            if (target is KeyVault.Target.None || target is KeyVault.Target.ScreenLock) {
+                // The duress PIN can't exist without an app secret.
+                s.repo.kvPutString("duress_on", null)
+            }
+            prefs.biometricUnlock = false
+            s.replaceMasterKey(newMk.copyOf())
+        } finally {
+            oldMk.wipe()
+            newMk.wipe()
+        }
     }
 
     fun inboxPrivateKey(s: Session): ECPrivateKey = ECPrivateKey(s.repo.kvGet("inbox_priv")!!)
@@ -149,7 +242,7 @@ object Graph {
      * the device itself is unlocked). Used by background work and push handling.
      */
     suspend fun tryAutoUnlock(): Session? {
-        _session.value?.let { return it }
+        _session.value?.let { return if (it.decoy) null else it }
         if (!vault.isSetUp || vault.requiresUserUnlock) {
             return null
         }

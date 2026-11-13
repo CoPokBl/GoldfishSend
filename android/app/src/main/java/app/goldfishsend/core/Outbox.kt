@@ -42,7 +42,7 @@ object Outbox {
 
     /** Starts sending now (in process) and schedules WorkManager as a durable fallback. */
     fun kick() {
-        Graph.session.value?.let { s -> Graph.scope.launchSafe { runAndSchedule(s) } }
+        Graph.realSession?.let { s -> Graph.scope.launchSafe { runAndSchedule(s) } }
         val req = OneTimeWorkRequestBuilder<OutboxWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .build()
@@ -61,6 +61,9 @@ object Outbox {
 
     /** Sends everything that's due. Returns the earliest pending retry time, or null if the outbox is empty. */
     suspend fun process(s: Session): Long? {
+        if (s.decoy) {
+            return null
+        }
         val contacts = s.repo.outboxAll().map { it.contactId }.distinct()
         coroutineScope {
             for (cid in contacts) {

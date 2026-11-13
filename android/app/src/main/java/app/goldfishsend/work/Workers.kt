@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit
 class OutboxWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
         // Locked with a passphrase: nothing we can do, and the unlock path kicks the outbox again.
-        val s = Graph.session.value ?: Graph.tryAutoUnlock() ?: return Result.success()
+        val s = Graph.realSession ?: Graph.tryAutoUnlock() ?: return Result.success()
         return try {
             Outbox.runAndSchedule(s)
             Result.success()
@@ -44,7 +44,7 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
             return Result.success()
         }
         runCatching { Sweeper.sweepLocked() }
-        val s = Graph.session.value ?: Graph.tryAutoUnlock() ?: return Result.success()
+        val s = Graph.realSession ?: Graph.tryAutoUnlock() ?: return Result.success()
         runCatching { Sweeper.sweep(s) }
         runCatching { Mailboxes.cleanup(s) }
         runCatching { Mailboxes.refreshAll(s) }
@@ -69,7 +69,7 @@ class ExpiryReceiver : BroadcastReceiver() {
         val pending = goAsync()
         Graph.scope.launchSafe {
             try {
-                val s = Graph.session.value ?: Graph.tryAutoUnlock()
+                val s = Graph.realSession ?: Graph.tryAutoUnlock()
                 if (s != null) {
                     Sweeper.sweep(s)
                 } else {
@@ -107,7 +107,7 @@ class PanicTileService : TileService() {
         if (!Graph.prefs.onboarded) {
             return
         }
-        Wiper.wipeEverything(applicationContext)
+        Wiper.wipeEverything(applicationContext, killProcess = true)
         qsTile?.apply {
             state = Tile.STATE_UNAVAILABLE
             updateTile()

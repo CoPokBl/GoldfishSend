@@ -45,6 +45,10 @@ object Invites {
 
     /** Creates an invite backed by a ready mailbox. It's instant when the background pool is warm. */
     suspend fun create(s: Session, purpose: Int): Created {
+        if (s.decoy) {
+            // The decoy stays offline: it never creates mailboxes that could be linked to the real profile.
+            throw InviteException("Still getting things ready. This only takes a moment the first time.")
+        }
         if (purpose == Mailbox.PURPOSE_QR) {
             cachedQr?.let { c ->
                 // Re-show the same still-valid QR code instead of burning a new mailbox each time the screen opens.
@@ -121,6 +125,9 @@ object Invites {
      * right away. The chat can open and the user can type at once, because everything is queued in the outbox.
      */
     suspend fun accept(s: Session, link: InviteLink, viaQr: Boolean): Long {
+        if (s.decoy) {
+            throw InviteException("Couldn't reach the server. Check your connection and try again.")
+        }
         if (!ServerApi.isValidContactServer(link.server)) {
             throw InviteException("This invite points to a server that isn't secure.")
         }

@@ -52,6 +52,9 @@ object Mailboxes {
 
     /** Creates and verifies one mailbox on our server. Returns null if push isn't ready yet. */
     suspend fun create(s: Session, purpose: Int): Mailbox? {
+        if (s.decoy) {
+            return null
+        }
         val ep = endpoint(s) ?: return null
         val send = MailboxCrypto.newSecret()
         val owner = MailboxCrypto.newSecret()
@@ -131,6 +134,9 @@ object Mailboxes {
 
     /** Keeps [POOL_TARGET] ready mailboxes so "Add contact" is instant. Safe to call often. */
     suspend fun ensurePool(s: Session) {
+        if (s.decoy) {
+            return
+        }
         if (poolMutex.isLocked) {
             return
         }
@@ -167,6 +173,9 @@ object Mailboxes {
     }
 
     suspend fun onNewEndpoint(s: Session, data: PushEndpointData) {
+        if (s.decoy) {
+            return
+        }
         val old = endpoint(s)
         s.repo.kvPutString("push_endpoint", ProtoJson.encodeToString(PushEndpointData.serializer(), data))
         Graph.prefs.pushStatus = "ok"
@@ -180,6 +189,9 @@ object Mailboxes {
 
     /** Points every mailbox at the current endpoint. Each batch of 100 is confirmed by one verification push. */
     suspend fun rotateAll(s: Session) = rotateMutex.withLock {
+        if (s.decoy) {
+            return@withLock
+        }
         val ep = endpoint(s) ?: return@withLock
         // Unverified mailboxes would be purged by the server anyway.
         for (m in s.repo.allMailboxes().filter { it.state != Mailbox.STATE_ACTIVE }) {
@@ -236,6 +248,9 @@ object Mailboxes {
      * still arrive. Only then is it deleted. A few contacts rotate per pass, which spreads the proof-of-work cost.
      */
     suspend fun rotateContacts(s: Session) {
+        if (s.decoy) {
+            return
+        }
         val now = System.currentTimeMillis()
         for (m in s.repo.drainedMailboxes(now)) {
             runCatching { deleteRemote(listOf(item(m))) }.onSuccess { s.repo.deleteMailboxRow(m.id) }
@@ -291,6 +306,9 @@ object Mailboxes {
 
     /** Extends any mailbox expiring within 60 days. */
     suspend fun refreshAll(s: Session) {
+        if (s.decoy) {
+            return
+        }
         val soon = LocalDate.now().plusDays(60).toString()
         val due = s.repo.activeMailboxes().filter { it.expiresAt == null || it.expiresAt < soon }
         val api = Graph.api()
@@ -317,6 +335,9 @@ object Mailboxes {
 
     /** Removes mailboxes from unused, expired invites and abandoned creations. */
     suspend fun cleanup(s: Session) {
+        if (s.decoy) {
+            return
+        }
         val now = System.currentTimeMillis()
         val abandoned = s.repo.abandonedInviteMailboxes(now - 3600_000L)
         // The invite can never be used now, so its one-time prekeys go too (forward secrecy).

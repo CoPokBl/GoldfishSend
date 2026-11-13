@@ -23,7 +23,7 @@ object Wiper {
      * so remnants of old sealed pushes can never be opened again.
      */
     fun wipeMessages() {
-        val s = Graph.session.value
+        val s = Graph.realSession
         LockedInbox.clear()
         if (s != null) {
             s.repo.wipeAllMessages()
@@ -90,13 +90,20 @@ object Wiper {
      * Inbound mailboxes are then deleted on the server on a best-effort basis, from a snapshot taken before the keys went.
      */
     @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun wipeEverything(ctx: Context) {
-        val s = Graph.session.value
+    fun wipeEverything(ctx: Context, killProcess: Boolean = false) {
+        val s = Graph.realSession
         val remote = s?.let { runCatching { it.repo.allMailboxes().map(Mailboxes::item) }.getOrNull() }.orEmpty()
         val server = Graph.prefs.serverUrl
         Graph.lock()
         Graph.vault.destroyAll()
+        app.goldfishsend.crypto.BucketKeys.destroyAll()
+        // Anything copied from a chat goes too.
+        runCatching {
+            val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+            cm.clearPrimaryClip()
+        }
         Db.deleteFiles(ctx)
+        Db.deleteFiles(ctx, Db.DECOY_NAME)
         LockedInbox.clear()
         PushHub.unregister(ctx)
         Notifier.cancelAll(ctx)
@@ -109,6 +116,10 @@ object Wiper {
             NetPrefs.clear()
             TorManager.deleteState(ctx)
             Graph.resetHttp()
+            if (killProcess) {
+                // Panic wipe: nothing of this process (decrypted strings, caches) survives in memory.
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }
         }
         if (remote.isNotEmpty()) {
             GlobalScope.launch {

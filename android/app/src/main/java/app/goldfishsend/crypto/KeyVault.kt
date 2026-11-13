@@ -80,11 +80,15 @@ class KeyVault(private val context: Context) {
     val usesStrongBox: Boolean
         get() = prefs.getBoolean(P_STRONGBOX, false)
 
+    /** The current device-key alias. It changes on every master-key rotation (the old alias is deleted). */
+    private val deviceAlias: String
+        get() = prefs.getString(P_DEVICE_ALIAS, null) ?: ALIAS_DEVICE
+
     /** Creates a fresh MK. Returns it, and the caller must wipe it when locking. */
     fun setup(passphrase: CharArray?): ByteArray {
         destroyAll()
         val mk = Rand.bytes(32)
-        createKey(ALIAS_DEVICE, preferStrongBox = true, biometric = false)
+        createKey(deviceAlias, preferStrongBox = true, biometric = false)
         writeWrapped(mk, passphrase)
         ensureDecoySlots()
         return mk
@@ -95,7 +99,7 @@ class KeyVault(private val context: Context) {
             return null
         }
         return try {
-            keystoreOpen(ALIAS_DEVICE, B64.dec(prefs.getString(P_WRAPPED, null)!!))
+            keystoreOpen(deviceAlias, B64.dec(prefs.getString(P_WRAPPED, null)!!))
         } catch (e: Exception) {
             null
         }
@@ -103,7 +107,7 @@ class KeyVault(private val context: Context) {
 
     /** Returns MK, or null for a wrong passphrase. Throws if the device key is unavailable (device locked). */
     fun unlockWithPassphrase(passphrase: CharArray): ByteArray? {
-        val inner = keystoreOpen(ALIAS_DEVICE, B64.dec(prefs.getString(P_WRAPPED, null)!!))
+        val inner = keystoreOpen(deviceAlias, B64.dec(prefs.getString(P_WRAPPED, null)!!))
         val salt = B64.dec(prefs.getString(P_SALT, null)!!)
         val kek = argon2(passphrase, salt)
         return try {
@@ -123,40 +127,61 @@ class KeyVault(private val context: Context) {
     // recorded only inside the encrypted database (see Repo kv "duress_on"/"hidden_on").
 
     /**
-     * The duress PIN is a second wrapping of MK (Argon2id inside the device key), so it can really open the app,
-     * either to erase it or to show a decoy view, depending on Prefs.duressAction.
-     * Returns MK if [pin] is the duress PIN, otherwise null.
+     * The duress PIN is a *verifier only*. Its slot holds `deviceKey(AEAD(argon2(pin, salt), MARKER))`, where MARKER is a
+     * fixed constant that has nothing to do with the master key. Nothing reachable from the duress PIN can unwrap MK, the
+     * message root, the inbox key or any other real-data key: a coerced duress PIN reveals nothing. What it does open
+     * (Prefs.duressAction) is an erase, or a separate decoy profile keyed by [decoyKey].
      */
-    fun unlockWithDuress(pin: CharArray): ByteArray? {
-        val blob = prefs.getString(P_DURESS, null)?.let { B64.dec(it) } ?: return null
-        val salt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) } ?: return null
+    fun isDuress(pin: CharArray): Boolean {
+        val blob = prefs.getString(P_DURESS, null)?.let { B64.dec(it) } ?: return false
+        val salt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) } ?: return false
         val kek = argon2(pin, salt)
         return try {
-            val inner = keystoreOpen(ALIAS_DEVICE, blob)
+            val inner = keystoreOpen(deviceAlias, blob)
             try {
-                Aead.open(kek, inner, AAD_DURESS)
+                MessageDigest.isEqual(Aead.open(kek, inner, AAD_DURESS), DURESS_MARKER)
             } finally {
                 inner.wipe()
             }
         } catch (e: Exception) {
-            null
+            false
         } finally {
             kek.wipe()
         }
     }
 
-    /** Sets the duress PIN (with the current MK), or replaces it with an unopenable decoy slot when [pin] is null. */
-    fun setDuress(pin: CharArray?, mk: ByteArray?) {
+    /** Sets the duress PIN, or (null) replaces it with an unopenable decoy slot of the same shape. */
+    fun setDuress(pin: CharArray?) {
         val salt = Rand.bytes(16)
-        val inner = if (pin != null && mk != null) {
+        val inner = if (pin != null) {
             val kek = argon2(pin, salt)
-            Aead.seal(kek, mk, AAD_DURESS).also { kek.wipe() }
+            Aead.seal(kek, DURESS_MARKER, AAD_DURESS).also { kek.wipe() }
         } else {
             Aead.seal(Rand.bytes(32), Rand.bytes(32), AAD_DURESS)
         }
-        val blob = if (keyStore.containsAlias(ALIAS_DEVICE)) keystoreSeal(ALIAS_DEVICE, inner) else Rand.bytes(inner.size + 28)
+        sealDuressSlot(inner, salt)
         inner.wipe()
+    }
+
+    private fun sealDuressSlot(inner: ByteArray, salt: ByteArray) {
+        val blob = if (keyStore.containsAlias(deviceAlias)) keystoreSeal(deviceAlias, inner) else Rand.bytes(inner.size + 28)
         prefs.edit().putString(P_DURESS, B64.enc(blob)).putString(P_DURESS_SALT, B64.enc(salt)).commit()
+    }
+
+    /**
+     * The decoy profile's database key: independent of the real data, derived only from the duress PIN and its own salt
+     * (`HMAC(argon2(pin, decoySalt), "gf/decoy-db")`). Only call it after [isDuress] returned true.
+     */
+    fun decoyKey(pin: CharArray): ByteArray {
+        val salt = prefs.getString(P_DECOY_SALT, null)?.let { B64.dec(it) } ?: Rand.bytes(16).also {
+            prefs.edit().putString(P_DECOY_SALT, B64.enc(it)).commit()
+        }
+        val k = argon2(pin, salt)
+        return try {
+            app.goldfishsend.proto.Hash.hmacSha256(k, "gf/decoy-db".toByteArray())
+        } finally {
+            k.wipe()
+        }
     }
 
     /** Hidden-chats PIN: a plain Argon2id check (the app is already unlocked when it's entered). */
@@ -179,7 +204,10 @@ class KeyVault(private val context: Context) {
     /** Fills both slots with decoy data, if they're empty (setup, upgrade). */
     fun ensureDecoySlots() {
         if (!prefs.contains(P_DURESS) || !prefs.contains(P_DURESS_SALT)) {
-            setDuress(null, null)
+            setDuress(null)
+        }
+        if (!prefs.contains(P_DECOY_SALT)) {
+            prefs.edit().putString(P_DECOY_SALT, B64.enc(Rand.bytes(16))).commit()
         }
         if (!prefs.contains(P_HIDDEN) || !prefs.contains(P_HIDDEN_SALT)) {
             setHiddenPin(null)
@@ -194,7 +222,7 @@ class KeyVault(private val context: Context) {
         writeWrapped(mk, newPassphrase, isPin)
         if (newPassphrase == null) {
             disableBiometric()
-            setDuress(null, null)
+            setDuress(null)
         }
     }
 
@@ -217,7 +245,7 @@ class KeyVault(private val context: Context) {
             .remove(P_SECRET_KIND)
             .commit()
         disableBiometric()
-        setDuress(null, null)
+        setDuress(null)
     }
 
     /**
@@ -247,6 +275,135 @@ class KeyVault(private val context: Context) {
             null
         }
     }
+
+    // --- master-key rotation (unlock-method or secret changes) ---
+    //
+    // Changing how GoldfishSend is unlocked also changes *what* is protected: a brand-new MK, a rekeyed database and a
+    // fresh device-key alias. The old wrapping (perhaps a weak PIN, or none at all) may survive in flash remnants of the
+    // preference file, but it only ever opens the old MK, which no longer opens anything, under a Keystore alias that's
+    // been deleted.
+    //
+    // Crash safety, in three steps (Graph.changeUnlock):
+    //   1. stageRotation: the new MK is wrapped for the target method under a fresh alias (P_NEXT_*), and a link
+    //      AEAD(oldMk → newMk) is written. The old wrapping still works.
+    //   2. The database is rekeyed to the new MK (SQLCipher does this atomically).
+    //   3. promoteRotation: NEXT becomes current, and the old alias, link and biometric copy are deleted.
+    // If the app dies before 2, the old method still opens the old DB and the stage is discarded (Graph.openSession).
+    // If it dies between 2 and 3, the old method opens the old MK, which fails on the DB, and the link recovers the new
+    // MK to finish step 3.
+
+    sealed class Target {
+        data object None : Target()
+
+        class Secret(val secret: CharArray, val isPin: Boolean) : Target()
+
+        /** [cipher] is a screen-lock cipher (from [screenLockEncryptCipher]) already authenticated by the system prompt. */
+        class ScreenLock(val cipher: Cipher) : Target()
+    }
+
+    val hasPendingRotation: Boolean
+        get() = prefs.contains(P_NEXT_WRAPPED)
+
+    fun stageRotation(oldMk: ByteArray, newMk: ByteArray, target: Target) {
+        abortRotation()
+        val edit = prefs.edit()
+        when (target) {
+            is Target.ScreenLock -> {
+                edit.putString(P_NEXT_WRAPPED, B64.enc(target.cipher.iv + target.cipher.doFinal(newMk)))
+                    .putString(P_NEXT_METHOD, NEXT_SCREENLOCK)
+            }
+            is Target.None, is Target.Secret -> {
+                val alias = ALIAS_DEVICE + "_" + B64.enc(Rand.bytes(9)).replace('-', 'x').replace('_', 'y')
+                createKey(alias, preferStrongBox = true, biometric = false)
+                edit.putString(P_NEXT_ALIAS, alias)
+                if (target is Target.Secret) {
+                    val salt = Rand.bytes(16)
+                    val kek = argon2(target.secret, salt)
+                    val inner = Aead.seal(kek, newMk, AAD_MK)
+                    edit.putString(P_NEXT_WRAPPED, B64.enc(keystoreSeal(alias, inner)))
+                        .putString(P_NEXT_METHOD, if (target.isPin) NEXT_PIN else NEXT_PASSPHRASE)
+                        .putString(P_NEXT_SALT, B64.enc(salt))
+                    kek.wipe()
+                    inner.wipe()
+                } else {
+                    edit.putString(P_NEXT_WRAPPED, B64.enc(keystoreSeal(alias, newMk)))
+                        .putString(P_NEXT_METHOD, NEXT_NONE)
+                }
+            }
+        }
+        val link = linkKey(oldMk)
+        edit.putString(P_ROTATE_LINK, B64.enc(Aead.seal(link, newMk, AAD_LINK)))
+        link.wipe()
+        edit.commit()
+    }
+
+    /** After a crash between the rekey and [promoteRotation]: recovers the new MK from the old one. */
+    fun recoverRotation(oldMk: ByteArray): ByteArray? {
+        val blob = prefs.getString(P_ROTATE_LINK, null)?.let { B64.dec(it) } ?: return null
+        val link = linkKey(oldMk)
+        return try {
+            Aead.open(link, blob, AAD_LINK)
+        } catch (e: Exception) {
+            null
+        } finally {
+            link.wipe()
+        }
+    }
+
+    /**
+     * Makes the staged wrapping current. The duress verifier doesn't contain MK, but it's sealed under the device key,
+     * so it moves to the new alias (or becomes a decoy slot when there's no app secret). The biometric shortcut wraps
+     * the old MK, so it's switched off.
+     */
+    fun promoteRotation() {
+        val method = prefs.getString(P_NEXT_METHOD, null) ?: return
+        val wrapped = prefs.getString(P_NEXT_WRAPPED, null) ?: return
+        val oldAlias = deviceAlias
+        val newAlias = prefs.getString(P_NEXT_ALIAS, null)
+        val duressInner = runCatching { keystoreOpen(oldAlias, B64.dec(prefs.getString(P_DURESS, null)!!)) }.getOrNull()
+        val duressSalt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) }
+        val edit = prefs.edit()
+            .putString(P_WRAPPED, wrapped)
+            .putBoolean(P_SCREENLOCK, method == NEXT_SCREENLOCK)
+            .putBoolean(P_HAS_PASS, method == NEXT_PIN || method == NEXT_PASSPHRASE)
+        when (method) {
+            NEXT_PIN, NEXT_PASSPHRASE -> edit.putString(P_SECRET_KIND, if (method == NEXT_PIN) KIND_PIN else KIND_PASSPHRASE)
+                .putString(P_SALT, prefs.getString(P_NEXT_SALT, null))
+            else -> edit.remove(P_SECRET_KIND).remove(P_SALT)
+        }
+        if (newAlias != null) {
+            edit.putString(P_DEVICE_ALIAS, newAlias)
+        } else {
+            // Screen lock: no device-key-wrapped copy of MK may remain.
+            edit.remove(P_DEVICE_ALIAS)
+        }
+        edit.remove(P_NEXT_WRAPPED).remove(P_NEXT_METHOD).remove(P_NEXT_SALT).remove(P_NEXT_ALIAS).remove(P_ROTATE_LINK)
+        edit.commit()
+        if (oldAlias != newAlias) {
+            runCatching { keyStore.deleteEntry(oldAlias) }
+        }
+        if (method != NEXT_SCREENLOCK) {
+            runCatching { keyStore.deleteEntry(ALIAS_SYSLOCK) }
+        }
+        disableBiometric()
+        if (duressInner != null && duressSalt != null && (method == NEXT_PIN || method == NEXT_PASSPHRASE)) {
+            sealDuressSlot(duressInner, duressSalt)
+        } else {
+            setDuress(null)
+        }
+        duressInner?.wipe()
+    }
+
+    /** Discards a staged rotation (the rekey never happened). */
+    fun abortRotation() {
+        val alias = prefs.getString(P_NEXT_ALIAS, null)
+        if (alias != null && alias != deviceAlias) {
+            runCatching { keyStore.deleteEntry(alias) }
+        }
+        prefs.edit().remove(P_NEXT_WRAPPED).remove(P_NEXT_METHOD).remove(P_NEXT_SALT).remove(P_NEXT_ALIAS).remove(P_ROTATE_LINK).commit()
+    }
+
+    private fun linkKey(mk: ByteArray): ByteArray = app.goldfishsend.proto.Hash.hmacSha256(mk, "gf/rotate-link/v1".toByteArray())
 
     // --- biometric ---
 
@@ -316,8 +473,15 @@ class KeyVault(private val context: Context) {
 
     /** Destroys every key: everything encrypted becomes unrecoverable. */
     fun destroyAll() {
-        for (alias in listOf(ALIAS_DEVICE, ALIAS_MSG, ALIAS_BIO, ALIAS_SYSLOCK)) {
+        val extra = listOfNotNull(prefs.getString(P_DEVICE_ALIAS, null), prefs.getString(P_NEXT_ALIAS, null))
+        for (alias in listOf(ALIAS_DEVICE, ALIAS_MSG, ALIAS_BIO, ALIAS_SYSLOCK) + extra) {
             runCatching { keyStore.deleteEntry(alias) }
+        }
+        // Rotated device aliases from interrupted rotations.
+        runCatching {
+            for (alias in keyStore.aliases().toList().filter { it.startsWith("${ALIAS_DEVICE}_") }) {
+                keyStore.deleteEntry(alias)
+            }
         }
         prefs.edit().clear().commit()
     }
@@ -325,12 +489,12 @@ class KeyVault(private val context: Context) {
     // --- internals ---
 
     private fun writeWrapped(mk: ByteArray, passphrase: CharArray?, isPin: Boolean = false) {
-        if (!keyStore.containsAlias(ALIAS_DEVICE)) {
-            createKey(ALIAS_DEVICE, preferStrongBox = true, biometric = false)
+        if (!keyStore.containsAlias(deviceAlias)) {
+            createKey(deviceAlias, preferStrongBox = true, biometric = false)
         }
         val edit = prefs.edit().putBoolean(P_SCREENLOCK, false)
         if (passphrase == null || passphrase.isEmpty()) {
-            edit.putString(P_WRAPPED, B64.enc(keystoreSeal(ALIAS_DEVICE, mk)))
+            edit.putString(P_WRAPPED, B64.enc(keystoreSeal(deviceAlias, mk)))
                 .putBoolean(P_HAS_PASS, false)
                 .remove(P_SALT)
                 .remove(P_SECRET_KIND)
@@ -339,7 +503,7 @@ class KeyVault(private val context: Context) {
             val salt = Rand.bytes(16)
             val kek = argon2(passphrase, salt)
             val inner = Aead.seal(kek, mk, AAD_MK)
-            edit.putString(P_WRAPPED, B64.enc(keystoreSeal(ALIAS_DEVICE, inner)))
+            edit.putString(P_WRAPPED, B64.enc(keystoreSeal(deviceAlias, inner)))
                 .putBoolean(P_HAS_PASS, true)
                 .putString(P_SALT, B64.enc(salt))
             kek.wipe()
@@ -437,8 +601,23 @@ class KeyVault(private val context: Context) {
         private const val P_DURESS_SALT = "duress_salt"
         private const val P_HIDDEN = "hidden_pin"
         private const val P_HIDDEN_SALT = "hidden_salt"
-        private val AAD_DURESS = "gf/duress/v1".toByteArray()
+        private val AAD_DURESS = "gf/duress/v2".toByteArray()
+        private const val P_DECOY_SALT = "decoy_salt"
+
+        /** What the duress verifier encrypts. A constant: it proves the PIN, and unlocks nothing. */
+        private val DURESS_MARKER = "gf/duress-verifier/v2/0000000000".toByteArray().copyOf(32)
         private const val P_STRONGBOX = "strongbox"
+        private const val P_DEVICE_ALIAS = "device_alias"
+        private const val P_NEXT_WRAPPED = "next_wrapped"
+        private const val P_NEXT_METHOD = "next_method"
+        private const val P_NEXT_SALT = "next_salt"
+        private const val P_NEXT_ALIAS = "next_alias"
+        private const val P_ROTATE_LINK = "rotate_link"
+        private const val NEXT_NONE = "none"
+        private const val NEXT_PIN = "pin"
+        private const val NEXT_PASSPHRASE = "passphrase"
+        private const val NEXT_SCREENLOCK = "screenlock"
+        private val AAD_LINK = "gf/rotate-link/v1".toByteArray()
         private val AAD_MK = "gf/mk/v1".toByteArray()
 
         /** Argon2id, m = 64 MiB, t = 3, p = 1. */
@@ -453,7 +632,18 @@ class KeyVault(private val context: Context) {
             val gen = Argon2BytesGenerator()
             gen.init(params)
             val out = ByteArray(32)
-            gen.generateBytes(passphrase, out)
+            // Encode to UTF-8 ourselves so the input copy can be wiped (BouncyCastle's CharArray overload leaves one behind).
+            val buf = java.nio.charset.StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(passphrase))
+            val bytes = ByteArray(buf.remaining())
+            buf.get(bytes)
+            if (buf.hasArray()) {
+                java.util.Arrays.fill(buf.array(), 0.toByte())
+            }
+            try {
+                gen.generateBytes(bytes, out)
+            } finally {
+                bytes.wipe()
+            }
             return out
         }
     }

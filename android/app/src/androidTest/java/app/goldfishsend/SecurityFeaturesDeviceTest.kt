@@ -47,7 +47,7 @@ class SecurityFeaturesDeviceTest {
         assertTrue(before.containsKey("duress") && before.containsKey("hidden_pin"))
         val emptyShape = (before["duress"] as String).length to (before["hidden_pin"] as String).length
 
-        Graph.vault.setDuress("4321".toCharArray(), mk)
+        Graph.vault.setDuress("4321".toCharArray())
         Graph.vault.setHiddenPin("777777".toCharArray())
         val after = vaultPrefs()
         assertEquals(emptyShape, (after["duress"] as String).length to (after["hidden_pin"] as String).length)
@@ -55,20 +55,28 @@ class SecurityFeaturesDeviceTest {
     }
 
     @Test
-    fun appPinAndDuressBothUnwrapTheSameMasterKey() {
-        val mk = Graph.vault.setup("123456".toCharArray(), )
-        Graph.vault.changePassphrase(mk, "123456".toCharArray(), isPin = true)
-        assertEquals(UnlockMethod.APP_SECRET, Graph.vault.unlockMethod)
-        assertTrue(Graph.vault.secretIsPin)
-        Graph.vault.setDuress("4321".toCharArray(), mk)
+    fun duressPinIsAVerifierThatCanNeverOpenRealData() {
+        val mk = Graph.vault.setup("123456".toCharArray())
+        Graph.vault.changePassphrase(mk.copyOf(), "123456".toCharArray(), isPin = true)
+        val s = kotlinx.coroutines.runBlocking { Graph.openSession(mk.copyOf()) }
+        s.repo.createContact("Real", false, 0, "https://x.example", ByteArray(32))
+        Graph.lock()
+        Graph.vault.setDuress("4321".toCharArray())
 
-        assertArrayEquals(mk, Graph.vault.unlockWithPassphrase("123456".toCharArray()))
-        assertArrayEquals(mk, Graph.vault.unlockWithDuress("4321".toCharArray()))
-        assertNull(Graph.vault.unlockWithDuress("123456".toCharArray()))
+        assertTrue(Graph.vault.isDuress("4321".toCharArray()))
+        assertFalse(Graph.vault.isDuress("123456".toCharArray()))
         assertNull(Graph.vault.unlockWithPassphrase("4321".toCharArray()))
-
-        Graph.vault.setDuress(null, null)
-        assertNull(Graph.vault.unlockWithDuress("4321".toCharArray()))
+        // Nothing derived from the duress PIN is the master key, and the real database refuses it.
+        val decoyKey = Graph.vault.decoyKey("4321".toCharArray())
+        assertFalse(decoyKey.contentEquals(mk))
+        try {
+            Db.open(ctx, decoyKey)
+            org.junit.Assert.fail("the duress PIN must not open the real database")
+        } catch (e: Exception) {
+            // expected
+        }
+        Graph.vault.setDuress(null)
+        assertFalse(Graph.vault.isDuress("4321".toCharArray()))
     }
 
     @Test
@@ -81,35 +89,61 @@ class SecurityFeaturesDeviceTest {
     }
 
     @Test
-    fun duressOpensDecoySessionWithoutHiddenChats_andCanDeleteThem() = runBlocking {
+    fun duressOpensAPersistentIndependentDecoyProfile() = runBlocking<Unit> {
         val mk = Graph.vault.setup("123456".toCharArray())
         Graph.vault.changePassphrase(mk.copyOf(), "123456".toCharArray(), isPin = true)
-        Graph.vault.setDuress("4321".toCharArray(), mk.copyOf())
+        Graph.vault.setDuress("4321".toCharArray())
         val s = Graph.openSession(mk)
-        val visible = s.repo.createContact("Visible", false, 0, "https://x.example", ByteArray(32))
-        val secret = s.repo.createContact("Secret", false, 0, "https://x.example", ByteArray(32))
-        s.repo.setHidden(secret, true)
+        val real = s.repo.createContact("Real friend", false, 0, "https://x.example", ByteArray(32))
         Graph.lock()
 
-        Graph.prefs.duressAction = DuressAction.HIDE_HIDDEN_CHATS
+        Graph.prefs.duressAction = DuressAction.DECOY
         assertEquals(UnlockResult.Ok, AppLock.unlock("4321".toCharArray()))
         val decoy = Graph.session.value!!
         assertTrue(decoy.decoy)
-        assertFalse(decoy.hiddenRevealed.value)
-        assertEquals(listOf(secret), decoy.repo.hiddenContactIds())
+        assertNull(Graph.realSession)
+        assertTrue(decoy.repo.contacts().isEmpty())
+        val fake = decoy.repo.createContact("Mum", false, 0, null, null)
         Graph.lock()
 
-        Graph.prefs.duressAction = DuressAction.DELETE_HIDDEN_CHATS
+        // Same decoy contents next time.
         assertEquals(UnlockResult.Ok, AppLock.unlock("4321".toCharArray()))
-        val after = Graph.session.value!!
-        assertTrue(after.repo.hiddenContactIds().isEmpty())
-        assertNotNull(after.repo.contact(visible))
-        assertNull(after.repo.contact(secret))
+        assertEquals(listOf("Mum"), Graph.session.value!!.repo.contacts().map { it.name })
         Graph.lock()
 
-        // The real PIN still opens a normal session.
+        // The real PIN shows the real data, untouched, and nothing of the decoy.
         assertEquals(UnlockResult.Ok, AppLock.unlock("123456".toCharArray()))
-        assertFalse(Graph.session.value!!.decoy)
+        val back = Graph.session.value!!
+        assertFalse(back.decoy)
+        assertEquals(listOf(real), back.repo.contacts().map { it.id })
+        fake.toString()
+    }
+
+    @Test
+    fun aPushDuringADecoySessionIsKeptForTheRealUnlock() = runBlocking<Unit> {
+        val mk = Graph.vault.setup("123456".toCharArray())
+        Graph.vault.changePassphrase(mk.copyOf(), "123456".toCharArray(), isPin = true)
+        Graph.vault.setDuress("4321".toCharArray())
+        Graph.openSession(mk)
+        Graph.lock()
+        Graph.prefs.duressAction = DuressAction.DECOY
+        assertEquals(UnlockResult.Ok, AppLock.unlock("4321".toCharArray()))
+        assertTrue(Graph.session.value!!.decoy)
+
+        val push = app.goldfishsend.proto.PushEnvelope.build(
+            app.goldfishsend.proto.PushEnvelope.TYPE_MESSAGE, ByteArray(8) { 5 }, byteArrayOf(3, 1, 2, 3),
+        )
+        app.goldfishsend.core.Messenger.onPushPayload(push)
+        assertFalse("kept in the locked inbox, not processed by the decoy", LockedInbox.isEmpty)
+        Graph.lock()
+
+        assertEquals(UnlockResult.Ok, AppLock.unlock("123456".toCharArray()))
+        // The real unlock drains it (in the background).
+        repeat(50) {
+            if (LockedInbox.isEmpty) return@repeat
+            Thread.sleep(100)
+        }
+        assertTrue(LockedInbox.isEmpty)
     }
 
     @Test
