@@ -98,6 +98,17 @@ object NetRules {
      * Server URLs: https anywhere, and also plain http to a valid v3 onion service, whose onion address already
      * authenticates and encrypts the connection end to end.
      */
+    /** See ServerApi.isValidContactServer: https on 443, or a v3 onion (http on 80 or https on 443). */
+    fun isAcceptableContactServer(scheme: String, host: String, port: Int, allowHttp: Boolean): Boolean {
+        if (allowHttp) {
+            return isAcceptableServerScheme(scheme, host, true)
+        }
+        return when {
+            isOnionHost(host) -> isValidV3Onion(host) && ((scheme == "http" && port == 80) || (scheme == "https" && port == 443))
+            else -> scheme == "https" && port == 443
+        }
+    }
+
     fun isAcceptableServerScheme(scheme: String, host: String, allowHttp: Boolean): Boolean = when (scheme) {
         "https" -> !isOnionHost(host) || isValidV3Onion(host)
         "http" -> allowHttp || isValidV3Onion(host)

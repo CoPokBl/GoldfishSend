@@ -116,9 +116,30 @@ class Prefs(context: Context) {
         get() = int("inactivity_days", 0)
         set(v) = setInt("inactivity_days", v)
 
-    var lastUnlockAt: Long
-        get() = long("last_unlock", System.currentTimeMillis())
-        set(v) = sp.edit().putLong("last_unlock", v).apply()
+    /** Last time the user was present (interactive unlock or app in the foreground). Null until first recorded. */
+    var presence: app.goldfishsend.security.Presence.Mark?
+        get() {
+            if (!sp.contains("presence_wall")) {
+                return null
+            }
+            return app.goldfishsend.security.Presence.Mark(
+                sp.getLong("presence_wall", 0), sp.getLong("presence_elapsed", 0), sp.getInt("presence_boot", -1),
+            )
+        }
+        set(v) {
+            val e = sp.edit()
+            if (v == null) {
+                e.remove("presence_wall").remove("presence_elapsed").remove("presence_boot")
+            } else {
+                e.putLong("presence_wall", v.wallMs).putLong("presence_elapsed", v.elapsedMs).putInt("presence_boot", v.bootCount)
+            }
+            e.commit()
+        }
+
+    /** Set by a reboot wipe while locked: the locked-inbox key pair is replaced at the next unlock (after draining). */
+    var inboxRotatePending: Boolean
+        get() = bool("inbox_rotate", false)
+        set(v) = setBool("inbox_rotate", v)
 
     /** Disappearing timer applied to new chats. */
     var defaultTimerSecs: Long

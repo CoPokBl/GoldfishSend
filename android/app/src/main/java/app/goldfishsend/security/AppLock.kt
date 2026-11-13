@@ -39,15 +39,33 @@ object AppLock {
 
     fun onBackground() {
         backgroundedAt = SystemClock.elapsedRealtime()
-        if (lockable && Graph.prefs.lockTimeoutSecs == 0) {
+        val timeout = Graph.prefs.lockTimeoutSecs
+        if (lockable && timeout == 0) {
             Graph.lock()
+        } else if (lockable) {
+            // Lock on schedule while in the background too, so the key doesn't stay in RAM (and pushes don't get processed
+            // with names in notifications) until the user happens to come back.
+            handler.removeCallbacks(timedLock)
+            handler.postDelayed(timedLock, timeout * 1000L)
         }
     }
 
     fun onForeground() {
+        handler.removeCallbacks(timedLock)
         val at = backgroundedAt
         backgroundedAt = null
         if (lockable && at != null && SystemClock.elapsedRealtime() - at >= Graph.prefs.lockTimeoutSecs * 1000L) {
+            Graph.lock()
+        }
+        // The user is looking at the app. Background auto-unlocks never count as presence.
+        if (Graph.isUnlocked) {
+            Wiper.recordPresence()
+        }
+    }
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val timedLock = Runnable {
+        if (lockable && backgroundedAt != null) {
             Graph.lock()
         }
     }
@@ -82,6 +100,7 @@ object AppLock {
                         duress?.wipe()
                         prefs.failedAttempts = 0
                         afterUnlock(Graph.openSession(real))
+                        Wiper.recordPresence()
                         UnlockResult.Ok
                     }
                     duress != null -> {
@@ -129,12 +148,19 @@ object AppLock {
     suspend fun unlockWithMasterKey(mk: ByteArray) {
         Graph.prefs.failedAttempts = 0
         afterUnlock(Graph.openSession(mk))
+        Wiper.recordPresence()
     }
 
     /** Catch-up work once the DB is open: locked inbox, expiry sweep, outbox, mailbox pool. */
     fun afterUnlock(s: Session) {
         Graph.scope.launchSafe {
             LockedInbox.drain(s)
+            if (Graph.prefs.inboxRotatePending) {
+                // A reboot wipe happened while locked. Pushes sealed since the reboot were just drained; anything older
+                // was deleted. Replace the key pair so no remnant of an old sealed push can ever be opened.
+                LockedInbox.rotateKeys(s)
+                Graph.prefs.inboxRotatePending = false
+            }
             Sweeper.sweep(s)
             Outbox.kick()
             Mailboxes.cleanup(s)

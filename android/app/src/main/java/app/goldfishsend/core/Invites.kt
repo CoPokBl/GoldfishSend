@@ -10,6 +10,7 @@ import app.goldfishsend.proto.InviteBundle
 import app.goldfishsend.proto.InviteCrypto
 import app.goldfishsend.proto.InviteLink
 import app.goldfishsend.proto.Rand
+import app.goldfishsend.proto.Sanitize
 import kotlinx.coroutines.sync.withLock
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.SessionBuilder
@@ -55,6 +56,7 @@ object Invites {
         val mb = Mailboxes.take(s, purpose)
             ?: throw InviteException("Still getting things ready. This only takes a moment the first time.")
         val ttl = if (purpose == Mailbox.PURPOSE_LINK) LINK_TTL_SECS else QR_TTL_SECS
+        var issued: Pair<Int, Int>? = null
         val bundle = s.lock.withLock {
             s.db.tx {
                 val identity = s.signal.identityKeyPair
@@ -66,6 +68,9 @@ object Invites {
                 val kyber = KEMKeyPair.generate(KEMKeyType.KYBER_1024)
                 val kyberSig = identity.privateKey.calculateSignature(kyber.publicKey.serialize())
                 s.signal.storeKyberPreKey(kyberId, KyberPreKeyRecord(kyberId, System.currentTimeMillis(), kyber, kyberSig))
+                // Bind the invite to this mailbox: a first hello is only accepted here, and only with this prekey.
+                s.repo.setInvitePrekeys(mb.id, spkId, kyberId)
+                issued = spkId to kyberId
                 InviteBundle(
                     server = Graph.prefs.serverUrl,
                     sendSecret = B64.enc(mb.sendSecret),
@@ -83,9 +88,25 @@ object Invites {
             }
         }
         val key = Rand.bytes(32)
-        val id = Graph.api().uploadInvite(InviteCrypto.encrypt(key, bundle), ttl)
+        val id = try {
+            Graph.api().uploadInvite(InviteCrypto.encrypt(key, bundle), ttl)
+        } catch (e: ApiException) {
+            // 429 (for example scope "global": the server's live-invite cap is full) or any other failure: the mailbox
+            // stays unadvertised, so the next attempt can reuse it.
+            s.lock.withLock {
+                s.db.tx {
+                    issued?.let { (spk, kyber) ->
+                        s.signal.removeSignedPreKey(spk)
+                        s.signal.removeKyberPreKey(kyber)
+                    }
+                    s.repo.releasePoolMailbox(mb.id)
+                }
+            }
+            throw InviteException(
+                if (e.status == 429) "The server is busy right now. Try again in a minute." else e.human,
+            )
+        }
         val expiresAt = System.currentTimeMillis() + ttl * 1000
-        s.repo.db.exec("UPDATE mailboxes SET purpose = ? WHERE id = ?", purpose, mb.id)
         s.repo.markInviteUsed(mb.id, expiresAt)
         Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
         val created = Created(InviteLink(Graph.prefs.serverUrl, id, key), mb.id, expiresAt)
@@ -100,7 +121,7 @@ object Invites {
      * right away. The chat can open and the user can type at once, because everything is queued in the outbox.
      */
     suspend fun accept(s: Session, link: InviteLink, viaQr: Boolean): Long {
-        if (!ServerApi.isValidServer(link.server)) {
+        if (!ServerApi.isValidContactServer(link.server)) {
             throw InviteException("This invite points to a server that isn't secure.")
         }
         val blob = try {
@@ -113,14 +134,14 @@ object Invites {
         } catch (e: Exception) {
             throw InviteException("This code doesn't look right. Ask for a new one.")
         }
-        if (!ServerApi.isValidServer(bundle.server)) {
+        if (!ServerApi.isValidContactServer(bundle.server)) {
             throw InviteException("This invite points to a server that isn't secure.")
         }
         val contactId = s.lock.withLock {
             s.db.tx {
                 val timer = Graph.prefs.defaultTimerSecs
                 val cid = s.repo.createContact(
-                    name = bundle.name?.take(64)?.ifBlank { null } ?: DEFAULT_NAME,
+                    name = Sanitize.name(bundle.name) ?: DEFAULT_NAME,
                     verified = viaQr,
                     timerSecs = timer,
                     outServer = bundle.server,

@@ -64,7 +64,7 @@ object Mailboxes {
         try {
             val api = Graph.api()
             val ch = api.powChallenge()
-            val nonce = Pow.solve(B64.dec(ch.challenge), ch.difficulty)
+            val nonce = Outbox.solvePow(ch.challenge, ch.difficulty)
             api.createMailbox(
                 CreateMailboxRequest(
                     pow = PowSolution(ch.challenge, B64.enc(nonce)),
@@ -107,6 +107,9 @@ object Mailboxes {
             val boxes = rotation.mapNotNull { s.repo.mailbox(it) }
             if (boxes.isNotEmpty()) {
                 val r = api.verify(boxes.map(::item), code)
+                if (r.endpointGone) {
+                    onEndpointGone(s)
+                }
                 for (b in boxes) {
                     s.repo.setMailboxState(b.id, Mailbox.STATE_ACTIVE, r.expiresAt)
                 }
@@ -119,6 +122,9 @@ object Mailboxes {
             return
         }
         val r = api.verify(listOf(item(mb)), code)
+        if (r.endpointGone) {
+            onEndpointGone(s)
+        }
         s.repo.setMailboxState(mb.id, Mailbox.STATE_ACTIVE, r.expiresAt)
         waiters[B64.enc(tag)]?.complete(Unit)
     }
@@ -137,9 +143,19 @@ object Mailboxes {
     }
 
     /** Pooled mailbox if available, otherwise a freshly created one. */
+    /** Claims a pool mailbox (atomically), or creates and claims a new one. */
     suspend fun take(s: Session, purpose: Int): Mailbox? {
-        s.repo.pooledMailboxes().firstOrNull()?.let { return it }
-        return create(s, purpose)
+        val provisional = System.currentTimeMillis() + 25 * 3600_000L
+        s.repo.claimPoolMailbox(purpose, provisional)?.let { return it }
+        repeat(3) {
+            val created = create(s, purpose) ?: return null
+            if (s.repo.claimMailbox(created.id, purpose, provisional)) {
+                return s.repo.mailbox(created.id)
+            }
+            // Someone else claimed the fresh one first. Try the pool again.
+            s.repo.claimPoolMailbox(purpose, provisional)?.let { return it }
+        }
+        return null
     }
 
     suspend fun takeForContact(s: Session, contactId: Long): Mailbox? {
@@ -253,6 +269,26 @@ object Mailboxes {
         }
     }
 
+    /**
+     * The server says it can't reach our push endpoint any more (protocol.md `endpointGone`). Ask the distributor for a
+     * fresh registration, then point every mailbox at the current endpoint again. If the endpoint didn't change, the
+     * rotation's verification push makes the server probe it again. At most once every 6 hours, so a server that keeps
+     * saying so can't make us loop.
+     */
+    private fun onEndpointGone(s: Session) {
+        val now = System.currentTimeMillis()
+        val last = s.repo.kvString("endpoint_gone_at")?.toLongOrNull() ?: 0L
+        if (now - last < 6 * 3600_000L) {
+            return
+        }
+        s.repo.kvPutString("endpoint_gone_at", now.toString())
+        s.repo.kvPutString("rotation_needed", "1")
+        Graph.scope.launchSafe {
+            runCatching { app.goldfishsend.push.PushHub.register(Graph.app) }
+            runCatching { rotateAll(s) }
+        }
+    }
+
     /** Extends any mailbox expiring within 60 days. */
     suspend fun refreshAll(s: Session) {
         val soon = LocalDate.now().plusDays(60).toString()
@@ -260,6 +296,9 @@ object Mailboxes {
         val api = Graph.api()
         for (batch in due.chunked(100)) {
             val r = api.refresh(batch.map(::item))
+            if (r.endpointGone) {
+                onEndpointGone(s)
+            }
             for (b in batch) {
                 s.repo.setMailboxExpiry(b.id, r.expiresAt)
             }
@@ -280,6 +319,15 @@ object Mailboxes {
     suspend fun cleanup(s: Session) {
         val now = System.currentTimeMillis()
         val abandoned = s.repo.abandonedInviteMailboxes(now - 3600_000L)
+        // The invite can never be used now, so its one-time prekeys go too (forward secrecy).
+        s.lock.withLock {
+            s.db.tx {
+                for (m in abandoned) {
+                    m.inviteSpkId?.let { s.signal.removeSignedPreKey(it) }
+                    m.inviteKyberId?.let { s.signal.removeKyberPreKey(it) }
+                }
+            }
+        }
         runCatching { deleteRemote(abandoned.map(::item)) }.onSuccess {
             for (m in abandoned) {
                 s.repo.deleteMailboxRow(m.id)

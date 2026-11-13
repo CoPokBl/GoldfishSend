@@ -16,9 +16,14 @@ import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.Pow
 import app.goldfishsend.proto.Rand
 import app.goldfishsend.work.OutboxWorker
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import org.signal.libsignal.protocol.SessionCipher
 
 /**
@@ -26,7 +31,14 @@ import org.signal.libsignal.protocol.SessionCipher
  * same idempotency key until accepted, so retries never duplicate messages or desync the ratchet.
  */
 object Outbox {
-    private val mutex = Mutex()
+    /**
+     * One lock per contact, never held across other contacts' network I/O. A slow or hostile server (a contact
+     * chooses their own) can only delay that contact's queue.
+     */
+    private val contactLocks = ConcurrentHashMap<Long, Mutex>()
+
+    /** At most this many contacts are sent to at once. */
+    private val parallel = Semaphore(4)
 
     /** Starts sending now (in process) and schedules WorkManager as a durable fallback. */
     fun kick() {
@@ -48,20 +60,38 @@ object Outbox {
     }
 
     /** Sends everything that's due. Returns the earliest pending retry time, or null if the outbox is empty. */
-    suspend fun process(s: Session): Long? = mutex.withLock {
-        val now = System.currentTimeMillis()
-        for ((_, items) in s.repo.outboxAll().groupBy { it.contactId }) {
-            for (item in items) {
-                if (item.nextAt > now) {
-                    break
-                }
-                if (!sendOne(s, item)) {
-                    // Preserve per-contact ordering: stop this contact's queue until the head succeeds.
-                    break
+    suspend fun process(s: Session): Long? {
+        val contacts = s.repo.outboxAll().map { it.contactId }.distinct()
+        coroutineScope {
+            for (cid in contacts) {
+                launch {
+                    val lock = contactLocks.getOrPut(cid) { Mutex() }
+                    // Another run is already sending to this contact; it will pick up anything new.
+                    if (!lock.tryLock()) {
+                        return@launch
+                    }
+                    try {
+                        parallel.withPermit { drainContact(s, cid) }
+                    } finally {
+                        lock.unlock()
+                    }
                 }
             }
         }
-        s.repo.outboxEarliest()
+        return s.repo.outboxEarliest()
+    }
+
+    private suspend fun drainContact(s: Session, cid: Long) {
+        val now = System.currentTimeMillis()
+        for (item in s.repo.outboxAll().filter { it.contactId == cid }) {
+            if (item.nextAt > now) {
+                break
+            }
+            if (!sendOne(s, item)) {
+                // Preserve per-contact ordering: stop this contact's queue until the head succeeds.
+                break
+            }
+        }
     }
 
     private suspend fun sendOne(s: Session, item: OutboxItem): Boolean {
@@ -117,7 +147,7 @@ object Outbox {
                     throw e
                 }
                 val ch = api.powChallenge()
-                val nonce = Pow.solve(B64.dec(ch.challenge), ch.difficulty)
+                val nonce = solvePow(ch.challenge, ch.difficulty)
                 api.sendMessage(secret, blob, item.idem, null, "${ch.challenge}.${B64.enc(nonce)}")
             }
             s.repo.outboxDelete(item.seq)
@@ -146,8 +176,9 @@ object Outbox {
                     return true
                 }
                 e.status == 507 -> {
-                    // mailbox_full: the recipient has been offline a long time. Keep it queued (shown as "sending").
-                    backoff(s, item, maxOf(e.retryAfterSeconds ?: 0, 3600))
+                    // mailbox_full (scope "mailbox": the recipient has been offline a long time; scope "global": the server's
+                    // held-message quota is full). Keep it queued, shown as "sending", and honour Retry-After.
+                    backoff(s, item, e.retryAfterSeconds ?: 3600)
                     return false
                 }
                 e.retryable -> {
@@ -160,6 +191,18 @@ object Outbox {
                 }
             }
         }
+    }
+
+    /**
+     * Solves a server's challenge, treating an absurd difficulty or a timeout as a server failure (retried later) rather
+     * than letting it pin the CPU or crash the send loop.
+     */
+    suspend fun solvePow(challengeB64: String, difficulty: Int): ByteArray = try {
+        Pow.solve(B64.dec(challengeB64), difficulty)
+    } catch (e: Pow.TooHardException) {
+        throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
+    } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+        throw ApiException("network", 0)
     }
 
     private fun backoff(s: Session, item: OutboxItem, retryAfter: Long?) {

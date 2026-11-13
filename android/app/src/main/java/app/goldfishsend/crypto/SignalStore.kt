@@ -131,6 +131,11 @@ class SignalStore(private val db: Db) : SignalProtocolStore {
     override fun containsKyberPreKey(kyberPreKeyId: Int): Boolean =
         db.long("SELECT COUNT(*) FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId) > 0
 
+    /** Deletes an unused Kyber prekey (its invite expired or was abandoned). */
+    fun removeKyberPreKey(kyberPreKeyId: Int) {
+        db.exec("DELETE FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId)
+    }
+
     /** One-time Kyber prekeys are deleted on use (forward secrecy). The signed prekey goes with it. */
     override fun markKyberPreKeyUsed(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) {
         db.exec("DELETE FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId)

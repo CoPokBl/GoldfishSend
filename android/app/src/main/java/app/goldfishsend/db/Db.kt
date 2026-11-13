@@ -109,10 +109,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
                 System.loadLibrary("sqlcipher")
                 libLoaded = true
             }
-            val raw = Hash.hmacSha256(mk, "gf/db-key/v1".utf8())
-            val hex = raw.joinToString("") { "%02x".format(it) }
-            val keyBytes = "x'$hex'".utf8()
-            raw.wipe()
+            val keyBytes = keyBlob(mk)
             val f = file(context)
             f.parentFile?.mkdirs()
             val sql = try {
@@ -122,10 +119,35 @@ class Db private constructor(private val sql: SQLiteDatabase) {
             }
             sql.rawExecSQL("PRAGMA cipher_memory_security = ON")
             sql.rawExecSQL("PRAGMA secure_delete = ON")
+            // Explicit rather than the library default: a rollback journal that's deleted at the end of every transaction
+            // (no long-lived WAL file holding old page copies), and temporary tables and indices kept in memory, never in
+            // temp files.
+            sql.rawQuery("PRAGMA journal_mode = DELETE", null).use { it.moveToFirst() }
+            sql.rawExecSQL("PRAGMA temp_store = MEMORY")
             sql.rawExecSQL("PRAGMA foreign_keys = ON")
             val db = Db(sql)
             Schema.migrate(db, sql)
             return db
+        }
+
+        /**
+         * The SQLCipher raw-key literal `x'<64 hex>'`, built directly in a byte array so the key never exists as an
+         * immutable String. The caller wipes it.
+         */
+        fun keyBlob(mk: ByteArray): ByteArray {
+            val raw = Hash.hmacSha256(mk, "gf/db-key/v1".utf8())
+            val out = ByteArray(3 + raw.size * 2)
+            out[0] = 'x'.code.toByte()
+            out[1] = '\''.code.toByte()
+            val digits = "0123456789abcdef"
+            for (i in raw.indices) {
+                val v = raw[i].toInt() and 0xff
+                out[2 + 2 * i] = digits[v ushr 4].code.toByte()
+                out[3 + 2 * i] = digits[v and 0xf].code.toByte()
+            }
+            out[out.size - 1] = '\''.code.toByte()
+            raw.wipe()
+            return out
         }
 
         /** Deletes the DB file and its journals. */
@@ -139,7 +161,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    private const val VERSION = 2
+    private const val VERSION = 3
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -157,9 +179,24 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 3) {
+                for (s in V3) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Time-bucketed message keys, and invite-to-prekey binding. */
+    private val V3 = listOf(
+        // The expiry bucket whose key wraps this message key (null = wrapped by the message root key).
+        "ALTER TABLE message_keys ADD COLUMN bucket INTEGER",
+        // The signed and Kyber prekey ids published in this mailbox's invite. A first PreKey hello is only accepted on the
+        // mailbox whose invite issued exactly those ids.
+        "ALTER TABLE mailboxes ADD COLUMN invite_spk_id INTEGER",
+        "ALTER TABLE mailboxes ADD COLUMN invite_kyber_id INTEGER",
+    )
 
     /** Identity-change review, hidden chats and mailbox rotation. */
     private val V2 = listOf(

@@ -35,6 +35,13 @@ import app.goldfishsend.ui.screens.PassphraseScreen
 import app.goldfishsend.ui.screens.UnlockingSplash
 import app.goldfishsend.ui.screens.acceptInvite
 import kotlinx.coroutines.flow.MutableStateFlow
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import app.goldfishsend.proto.InviteLink
+import app.goldfishsend.ui.components.blockWhenObscured
 
 private enum class RootState { ONBOARDING, LOCKED, UNLOCKING, READY }
 
@@ -68,12 +75,37 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
     val nav = rememberNavController()
     val snackbar = remember { SnackbarHostState() }
     val link by pendingLink.collectAsState()
+    var confirmLink by remember { mutableStateOf<String?>(null) }
+    var accepting by remember { mutableStateOf<String?>(null) }
+    // An opened link only proposes a contact. Nothing is fetched or sent until the user accepts.
     LaunchedEffect(link) {
         val raw = link ?: return@LaunchedEffect
         pendingLink.value = null
+        confirmLink = raw
+    }
+    LaunchedEffect(accepting) {
+        val raw = accepting ?: return@LaunchedEffect
+        accepting = null
         acceptInvite(s, raw, viaQr = false)
             .onSuccess { id -> nav.navigate("chat/$id") { popUpTo("home") } }
             .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't add that contact.") }
+    }
+    confirmLink?.let { raw ->
+        val host = InviteLink.parse(raw)?.server?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: "an unknown server"
+        AlertDialog(
+            onDismissRequest = { confirmLink = null },
+            title = { Text("Add a contact from a link?") },
+            text = {
+                Text(
+                    "Someone shared an invite on $host. If you accept, they'll be able to message you and will see your name. " +
+                        "They'll be unverified until you compare safety numbers. Only accept links from people you know.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { accepting = raw; confirmLink = null }, modifier = Modifier.blockWhenObscured()) { Text("Accept") }
+            },
+            dismissButton = { TextButton(onClick = { confirmLink = null }) { Text("Decline") } },
+        )
     }
     Box(Modifier.fillMaxSize()) {
         NavHost(

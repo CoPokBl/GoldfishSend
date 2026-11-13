@@ -2,6 +2,7 @@ package app.goldfishsend.core
 
 import app.goldfishsend.security.MemoryScrubber
 import android.app.Application
+import app.goldfishsend.crypto.BucketKeys
 import app.goldfishsend.crypto.KeyVault
 import app.goldfishsend.crypto.MessageVault
 import app.goldfishsend.crypto.SignalStore
@@ -118,7 +119,7 @@ object Graph {
             bootstrapRepo.kvPut("inbox_priv", kp.privateKey.serialize())
             prefs.inboxPublicKey = B64.enc(kp.publicKey.serialize())
         }
-        val s = Session(db, mk, MessageVault(mrk))
+        val s = Session(db, mk, MessageVault(mrk, BucketKeys.DbStore(db)))
         if (shredded) {
             for (c in s.repo.contacts()) {
                 s.repo.insertMessage(
@@ -127,7 +128,6 @@ object Graph {
                 )
             }
         }
-        prefs.lastUnlockAt = System.currentTimeMillis()
         _session.value = s
         s
     }

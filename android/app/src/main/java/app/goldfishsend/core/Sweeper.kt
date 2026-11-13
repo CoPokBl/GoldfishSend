@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import app.goldfishsend.crypto.BucketKeys
 import app.goldfishsend.work.ExpiryReceiver
 
 /**
@@ -13,11 +14,28 @@ import app.goldfishsend.work.ExpiryReceiver
  */
 object Sweeper {
     fun sweep(s: Session) {
-        val n = s.repo.deleteExpired(System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        val n = s.repo.deleteExpired(now)
+        BucketKeys.shredExpired(now)
+        (s.messages.bucketStore as? BucketKeys.DbStore)?.pruneRows(now)
         if (n > 0) {
             s.db.notifyChanged()
+            // Expired messages may still have a notification showing their text.
+            Notifier.cancel(Graph.app)
         }
         schedule(s)
+    }
+
+    /**
+     * Locked: the DB is closed, but finished expiry buckets can still be destroyed through the Keystore. Re-arms the alarm
+     * for the next bucket end.
+     */
+    fun sweepLocked() {
+        val now = System.currentTimeMillis()
+        if (BucketKeys.shredExpired(now) > 0) {
+            Notifier.cancel(Graph.app)
+        }
+        arm(BucketKeys.nextBucketEnd())
     }
 
     fun schedule(s: Session) {
@@ -27,7 +45,16 @@ object Sweeper {
             ctx, 1, Intent(ctx, ExpiryReceiver::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val next = s.repo.nextExpiry()
+        arm(s.repo.nextExpiry())
+    }
+
+    private fun arm(next: Long?) {
+        val ctx = Graph.app
+        val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            ctx, 1, Intent(ctx, ExpiryReceiver::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         if (next == null) {
             am.cancel(pi)
             return

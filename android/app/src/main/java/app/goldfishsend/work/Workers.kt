@@ -43,6 +43,7 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         if (!Graph.prefs.onboarded) {
             return Result.success()
         }
+        runCatching { Sweeper.sweepLocked() }
         val s = Graph.session.value ?: Graph.tryAutoUnlock() ?: return Result.success()
         runCatching { Sweeper.sweep(s) }
         runCatching { Mailboxes.cleanup(s) }
@@ -50,6 +51,7 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         runCatching { Mailboxes.ensurePool(s) }
         runCatching { Mailboxes.rotateContacts(s) }
         runCatching { Messenger.resendUnreceipted(s) }
+        runCatching { s.repo.vacuumIfNeeded() }
         return Result.success()
     }
 
@@ -70,6 +72,8 @@ class ExpiryReceiver : BroadcastReceiver() {
                 val s = Graph.session.value ?: Graph.tryAutoUnlock()
                 if (s != null) {
                     Sweeper.sweep(s)
+                } else {
+                    Sweeper.sweepLocked()
                 }
             } finally {
                 pending.finish()
