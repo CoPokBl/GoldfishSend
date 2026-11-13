@@ -15,3 +15,7 @@
 -dontwarn com.google.errorprone.annotations.**
 -dontwarn javax.annotation.**
 -dontwarn org.bouncycastle.**
+# Built-in Tor (tor-android): JNI entry points and the control-port library must keep their names.
+-keep class org.torproject.jni.** { *; }
+-keep class net.freehaven.tor.control.** { *; }
+-dontwarn net.freehaven.tor.control.**

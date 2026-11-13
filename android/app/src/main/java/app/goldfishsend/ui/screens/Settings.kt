@@ -102,6 +102,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     var editName by remember { mutableStateOf(false) }
     var editServer by remember { mutableStateOf(false) }
     var pushPicker by remember { mutableStateOf(false) }
+    var networkSettings by remember { mutableStateOf(false) }
     var duress by remember { mutableStateOf(false) }
     var confirmWipeMessages by remember { mutableStateOf(false) }
     var confirmPanic by remember { mutableStateOf(false) }
@@ -242,15 +243,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     Icons.Rounded.NotificationsActive,
                     onClick = { pushPicker = true },
                 )
-                SwitchRow(
-                    "Route through Tor (Orbot)",
-                    "Hides your IP address from the server. Requires Orbot to be running.",
-                    Icons.Rounded.VpnLock,
-                    p.socksProxy,
-                ) {
-                    p.socksProxy = it
-                    Graph.resetHttp()
-                }
+                SettingRow("Connection", connectionSummary(), Icons.Rounded.VpnLock, onClick = { networkSettings = true })
                 SettingRow("Server", p.serverUrl, Icons.Rounded.Dns, onClick = { editServer = true })
             }
             item {
@@ -271,6 +264,9 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
         }
     }
 
+    if (networkSettings) {
+        NetworkSettingsDialog { networkSettings = false }
+    }
     when (picker) {
         Picker.NOTIF -> ChoiceDialog(
             "Notification content",

@@ -66,10 +66,12 @@ object Graph {
     }
 
     fun httpClient(): OkHttpClient = http ?: synchronized(this) {
-        http ?: ServerApi.buildClient(prefs.socksProxy).also { http = it }
+        http ?: ServerApi.buildClient().also { http = it }
     }
 
+    /** Drops pooled connections (for example after switching to or from Tor) so none are reused on the old route. */
     fun resetHttp() {
+        http?.let { runCatching { it.connectionPool.evictAll() } }
         http = null
     }
 

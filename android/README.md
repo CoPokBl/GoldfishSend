@@ -33,7 +33,7 @@ There's a single `:app` module, so the build stays simple and fast. It has no DI
 | `proto` | Pure Kotlin wire formats: base64url, padding, PoW, mailbox tag/owner hash, push envelope, E2E blob, Content JSON, chunking, invite link/blob. JVM-tested. |
 | `crypto` | `KeyVault` (Keystore and Argon2 key hierarchy), `MessageVault` (per-message keys), `SignalStore` (libsignal stores on SQLCipher) |
 | `db` | `Db` (SQLCipher wrapper, schema) and `Repo` (typed queries; every message body goes through `MessageVault`) |
-| `net` | `ServerApi` (OkHttp, TLS 1.2+ restricted ciphers, no redirects, optional Orbot SOCKS), plus friendly error mapping |
+| `net` | `ServerApi` (OkHttp, TLS 1.2+ restricted ciphers, no redirects) with friendly error mapping. `NetStack`: per-request routing (direct, built-in Tor or Orbot, fail closed) and TOFU key pinning. `TorManager` (in-process tor-android). `NetRules`/`PinPolicy` are pure rules, JVM-tested. |
 | `push` | UnifiedPush connector 3.x (`GfPushService`, `PushHub`), registered with the server's VAPID key |
 | `core` | `Graph` (service locator and unlocked `Session`), `Mailboxes`, `Invites`, `Messenger` (receive/send), `Outbox`, `Sweeper`, `LockedInbox`, `Notifier`, `Prefs` |
 | `security` | `AppLock`, `Wiper`, `SecurityAudit`, `ClipboardGuard` |
@@ -78,6 +78,26 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 - Notifications reveal nothing by default (`VISIBILITY_SECRET`).
 - No backups or device transfer.
 
+**Network** (Settings › Connection, also reachable from onboarding's Advanced section)
+- **Connection mode**: Direct (default), **Built-in Tor**, or **Orbot**. Built-in Tor embeds the Guardian Project's
+  `tor-android` and runs it in-process as a bound, non-exported service, with no extra permissions. Its torrc adds
+  `SafeSocks`, `ClientOnly` and `AvoidDiskWrites`. With Tor or Orbot selected, every request to a GoldfishSend server
+  goes over SOCKS with remote DNS. Requests **fail closed**: they wait up to 45 s for built-in Tor to connect, then fail
+  and are retried later, and never fall back to a direct connection. The UI shows "Connecting to Tor…".
+- **Onion servers**: `http://<v3>.onion` server URLs are accepted (the v3 address and its checksum are validated).
+  Plain http is allowed only to onion hosts (network security config plus the route check), and only through Tor or
+  Orbot. If a contact's server is an onion and Tor is off, the user is asked to turn Tor on. Nothing is sent directly.
+- **Pin server keys** (off by default, because servers legitimately rotate keys): trust on first use of the SHA-256
+  SPKI of each server's leaf certificate, checked in an OkHttp network interceptor before any request bytes are
+  written. A change fails closed and shows "This server's identity changed", with the old and new fingerprints and
+  **Keep blocked** or **Trust new key** (confirmed a second time). It never auto-accepts. Onion servers are skipped,
+  because the onion address is the key. Fingerprints are shown in Connection settings for comparison with the
+  operator's (see server/README.md).
+- Tor covers connections to GoldfishSend servers only. **Push delivery still goes through your UnifiedPush
+  distributor** (ntfy etc.), which sees delivery timing but never content.
+- A panic wipe deletes the network settings, pins and Tor's state directory, **after** the best-effort mailbox
+  deletions have been sent over the same route (so a Tor user's last requests don't go out directly).
+
 **Security tab**: an on-device audit covering patch age, Android end of life, a Google/FCM push distributor, screen lock, encryption, ADB and developer options, root or bootloader state, accessibility services, the keyboard (closed-source keyboards such as Gboard or SwiftKey are a warning and known cloud keyboards such as Sogou, Baidu or Grammarly are critical; known open-source keyboards and anything installed by an F-Droid client are trusted, see `security/KeyboardTrust.kt`), StrongBox, the auto-lock delay (screen timeout plus lock delay: info over 2 min, warning over 5 min or "never"), apps with notification access (a warning if previews are on), Private DNS (a zero-penalty note, since Tailscale MagicDNS and similar setups are good reasons to leave it off; skipped when a VPN handles DNS), and app settings. Each item has a one-tap **Fix** where possible.
 
 Findings can be **dismissed** if there's a legitimate reason to leave them as they are, for example root, an unlocked bootloader, accessibility services, USB debugging, a Google push service or a closed-source keyboard a language needs. Dismissed findings stop counting toward the score, and a Restore option keeps them visible. They come back if the situation changes. Findings with no safe justification can't be dismissed: no screen lock, a non-HTTPS server, unencrypted storage, push not working, a cloud keyboard, patches over 180 days old, and an unsupported Android version (`security/AuditRules.kt`).
@@ -86,7 +106,11 @@ The audit adds **no extra permissions**. Checks that would need one, such as lis
 
 ## Known gaps / TODO
 - **No group chats or attachments.** Multi-device isn't supported either.
-- **No certificate pinning yet.** The server connection relies on system trust anchors and `RESTRICTED_TLS`.
+- **Key pinning is opt-in and trust-on-first-use.** A first connection that's already intercepted gets pinned.
+  Compare the fingerprint with the operator's.
+- **Built-in Tor adds about 8 MB per ABI** (`libtor.so`) to the APK, and isn't yet exercised on a device by the tests.
+- **Requests over Tor can be linked by the server**, just like requests from one IP: connections are reused across a
+  device's mailboxes on the same server.
 - **Changing server needs an empty contact list.** Mailboxes don't record which server they live on, so you must remove your contacts before switching.
 - **Locked inbox needs one unlock first.** The inbox key pair is created on first unlock, so a push that arrives before the app has ever been unlocked is dropped.
 - **Key material can't always be wiped from memory.** Text you type in fields passes through `EditText` and `String`, which the JVM can't reliably zero. Raw key arrays are zeroed.

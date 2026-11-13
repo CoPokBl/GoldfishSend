@@ -25,6 +25,8 @@ class GoldfishApp : Application() {
         // Order matters: the restart and inactivity wipes must run before anything can open the DB.
         Wiper.checkBoot(this, fromBootBroadcast = false)
         Wiper.checkInactivity(this)
+        // Starts built-in Tor if the user turned it on (off by default).
+        app.goldfishsend.net.NetStack.apply(this)
 
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {

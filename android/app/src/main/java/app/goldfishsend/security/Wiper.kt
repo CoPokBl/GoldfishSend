@@ -6,6 +6,8 @@ import androidx.work.WorkManager
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.LockedInbox
 import app.goldfishsend.core.Mailboxes
+import app.goldfishsend.core.NetPrefs
+import app.goldfishsend.net.TorManager
 import app.goldfishsend.core.Notifier
 import app.goldfishsend.db.Db
 import app.goldfishsend.push.PushHub
@@ -67,18 +69,32 @@ object Wiper {
         PushHub.unregister(ctx)
         Notifier.cancelAll(ctx)
         runCatching { WorkManager.getInstance(ctx).cancelAllWork() }
+        // Store the connection mode explicitly, so the best-effort deletes below still go through Tor or Orbot
+        // after the main preferences (which hold the legacy Orbot flag) are cleared. Network state goes last.
+        NetPrefs.proxyMode = NetPrefs.proxyMode
         Graph.prefs.clear()
+        val wipeNetwork = {
+            NetPrefs.clear()
+            TorManager.deleteState(ctx)
+            Graph.resetHttp()
+        }
         if (remote.isNotEmpty()) {
             GlobalScope.launch {
-                withTimeoutOrNull(15_000) {
-                    runCatching {
-                        val api = Graph.api(server)
-                        for (batch in remote.chunked(100)) {
-                            api.delete(batch)
+                try {
+                    withTimeoutOrNull(15_000) {
+                        runCatching {
+                            val api = Graph.api(server)
+                            for (batch in remote.chunked(100)) {
+                                api.delete(batch)
+                            }
                         }
                     }
+                } finally {
+                    wipeNetwork()
                 }
             }
+        } else {
+            wipeNetwork()
         }
     }
 }

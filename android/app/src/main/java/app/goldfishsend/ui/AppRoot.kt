@@ -59,6 +59,8 @@ fun AppRoot(pendingLink: MutableStateFlow<String?>) {
             RootState.READY -> session?.let { MainNav(it, pendingLink) }
         }
     }
+    // A pinned server presented a different key: ask the user, whatever screen is showing.
+    app.goldfishsend.ui.screens.PinMismatchDialog()
 }
 
 @Composable
