@@ -51,8 +51,10 @@ class GoldfishApp : Application() {
         )
 
         if (Graph.prefs.onboarded) {
+            // Older installs: make sure the duress and hidden-chat slots hold decoy data, so their presence can't be told.
+            runCatching { Graph.vault.ensureDecoySlots() }
             MaintenanceWorker.schedule(this)
-            if (!Graph.vault.hasPassphrase) {
+            if (!Graph.vault.requiresUserUnlock) {
                 Graph.scope.launchSafe {
                     Graph.tryAutoUnlock()?.let { AppLock.afterUnlock(it) }
                 }

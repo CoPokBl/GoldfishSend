@@ -1,6 +1,9 @@
 package app.goldfishsend.ui.screens
 
+import androidx.activity.compose.LocalActivity
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -8,6 +11,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.Button
@@ -16,9 +23,10 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -26,99 +34,251 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.fragment.app.FragmentActivity
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Session
+import app.goldfishsend.crypto.UnlockMethod
 import app.goldfishsend.ui.components.ConfirmDialog
 import app.goldfishsend.ui.components.FieldKind
+import app.goldfishsend.ui.components.PinBuffer
+import app.goldfishsend.ui.components.PinPad
 import app.goldfishsend.ui.components.SecureTextField
+import app.goldfishsend.ui.components.promptScreenLock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Set, change or remove the app passphrase. MK never changes: only its wrapping does. */
+private enum class Choice { NONE, SCREEN_LOCK, PIN, PASSPHRASE }
+
+private enum class Step { CHOOSE, PIN_NEW, PIN_CONFIRM, PASSPHRASE }
+
+/**
+ * Chooses how GoldfishSend is unlocked. MK never changes, only how it's wrapped:
+ * - No app lock: opens whenever the phone is unlocked.
+ * - Phone screen lock: the system prompt (PIN, pattern, password, fingerprint). The OS handles it, so we never see it.
+ * - App PIN: typed on GoldfishSend's own keypad, so the keyboard app never sees it. Supports the duress PIN and erasing.
+ * - Passphrase (advanced): alphanumeric, typed with the system keyboard.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PassphraseScreen(s: Session, back: () -> Unit) {
+    val activity = LocalActivity.current as FragmentActivity
     val scope = rememberCoroutineScope()
-    val has = Graph.vault.hasPassphrase
+    val vault = Graph.vault
+    val current = when (vault.unlockMethod) {
+        UnlockMethod.NONE -> Choice.NONE
+        UnlockMethod.SCREEN_LOCK -> Choice.SCREEN_LOCK
+        UnlockMethod.APP_SECRET -> if (vault.secretIsPin) Choice.PIN else Choice.PASSPHRASE
+    }
+    val screenLockSupported = remember { vault.screenLockSupported() }
+    var step by remember { mutableStateOf(Step.CHOOSE) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var confirmNone by remember { mutableStateOf(false) }
+    var confirmScreenLock by remember { mutableStateOf(false) }
+    val pin = remember { PinBuffer() }
+    var firstPin by remember { mutableStateOf<CharArray?>(null) }
     var pass by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var confirmRemove by remember { mutableStateOf(false) }
 
-    fun save(newPass: CharArray?) {
+    fun saveSecret(secret: CharArray?, isPin: Boolean) {
         busy = true
         scope.launch {
             withContext(Dispatchers.Default) {
                 val mk = s.masterKeyCopy()
-                Graph.vault.changePassphrase(mk, newPass)
+                vault.changePassphrase(mk, secret, isPin)
                 mk.fill(0)
-                newPass?.fill('\u0000')
+                secret?.fill('\u0000')
             }
-            if (newPass == null) {
+            if (secret == null) {
                 Graph.prefs.biometricUnlock = false
             }
             back()
         }
     }
 
+    fun enableScreenLock() {
+        val cipher = runCatching { vault.screenLockEncryptCipher() }.getOrElse {
+            error = "Your phone's screen lock couldn't be used. Make sure a PIN, pattern or password is set."
+            return
+        }
+        promptScreenLock(activity, "Confirm your screen lock", cipher, onSuccess = { c ->
+            val mk = s.masterKeyCopy()
+            vault.enableScreenLock(mk, c)
+            mk.fill(0)
+            Graph.prefs.biometricUnlock = false
+            back()
+        }, onError = { msg -> if (msg != null) error = msg })
+    }
+
+    fun pick(choice: Choice) {
+        error = null
+        when (choice) {
+            Choice.NONE -> if (current != Choice.NONE) confirmNone = true
+            Choice.SCREEN_LOCK -> if (current != Choice.SCREEN_LOCK) confirmScreenLock = true
+            Choice.PIN -> step = Step.PIN_NEW
+            Choice.PASSPHRASE -> step = Step.PASSPHRASE
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (has) "Change passphrase" else "Set a passphrase") },
-                navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                title = { Text("Unlock method") },
+                navigationIcon = {
+                    IconButton(onClick = {
+                        if (step == Step.CHOOSE) back() else {
+                            firstPin?.fill('\u0000')
+                            firstPin = null
+                            pin.clear()
+                            step = Step.CHOOSE
+                        }
+                    }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") }
+                },
             )
         },
     ) { pad ->
         Column(
-            Modifier
-                .padding(pad)
-                .fillMaxSize()
-                .imePadding()
-                .padding(24.dp),
+            Modifier.padding(pad).fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text(
-                "Your passphrase is stretched with Argon2 and combined with a key locked inside your phone's secure hardware. " +
-                    "Without it, your chats can't be decrypted, even by someone who copies the app's data.",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(20.dp))
-            SecureTextField(pass, { pass = it }, Modifier.fillMaxWidth(), hint = "New passphrase", kind = FieldKind.PASSWORD)
-            Spacer(Modifier.height(10.dp))
-            SecureTextField(confirm, { confirm = it }, Modifier.fillMaxWidth(), hint = "Confirm passphrase", kind = FieldKind.PASSWORD)
-            Spacer(Modifier.height(6.dp))
-            Text(
-                when {
-                    confirm.isNotEmpty() && confirm != pass -> "Passphrases don't match"
-                    pass.isNotEmpty() && pass.length < 6 -> "Use at least 6 characters. Longer is stronger."
-                    else -> " "
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-            Spacer(Modifier.height(16.dp))
-            Button(
-                enabled = !busy && pass.length >= 6 && pass == confirm,
-                onClick = { save(pass.toCharArray().also { pass = ""; confirm = "" }) },
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-            ) {
-                if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text("Save")
-            }
-            if (has) {
-                Spacer(Modifier.height(8.dp))
-                TextButton(onClick = { confirmRemove = true }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Remove passphrase", color = MaterialTheme.colorScheme.error)
+            when (step) {
+                Step.CHOOSE -> {
+                    Option(
+                        "No app lock", "GoldfishSend opens whenever your phone is unlocked.",
+                        current == Choice.NONE,
+                    ) { pick(Choice.NONE) }
+                    Option(
+                        "Phone screen lock",
+                        if (screenLockSupported) {
+                            "Use your phone's PIN, pattern, password or fingerprint. Your phone handles it, and GoldfishSend never sees it. " +
+                                "Erasing after failed attempts and the duress PIN aren't available with this method."
+                        } else {
+                            "Needs Android 11 or newer and a screen lock set on your phone."
+                        },
+                        current == Choice.SCREEN_LOCK, enabled = screenLockSupported,
+                    ) { pick(Choice.SCREEN_LOCK) }
+                    Option(
+                        "App PIN",
+                        "Typed on GoldfishSend's own keypad, so your keyboard app never sees it. It also protects your data with " +
+                            "its own key, and supports the duress PIN and erasing after failed attempts.",
+                        current == Choice.PIN,
+                    ) { pick(Choice.PIN) }
+                    Option(
+                        "Passphrase (advanced)",
+                        "Letters and numbers, typed with your keyboard app. That's stronger than a PIN, but your keyboard sees what you type.",
+                        current == Choice.PASSPHRASE,
+                    ) { pick(Choice.PASSPHRASE) }
+                    error?.let {
+                        Spacer(Modifier.height(12.dp))
+                        Text(it, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                Step.PIN_NEW, Step.PIN_CONFIRM -> {
+                    Text(
+                        if (step == Step.PIN_NEW) "Choose a PIN of at least 6 digits" else "Enter the same PIN again",
+                        style = MaterialTheme.typography.titleMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(error ?: "Longer is stronger.", color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(20.dp))
+                    PinPad(pin, scrambled = Graph.prefs.scramblePinPad, enabled = !busy, onSubmit = {
+                        if (step == Step.PIN_NEW) {
+                            firstPin = pin.take()
+                            error = null
+                            step = Step.PIN_CONFIRM
+                        } else {
+                            val second = pin.take()
+                            val first = firstPin
+                            if (first != null && first.contentEquals(second)) {
+                                first.fill('\u0000')
+                                firstPin = null
+                                saveSecret(second, isPin = true)
+                            } else {
+                                second.fill('\u0000')
+                                first?.fill('\u0000')
+                                firstPin = null
+                                error = "The PINs didn't match. Try again."
+                                step = Step.PIN_NEW
+                            }
+                        }
+                    })
+                    if (busy) {
+                        Spacer(Modifier.height(16.dp))
+                        CircularProgressIndicator()
+                    }
+                }
+                Step.PASSPHRASE -> {
+                    Text(
+                        "Your passphrase is stretched with Argon2 and combined with a key locked inside your phone's secure hardware.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(20.dp))
+                    SecureTextField(pass, { pass = it }, Modifier.fillMaxWidth(), hint = "New passphrase", kind = FieldKind.PASSWORD)
+                    Spacer(Modifier.height(10.dp))
+                    SecureTextField(confirm, { confirm = it }, Modifier.fillMaxWidth(), hint = "Confirm passphrase", kind = FieldKind.PASSWORD)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        when {
+                            confirm.isNotEmpty() && confirm != pass -> "Passphrases don't match"
+                            pass.isNotEmpty() && pass.length < 8 -> "Use at least 8 characters. Longer is stronger."
+                            else -> " "
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Button(
+                        enabled = !busy && pass.length >= 8 && pass == confirm,
+                        onClick = { saveSecret(pass.toCharArray().also { pass = ""; confirm = "" }, isPin = false) },
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                    ) {
+                        if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text("Save")
+                    }
                 }
             }
         }
     }
-    if (confirmRemove) {
+    if (confirmNone) {
         ConfirmDialog(
-            "Remove passphrase?",
+            "Turn off app lock?",
             "Anyone who can unlock your phone will be able to open GoldfishSend. Fingerprint unlock and the duress PIN are turned off too.",
-            "Remove", true, { confirmRemove = false },
-        ) { save(null) }
+            "Turn off", true, { confirmNone = false },
+        ) { saveSecret(null, isPin = false) }
+    }
+    if (confirmScreenLock) {
+        ConfirmDialog(
+            "Use your phone's screen lock?",
+            "GoldfishSend's data will be locked to your phone's screen lock. If you ever remove or reset your phone's screen lock, " +
+                "your chats can't be recovered. The duress PIN and fingerprint shortcut are turned off.",
+            "Continue", false, { confirmScreenLock = false },
+        ) { enableScreenLock() }
+    }
+}
+
+@Composable
+private fun Option(title: String, detail: String, selected: Boolean, enabled: Boolean = true, onClick: () -> Unit) {
+    Surface(
+        color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = MaterialTheme.shapes.large,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)
+            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick),
+    ) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.Start) {
+            RadioButton(selected = selected, onClick = null, enabled = enabled)
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text(title, style = MaterialTheme.typography.titleSmall,
+                    color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(2.dp))
+                Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }

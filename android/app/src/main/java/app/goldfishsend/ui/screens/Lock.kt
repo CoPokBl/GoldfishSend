@@ -45,6 +45,10 @@ import app.goldfishsend.ui.components.FieldKind
 import app.goldfishsend.ui.components.SecureTextField
 import app.goldfishsend.ui.components.biometricAvailable
 import app.goldfishsend.ui.components.promptBiometric
+import app.goldfishsend.ui.components.promptScreenLock
+import app.goldfishsend.ui.components.PinBuffer
+import app.goldfishsend.ui.components.PinPad
+import app.goldfishsend.ui.components.ConfirmDialog
 import android.view.inputmethod.EditorInfo
 import kotlinx.coroutines.launch
 import androidx.activity.compose.LocalActivity
@@ -56,7 +60,34 @@ fun LockScreen() {
     var pass by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    val bioEnabled = Graph.prefs.biometricUnlock && Graph.vault.hasBiometric && biometricAvailable(activity)
+    val vault = Graph.vault
+    val screenLock = vault.hasScreenLock
+    val pinMode = !screenLock && vault.secretIsPin
+    val pin = remember { PinBuffer() }
+    var keyLost by remember { mutableStateOf(false) }
+    var confirmReset by remember { mutableStateOf(false) }
+    val bioEnabled = !screenLock && Graph.prefs.biometricUnlock && vault.hasBiometric && biometricAvailable(activity)
+
+    fun tryScreenLock() {
+        val cipher = try {
+            vault.screenLockDecryptCipher()
+        } catch (e: Exception) {
+            error = "Your phone's secure storage isn't available right now. Try again in a moment."
+            return
+        } ?: run {
+            keyLost = true
+            return
+        }
+        promptScreenLock(activity, "Unlock GoldfishSend", cipher, onSuccess = { c ->
+            val mk = vault.unwrapWithScreenLock(c)
+            if (mk != null) {
+                busy = true
+                scope.launch { AppLock.unlockWithMasterKey(mk) }
+            } else {
+                error = "Couldn't unlock. Try again."
+            }
+        }, onError = { msg -> if (msg != null) error = msg })
+    }
 
     fun tryBiometric() {
         val cipher = Graph.vault.biometricDecryptCipher() ?: run {
@@ -73,21 +104,22 @@ fun LockScreen() {
     }
 
     fun submit() {
-        if (pass.isEmpty() || busy) {
+        if ((if (pinMode) pin.length == 0 else pass.isEmpty()) || busy) {
             return
         }
         busy = true
         error = null
-        val chars = pass.toCharArray()
+        val chars = if (pinMode) pin.take() else pass.toCharArray()
         pass = ""
         scope.launch {
             when (val r = AppLock.unlock(chars)) {
                 UnlockResult.Ok, UnlockResult.Wiped -> Unit
                 is UnlockResult.Wrong -> {
+                    val what = if (pinMode) "PIN" else "passphrase"
                     error = if (r.attemptsLeft != null && r.attemptsLeft <= 3) {
-                        "Wrong passphrase. ${r.attemptsLeft} attempt${if (r.attemptsLeft == 1) "" else "s"} left before everything is erased."
+                        "Wrong $what. ${r.attemptsLeft} attempt${if (r.attemptsLeft == 1) "" else "s"} left before everything is erased."
                     } else {
-                        "Wrong passphrase"
+                        "Wrong $what"
                     }
                     busy = false
                 }
@@ -100,8 +132,9 @@ fun LockScreen() {
     }
 
     LaunchedEffect(Unit) {
-        if (bioEnabled) {
-            tryBiometric()
+        when {
+            screenLock -> tryScreenLock()
+            bioEnabled -> tryBiometric()
         }
     }
 
@@ -124,6 +157,36 @@ fun LockScreen() {
             Spacer(Modifier.height(24.dp))
             Text("GoldfishSend is locked", style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.height(24.dp))
+            if (screenLock) {
+                Text(
+                    if (keyLost) {
+                        "Your phone's screen lock was removed or reset, so the key protecting GoldfishSend no longer exists. Your chats can't be recovered."
+                    } else {
+                        "Use your phone's screen lock to open GoldfishSend."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(error ?: "", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(16.dp))
+                if (keyLost) {
+                    Button(onClick = { confirmReset = true }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Start over") }
+                } else {
+                    Button(onClick = ::tryScreenLock, enabled = !busy, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        if (busy) {
+                            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                        } else {
+                            Text("Unlock")
+                        }
+                    }
+                }
+            } else if (pinMode) {
+                Text(error ?: "Enter your PIN", color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(16.dp))
+                // The duress PIN may be shorter than the real PIN, so the pad accepts anything 4 digits or longer.
+                PinPad(pin, onSubmit = ::submit, scrambled = Graph.prefs.scramblePinPad, minLength = 4, enabled = !busy)
+            } else {
             SecureTextField(
                 pass, { pass = it; error = null },
                 Modifier.fillMaxWidth(),
@@ -148,6 +211,7 @@ fun LockScreen() {
                     Text("Unlock")
                 }
             }
+            }
             if (bioEnabled) {
                 Spacer(Modifier.height(16.dp))
                 FilledTonalIconButton(onClick = ::tryBiometric, modifier = Modifier.size(56.dp)) {
@@ -155,6 +219,13 @@ fun LockScreen() {
                 }
             }
         }
+    }
+    if (confirmReset) {
+        ConfirmDialog(
+            "Start over?",
+            "Everything in GoldfishSend is erased and you'll set it up again. Your contacts will need to add you again.",
+            "Erase and start over", true, { confirmReset = false },
+        ) { app.goldfishsend.security.Wiper.wipeEverything(Graph.app) }
     }
 }
 

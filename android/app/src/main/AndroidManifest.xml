@@ -36,6 +36,28 @@
         android:theme="@style/Theme.GoldfishSend"
         tools:targetApi="36">
 
+        <!--
+          PanicKit responder: panic trigger apps (for example Ripple) can lock GoldfishSend, and, if the user approved that
+          app and chose it in Settings, erase it. Does nothing until a response is chosen.
+        -->
+        <activity
+            android:name=".security.PanicResponderActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="info.guardianproject.panic.action.TRIGGER" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="info.guardianproject.panic.action.CONNECT" />
+                <action android:name="info.guardianproject.panic.action.DISCONNECT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

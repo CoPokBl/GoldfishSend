@@ -1,5 +1,6 @@
 package app.goldfishsend.core
 
+import app.goldfishsend.security.MemoryScrubber
 import android.app.Application
 import app.goldfishsend.crypto.KeyVault
 import app.goldfishsend.crypto.MessageVault
@@ -32,6 +33,16 @@ class Session(val db: Db, private val mk: ByteArray, val messages: MessageVault)
 
     /** Serialises libsignal and DB mutations: libsignal stores aren't safe for concurrent ratchet updates. */
     val lock = Mutex()
+
+    /** Hidden chats are only listed after the hidden-chats PIN was entered in this session. Resets on lock. */
+    val hiddenRevealed = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /**
+     * Opened with the duress PIN in a non-erasing mode. Hidden chats can't be revealed, and hidden-chat and duress settings
+     * read as off.
+     */
+    @Volatile
+    var decoy = false
 
     fun masterKeyCopy(): ByteArray = mk.copyOf()
 
@@ -115,7 +126,6 @@ object Graph {
             }
         }
         prefs.lastUnlockAt = System.currentTimeMillis()
-        prefs.failedAttempts = 0
         _session.value = s
         s
     }
@@ -127,6 +137,9 @@ object Graph {
         val s = _session.value ?: return
         _session.value = null
         s.close()
+        if (prefs.wipeMemoryOnLock) {
+            MemoryScrubber.scrubAsync()
+        }
     }
 
     /**
@@ -135,7 +148,7 @@ object Graph {
      */
     suspend fun tryAutoUnlock(): Session? {
         _session.value?.let { return it }
-        if (!vault.isSetUp || vault.hasPassphrase) {
+        if (!vault.isSetUp || vault.requiresUserUnlock) {
             return null
         }
         val mk = vault.unlockWithoutPassphrase() ?: return null

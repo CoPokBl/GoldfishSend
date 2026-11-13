@@ -1,5 +1,12 @@
 package app.goldfishsend.ui.screens
 
+import androidx.compose.runtime.mutableStateOf
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.foundation.combinedClickable
+import app.goldfishsend.ui.components.PinEntryDialog
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -114,14 +121,31 @@ fun HomeScreen(
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
-    val chats by rememberQuery(s) { it.repo.chatSummaries(System.currentTimeMillis()) }
+    val allChats by rememberQuery(s) { it.repo.chatSummaries(System.currentTimeMillis()) }
+    val revealed by s.hiddenRevealed.collectAsState()
+    // Hidden chats stay out of the list until the hidden-chats PIN was entered in this session.
+    val chats = allChats?.filter { !it.contact.hidden || revealed }
+    var askHiddenPin by remember { mutableStateOf(false) }
     val busy by Mailboxes.busy.collectAsState()
     val prefsVersion by Graph.prefs.version.collectAsState()
     val pushOk = prefsVersion.let { Graph.prefs.pushStatus == "ok" }
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
-        topBar = { LargeTopAppBar(title = { Text("Chats") }, scrollBehavior = scroll) },
+        topBar = {
+            LargeTopAppBar(
+                // Long-pressing the title asks for the hidden-chats PIN. It always responds the same way, so it doesn't
+                // reveal whether hidden chats exist.
+                title = {
+                    Text(
+                        "Chats",
+                        Modifier.combinedClickable(onClick = {}, onLongClick = { askHiddenPin = true }, indication = null,
+                            interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }),
+                    )
+                },
+                scrollBehavior = scroll,
+            )
+        },
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = addContact,
@@ -135,6 +159,7 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
         Column(Modifier.padding(top = pad.calculateTopPadding()).fillMaxSize()) {
             StatusLine(!pushOk && Graph.prefs.onboarded, "Notifications aren't connected yet. Check your push app.", action = null)
             StatusLine(pushOk && busy && chats.isNullOrEmpty(), "Getting ready…")
+            StatusLine(revealed, "Showing hidden chats", action = "Hide") { s.hiddenRevealed.value = false }
             val list = chats
             if (list != null && list.isEmpty()) {
                 EmptyChats(addContact)
@@ -143,6 +168,22 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit) {
                     items(list.orEmpty(), key = { it.contact.id }) { c ->
                         ChatRow(c, Modifier.animateItem()) { openChat(c.contact.id) }
                     }
+                }
+            }
+        }
+    }
+    if (askHiddenPin) {
+        val scope = rememberCoroutineScope()
+        PinEntryDialog(
+            "Enter PIN", "", onDismiss = { askHiddenPin = false }, minLength = 4, confirm = false,
+        ) { pin ->
+            askHiddenPin = false
+            scope.launch(Dispatchers.Default) {
+                // Never revealed in a decoy session (opened with the duress PIN).
+                val ok = !s.decoy && Graph.vault.isHiddenPin(pin)
+                pin.fill('\u0000')
+                if (ok) {
+                    s.hiddenRevealed.value = true
                 }
             }
         }

@@ -384,6 +384,25 @@ signal_* (identity, prekeys, signed_prekeys, kyber_prekeys, sessions)
    consumer group, `SKIP LOCKED` leases, pub/sub wake-ups, shared GCRA limits and circuit breakers, and a maintenance lease).
    Rate-limit, PoW and breaker state lives in a separate **non-persistent** Redis, so no on-disk log records client activity.
 
+10. **Optional security features (2026-11-13).** Every one is a setting. Only those with no downside are on by default.
+    | Feature | Default |
+    |---|---|
+    | Unlock method: none / **phone screen lock** (system prompt; the app never sees the credential) / **app PIN on GoldfishSend's own keypad** (the keyboard app never sees it) / passphrase (advanced) | none |
+    | Scrambled keypad | off |
+    | Mailbox rotation: a fresh inbound mailbox per contact every N days, with the old one drained after the contact switches | **every 30 days** (invisible, no downside) |
+    | PanicKit responder: panic apps may lock; only the user-approved app may erase | off |
+    | Safety-number changes: verified contacts are always paused for review, and unverified ones are accepted with a notice (option: pause all) | pause verified |
+    | Hidden chats behind a separate PIN, and the duress PIN may open a decoy view (hidden chats kept hidden, or deleted) instead of erasing | off / erase |
+    | Clear app memory on lock | **on** (only cost is a brief CPU spike) |
+    | Trust-on-first-use server key pinning | off (servers legitimately rotate keys) |
+    | Built-in Tor and `.onion` servers | off |
+    The duress and hidden-chat slots always hold same-shaped data, so their presence can't be read from disk.
+11. **Deferred: two-relay routing.** The sender's own server would forward to the recipient's server, so the recipient's
+    server never sees the sender's IP (as in SimpleX private message routing). It fits the federated design, since the
+    sender's server is already known to the client. It needs a server-to-server forwarding endpoint with its own abuse
+    controls. It's not built yet.
+12. **Future: memory-hard PoW or Privacy Pass tokens** for mailbox creation (SHA-256 hashcash is cheap on GPUs).
+
 The exact wire format lives in `docs/protocol.md`.
 
 ---

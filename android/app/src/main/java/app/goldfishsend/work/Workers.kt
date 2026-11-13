@@ -48,6 +48,7 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         runCatching { Mailboxes.cleanup(s) }
         runCatching { Mailboxes.refreshAll(s) }
         runCatching { Mailboxes.ensurePool(s) }
+        runCatching { Mailboxes.rotateContacts(s) }
         runCatching { Messenger.resendUnreceipted(s) }
         return Result.success()
     }

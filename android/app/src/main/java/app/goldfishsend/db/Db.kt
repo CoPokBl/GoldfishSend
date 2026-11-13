@@ -139,7 +139,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    private const val VERSION = 1
+    private const val VERSION = 2
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -152,9 +152,32 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 2) {
+                for (s in V2) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Identity-change review, hidden chats and mailbox rotation. */
+    private val V2 = listOf(
+        // A changed identity key seen from this contact, waiting for the user to review it (null = none).
+        "ALTER TABLE contacts ADD COLUMN pending_identity BLOB",
+        "ALTER TABLE contacts ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+        // Rotation: when a mailbox was superseded, and when it may finally be deleted (after the contact has switched).
+        "ALTER TABLE mailboxes ADD COLUMN replaced_at INTEGER",
+        "ALTER TABLE mailboxes ADD COLUMN drain_until INTEGER",
+        // Raw E2E blobs that arrived with an untrusted (changed) identity key. Processed after the user accepts the change.
+        """CREATE TABLE held_incoming (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            tag BLOB NOT NULL,
+            blob BLOB NOT NULL,
+            received_at INTEGER NOT NULL
+        )""",
+    )
 
     private val V1 = listOf(
         "CREATE TABLE kv (k TEXT PRIMARY KEY, v BLOB)",

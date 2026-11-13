@@ -47,7 +47,7 @@ fun AppRoot(pendingLink: MutableStateFlow<String?>) {
         when {
             !Graph.prefs.onboarded -> RootState.ONBOARDING
             session != null -> RootState.READY
-            Graph.vault.hasPassphrase -> RootState.LOCKED
+            Graph.vault.requiresUserUnlock -> RootState.LOCKED
             else -> RootState.UNLOCKING
         }
     }

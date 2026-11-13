@@ -13,6 +13,10 @@ enum class NotificationContent { NONE, NAME, NAME_AND_MESSAGE }
  * Non-secret app configuration, readable while the app is locked (lock settings, theme, wipe triggers).
  * Secrets never go here. They live in the encrypted DB or the Keystore-wrapped vault.
  */
+enum class PanicResponse { OFF, LOCK, WIPE_MESSAGES, WIPE_EVERYTHING }
+
+enum class DuressAction { WIPE_ALL, HIDE_HIDDEN_CHATS, DELETE_HIDDEN_CHATS }
+
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("gf_prefs", Context.MODE_PRIVATE)
     private val _version = MutableStateFlow(0L)
@@ -91,9 +95,13 @@ class Prefs(context: Context) {
         get() = int("max_failed", 10)
         set(v) = setInt("max_failed", v)
 
+    /** Written synchronously (commit), so a crash or kill mid-attempt can't hand out a free guess. */
     var failedAttempts: Int
         get() = int("failed", 0)
-        set(v) = setInt("failed", v)
+        set(v) {
+            sp.edit().putInt("failed", v).commit()
+            changed()
+        }
 
     var wipeOnReboot: Boolean
         get() = bool("wipe_on_reboot", false)
@@ -147,6 +155,54 @@ class Prefs(context: Context) {
     var pushHost: String?
         get() = str("push_host")
         set(v) = setStr("push_host", v)
+
+    // --- Security features (each one optional, see PLAN.md §11.10) ---
+
+    /** Shuffle the in-app PIN keypad's digits each time it's shown. Off by default because it slows entry. */
+    var scramblePinPad: Boolean
+        get() = bool("scramble_pin", false)
+        set(v) = setBool("scramble_pin", v)
+
+    /**
+     * Move each contact to a fresh inbound mailbox every N days (0 = never). This limits how long the server can link
+     * traffic to one mailbox. On by default: it's invisible, and the old mailbox stays alive until the contact has switched.
+     */
+    var mailboxRotationDays: Int
+        get() = int("mbx_rotation_days", 30)
+        set(v) = setInt("mbx_rotation_days", v)
+
+    /** What a PanicKit trigger app may do. OFF by default: no app can act on GoldfishSend until the user connects one. */
+    var panicResponse: PanicResponse
+        get() = runCatching { PanicResponse.valueOf(str("panic_response") ?: "") }.getOrDefault(PanicResponse.OFF)
+        set(v) = setStr("panic_response", v.name)
+
+    /** Package of the panic trigger app the user approved. Destructive responses only come from this app. */
+    var panicTrigger: String?
+        get() = str("panic_trigger")
+        set(v) = setStr("panic_trigger", v)
+
+    /** What the duress PIN does. WIPE_ALL keeps the original behaviour. The others open the app without hidden chats. */
+    var duressAction: DuressAction
+        get() = runCatching { DuressAction.valueOf(str("duress_action") ?: "") }.getOrDefault(DuressAction.WIPE_ALL)
+        set(v) = setStr("duress_action", v.name)
+
+    /** Whether hidden chats post notifications at all (generic ones, never contents). Off by default. */
+    var notifyHiddenChats: Boolean
+        get() = bool("notify_hidden", false)
+        set(v) = setBool("notify_hidden", v)
+
+    /**
+     * Pause any contact whose safety number changes until the user reviews it. Verified contacts are always paused.
+     * Off by default for unverified contacts, matching Signal: the change is accepted with a visible notice.
+     */
+    var holdAllKeyChanges: Boolean
+        get() = bool("hold_all_key_changes", false)
+        set(v) = setBool("hold_all_key_changes", v)
+
+    /** Overwrite freed app memory after locking. On by default: the only cost is a brief CPU spike. */
+    var wipeMemoryOnLock: Boolean
+        get() = bool("wipe_memory_on_lock", true)
+        set(v) = setBool("wipe_memory_on_lock", v)
 
     /** Dismiss keys of Security-tab findings the user chose to hide (see Finding.dismissKey). */
     val dismissedFindings: Set<String>

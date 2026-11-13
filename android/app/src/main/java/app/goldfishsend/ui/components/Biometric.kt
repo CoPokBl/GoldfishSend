@@ -38,3 +38,35 @@ fun promptBiometric(
         .build()
     prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
 }
+
+/**
+ * The system's own unlock sheet: phone PIN, pattern, password or strong biometric, bound to [cipher]. GoldfishSend never
+ * sees the credential. Needs Android 11+ (a CryptoObject together with DEVICE_CREDENTIAL).
+ */
+fun promptScreenLock(
+    activity: FragmentActivity,
+    title: String,
+    cipher: Cipher,
+    onSuccess: (Cipher) -> Unit,
+    onError: (String?) -> Unit = {},
+) {
+    val prompt = BiometricPrompt(
+        activity,
+        ContextCompat.getMainExecutor(activity),
+        object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                val c = result.cryptoObject?.cipher
+                if (c != null) onSuccess(c) else onError(null)
+            }
+
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                onError(if (errorCode == BiometricPrompt.ERROR_USER_CANCELED) null else errString.toString())
+            }
+        },
+    )
+    val info = BiometricPrompt.PromptInfo.Builder()
+        .setTitle(title)
+        .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+        .build()
+    prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+}

@@ -15,6 +15,8 @@ import app.goldfishsend.proto.PushEnvelope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.withLock
 import org.signal.libsignal.protocol.DuplicateMessageException
+import org.signal.libsignal.protocol.IdentityKey
+import org.signal.libsignal.protocol.state.IdentityKeyStore
 import org.signal.libsignal.protocol.SessionCipher
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.message.PreKeySignalMessage
@@ -56,6 +58,9 @@ object Messenger {
 
     private class Decrypted(val contactId: Long, val content: Content, val newContact: Boolean)
 
+    /** A PreKey message from an existing contact carried a different identity key than the one we trust. */
+    private class IdentityChanged(val contactId: Long, val newKey: ByteArray) : Exception()
+
     private suspend fun receive(s: Session, tag: ByteArray, raw: ByteArray) {
         val mb = s.repo.mailboxByTag(tag) ?: return
         val blob = E2eBlob.decode(raw) ?: return
@@ -63,11 +68,15 @@ object Messenger {
             s.lock.withLock { decrypt(s, mb, blob) }
         } catch (e: DuplicateMessageException) {
             return
+        } catch (e: IdentityChanged) {
+            onIdentityChanged(s, e, tag, raw)
+            return
         } catch (e: Exception) {
             Log.w(TAG, "dropping undecryptable message: ${e.javaClass.simpleName}")
             return
         } ?: return
         dispatch(s, d)
+        Mailboxes.onMessageOnMailbox(s, s.repo.mailbox(mb.id) ?: mb)
         s.db.notifyChanged()
     }
 
@@ -86,6 +95,9 @@ object Messenger {
         val cipher = SessionCipher(s.signal, LOCAL, remote(cid))
         val padded = if (blob.type == E2eBlob.PREKEY) {
             val m = PreKeySignalMessage(blob.body)
+            if (!newContact && !s.signal.isTrustedIdentity(remote(cid), m.identityKey, IdentityKeyStore.Direction.RECEIVING)) {
+                throw IdentityChanged(cid, m.identityKey.serialize())
+            }
             val pt = cipher.decrypt(m)
             if (newContact) {
                 s.repo.setContactIdentity(cid, m.identityKey.serialize())
@@ -121,7 +133,7 @@ object Messenger {
                 if (d.newContact) {
                     systemMessage(s, cid, "Messages are end-to-end encrypted.")
                     s.repo.touchContact(cid, false)
-                    Notifier.newMessage(Graph.app, s.repo.contact(cid)?.name, "Connected")
+                    notify(s, cid, "Connected")
                 }
                 Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
                 Outbox.kick()
@@ -185,12 +197,78 @@ object Messenger {
         if (visible) {
             markChatRead(s, cid)
         } else {
-            Notifier.newMessage(Graph.app, s.repo.contact(cid)?.name, if (t.once == true) "View-once message" else body)
+            notify(s, cid, if (t.once == true) "View-once message" else body)
         }
         Sweeper.schedule(s)
     }
 
     // ---------- send ----------
+
+    /**
+     * A contact's identity key changed (reinstall, new phone, or someone impersonating them). Verified contacts (and,
+     * if the user opted in, every contact) are paused: their messages are held and nothing is sent until the user
+     * reviews the change. Otherwise, as in Signal, the new key is accepted with a visible notice.
+     */
+    private suspend fun onIdentityChanged(s: Session, e: IdentityChanged, tag: ByteArray, raw: ByteArray) {
+        val contact = s.repo.contact(e.contactId) ?: return
+        val hold = contact.verified || Graph.prefs.holdAllKeyChanges || contact.pendingIdentity != null
+        if (!hold) {
+            s.lock.withLock {
+                s.db.tx {
+                    s.signal.saveIdentity(remote(contact.id), IdentityKey(e.newKey))
+                    s.repo.acceptPendingIdentity(contact.id, e.newKey)
+                }
+            }
+            systemMessage(s, contact.id, "${contact.name}'s safety number changed. Compare it again to make sure it's really them.")
+            receive(s, tag, raw)
+            return
+        }
+        s.repo.holdIncoming(contact.id, tag, raw)
+        if (contact.pendingIdentity == null || !contact.pendingIdentity.contentEquals(e.newKey)) {
+            s.repo.setPendingIdentity(contact.id, e.newKey)
+            systemMessage(
+                s, contact.id,
+                "${contact.name}'s safety number changed. Messages are paused until you review it in their contact info.",
+            )
+            notify(s, contact.id, "Safety number changed")
+        }
+        s.db.notifyChanged()
+    }
+
+    /** The user reviewed and accepted a changed safety number. Delivers the held messages and resumes sending. */
+    suspend fun acceptIdentityChange(s: Session, cid: Long) {
+        val contact = s.repo.contact(cid) ?: return
+        val key = contact.pendingIdentity ?: return
+        s.lock.withLock {
+            s.db.tx {
+                s.signal.saveIdentity(remote(cid), IdentityKey(key))
+                s.repo.acceptPendingIdentity(cid, key)
+            }
+        }
+        val held = s.repo.heldIncoming(cid)
+        s.repo.clearHeldIncoming(cid)
+        systemMessage(s, cid, "You accepted ${contact.name}'s new safety number.")
+        for ((tag, blob) in held) {
+            receive(s, tag, blob)
+        }
+        s.db.notifyChanged()
+        Outbox.kick()
+    }
+
+    /**
+     * Hidden chats post nothing, unless the user allowed it and this isn't a decoy session. Even then the notification
+     * is generic, with no name and no text.
+     */
+    private fun notify(s: Session, cid: Long, text: String?) {
+        val c = s.repo.contact(cid)
+        if (c?.hidden == true) {
+            if (Graph.prefs.notifyHiddenChats && !s.decoy) {
+                Notifier.newMessage(Graph.app, null, null)
+            }
+            return
+        }
+        Notifier.newMessage(Graph.app, c?.name, text)
+    }
 
     fun systemMessage(s: Session, cid: Long, text: String) {
         s.repo.insertMessage(cid, "sys-" + Content.newId(), false, MsgKind.SYSTEM, text, System.currentTimeMillis(), null, 0, false, null, MsgStatus.READ)

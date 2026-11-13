@@ -1,5 +1,16 @@
 package app.goldfishsend.ui.screens
 
+import androidx.compose.material.icons.rounded.GppMaybe
+import androidx.compose.material.icons.rounded.Autorenew
+import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Emergency
+import androidx.compose.material.icons.rounded.NotificationsOff
+import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.TheaterComedy
+import app.goldfishsend.ui.components.PinEntryDialog
+import app.goldfishsend.security.AppLock
+import app.goldfishsend.core.PanicResponse
+import app.goldfishsend.core.DuressAction
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -33,6 +44,8 @@ import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.PhonelinkLock
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Screenshot
+import androidx.compose.material.icons.rounded.Memory
+import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Timer
 import androidx.compose.material.icons.rounded.VpnLock
@@ -86,7 +99,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private enum class Picker { NOTIF, CLIPBOARD, DEFAULT_TIMER, TIMER_START, LOCK_TIMEOUT, FAILED, INACTIVITY }
+private enum class Picker { NOTIF, CLIPBOARD, DEFAULT_TIMER, TIMER_START, LOCK_TIMEOUT, FAILED, INACTIVITY, DURESS_ACTION, PANIC, ROTATION }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -103,6 +116,11 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     var editServer by remember { mutableStateOf(false) }
     var pushPicker by remember { mutableStateOf(false) }
     var duress by remember { mutableStateOf(false) }
+    var hiddenPinDialog by remember { mutableStateOf(false) }
+    var disconnectPanic by remember { mutableStateOf(false) }
+    // Feature flags live inside the encrypted DB. In a decoy session they always read as off.
+    val duressOn by rememberQuery(s, v) { q -> !q.decoy && q.repo.kvString(AppLock.KV_DURESS_ON) == "1" }
+    val hiddenOn by rememberQuery(s, v) { q -> !q.decoy && q.repo.kvString(AppLock.KV_HIDDEN_ON) == "1" }
     var confirmWipeMessages by remember { mutableStateOf(false) }
     var confirmPanic by remember { mutableStateOf(false) }
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
@@ -171,12 +189,39 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
             item {
                 SectionHeader("App lock")
                 SettingRow(
-                    if (vault.hasPassphrase) "Change passphrase" else "Set a passphrase",
-                    if (vault.hasPassphrase) "Required to open GoldfishSend" else "Off · anyone who can unlock your phone can read chats",
+                    "Unlock method",
+                    when (vault.unlockMethod) {
+                        app.goldfishsend.crypto.UnlockMethod.NONE -> "Off · anyone who can unlock your phone can read chats"
+                        app.goldfishsend.crypto.UnlockMethod.SCREEN_LOCK -> "Phone screen lock"
+                        app.goldfishsend.crypto.UnlockMethod.APP_SECRET -> if (vault.secretIsPin) "App PIN (own keypad)" else "Passphrase"
+                    },
                     Icons.Rounded.Key,
                     onClick = openPassphrase,
                 )
+                if (vault.requiresUserUnlock) {
+                    SwitchRow(
+                        "Clear memory when locking",
+                        "Overwrites leftover message text in the app's memory after it locks",
+                        Icons.Rounded.Memory,
+                        p.wipeMemoryOnLock,
+                    ) { p.wipeMemoryOnLock = it }
+                    SettingRow(
+                        "Auto-lock",
+                        lockLabel(p.lockTimeoutSecs),
+                        Icons.Rounded.LockClock,
+                        onClick = { picker = Picker.LOCK_TIMEOUT },
+                    )
+                    SwitchRow("Lock when screen turns off", null, Icons.Rounded.Lock, p.lockOnScreenOff) { p.lockOnScreenOff = it }
+                }
                 if (vault.hasPassphrase) {
+                    if (vault.secretIsPin) {
+                        SwitchRow(
+                            "Scramble keypad",
+                            "Shuffle the digits each time, so watching your fingers or smudges doesn't reveal your PIN",
+                            Icons.Rounded.Shuffle,
+                            p.scramblePinPad,
+                        ) { p.scramblePinPad = it }
+                    }
                     val bioAvailable = remember { biometricAvailable(activity) }
                     SwitchRow(
                         "Fingerprint unlock",
@@ -199,25 +244,96 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                         }
                     }
                     SettingRow(
-                        "Auto-lock",
-                        lockLabel(p.lockTimeoutSecs),
-                        Icons.Rounded.LockClock,
-                        onClick = { picker = Picker.LOCK_TIMEOUT },
-                    )
-                    SwitchRow("Lock when screen turns off", null, Icons.Rounded.Lock, p.lockOnScreenOff) { p.lockOnScreenOff = it }
-                    SettingRow(
                         "Erase after failed attempts",
-                        if (p.maxFailedAttempts == 0) "Off" else "After ${p.maxFailedAttempts} wrong passphrases",
+                        if (p.maxFailedAttempts == 0) "Off" else "After ${p.maxFailedAttempts} wrong ${if (vault.secretIsPin) "PINs" else "passphrases"}",
                         Icons.Rounded.Warning,
                         onClick = { picker = Picker.FAILED },
                     )
                     SettingRow(
                         "Duress PIN",
-                        if (vault.hasDuress) "Set · entering it silently erases everything" else "Off · a second PIN that erases everything when entered",
+                        if (duressOn == true) {
+                            "On · " + when (p.duressAction) {
+                                DuressAction.WIPE_ALL -> "silently erases everything"
+                                DuressAction.HIDE_HIDDEN_CHATS -> "opens without hidden chats"
+                                DuressAction.DELETE_HIDDEN_CHATS -> "deletes hidden chats, then opens"
+                            }
+                        } else {
+                            "Off · a second PIN for when you're forced to unlock"
+                        },
                         Icons.Rounded.PhonelinkLock,
                         onClick = { duress = true },
                     )
+                    if (duressOn == true) {
+                        SettingRow(
+                            "When the duress PIN is entered",
+                            when (p.duressAction) {
+                                DuressAction.WIPE_ALL -> "Erase everything"
+                                DuressAction.HIDE_HIDDEN_CHATS -> "Open normally, with hidden chats kept hidden"
+                                DuressAction.DELETE_HIDDEN_CHATS -> "Delete hidden chats, then open normally"
+                            },
+                            Icons.Rounded.TheaterComedy,
+                            onClick = { picker = Picker.DURESS_ACTION },
+                        )
+                    }
                 }
+            }
+            item {
+                SectionHeader("Hidden chats")
+                SettingRow(
+                    "Hidden chats",
+                    if (hiddenOn == true) "On · long-press \"Chats\" and enter your hidden-chats PIN to show them" else "Off · keep chosen chats out of the list behind a separate PIN",
+                    Icons.Rounded.VisibilityOff,
+                    onClick = { hiddenPinDialog = true },
+                )
+                if (hiddenOn == true) {
+                    SwitchRow(
+                        "Notify for hidden chats",
+                        "A notification with no name or text. Off means hidden chats stay completely silent.",
+                        Icons.Rounded.NotificationsOff,
+                        p.notifyHiddenChats,
+                    ) { p.notifyHiddenChats = it }
+                }
+            }
+            item {
+                SectionHeader("Panic button")
+                SettingRow(
+                    "Response to a panic app",
+                    when (p.panicResponse) {
+                        PanicResponse.OFF -> "Off"
+                        PanicResponse.LOCK -> "Lock GoldfishSend"
+                        PanicResponse.WIPE_MESSAGES -> "Lock and erase all messages"
+                        PanicResponse.WIPE_EVERYTHING -> "Erase everything"
+                    },
+                    Icons.Rounded.Emergency,
+                    onClick = { picker = Picker.PANIC },
+                )
+                val trigger = p.panicTrigger
+                SettingRow(
+                    "Connected panic app",
+                    if (trigger == null) {
+                        "None · connect one from a panic app such as Ripple. Only a connected app can erase."
+                    } else {
+                        runCatching { ctx.packageManager.getApplicationLabel(ctx.packageManager.getApplicationInfo(trigger, 0)).toString() }
+                            .getOrDefault(trigger) + " · tap to disconnect"
+                    },
+                    Icons.Rounded.Link,
+                    onClick = { if (trigger != null) disconnectPanic = true },
+                )
+            }
+            item {
+                SectionHeader("Contacts and keys")
+                SettingRow(
+                    "Rotate mailboxes",
+                    if (p.mailboxRotationDays == 0) "Never" else "Every ${p.mailboxRotationDays} days · limits how long the server can link your traffic",
+                    Icons.Rounded.Autorenew,
+                    onClick = { picker = Picker.ROTATION },
+                )
+                SwitchRow(
+                    "Pause on any safety number change",
+                    "Verified contacts are always paused. This also pauses unverified ones until you review the change.",
+                    Icons.Rounded.GppMaybe,
+                    p.holdAllKeyChanges,
+                ) { p.holdAllKeyChanges = it }
             }
             item {
                 SectionHeader("Automatic erasing")
@@ -298,6 +414,29 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
             "Erase everything if unused", listOf(0 to "Off", 3 to "3 days", 7 to "7 days", 14 to "14 days", 30 to "30 days", 90 to "90 days"),
             p.inactivityWipeDays, { picker = null },
         ) { p.inactivityWipeDays = it }
+        Picker.DURESS_ACTION -> ChoiceDialog(
+            "When the duress PIN is entered",
+            listOf(
+                DuressAction.WIPE_ALL to "Erase everything",
+                DuressAction.HIDE_HIDDEN_CHATS to "Open normally, hidden chats stay hidden",
+                DuressAction.DELETE_HIDDEN_CHATS to "Delete hidden chats, then open normally",
+            ),
+            p.duressAction, { picker = null },
+        ) { p.duressAction = it }
+        Picker.PANIC -> ChoiceDialog(
+            "Response to a panic app",
+            listOf(
+                PanicResponse.OFF to "Off",
+                PanicResponse.LOCK to "Lock GoldfishSend",
+                PanicResponse.WIPE_MESSAGES to "Lock and erase all messages",
+                PanicResponse.WIPE_EVERYTHING to "Erase everything",
+            ),
+            p.panicResponse, { picker = null },
+        ) { p.panicResponse = it }
+        Picker.ROTATION -> ChoiceDialog(
+            "Rotate mailboxes", listOf(0 to "Never", 7 to "Every 7 days", 14 to "Every 14 days", 30 to "Every 30 days", 90 to "Every 90 days"),
+            p.mailboxRotationDays, { picker = null },
+        ) { p.mailboxRotationDays = it }
         null -> Unit
     }
 
@@ -329,7 +468,16 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
         PushPickerDialog { pushPicker = false }
     }
     if (duress) {
-        DuressDialog { duress = false }
+        DuressDialog(s, duressOn == true) { duress = false }
+    }
+    if (hiddenPinDialog) {
+        HiddenChatsDialog(s, hiddenOn == true) { hiddenPinDialog = false }
+    }
+    if (disconnectPanic) {
+        ConfirmDialog(
+            "Disconnect panic app?", "It will only be able to lock GoldfishSend, never erase it.", "Disconnect", false,
+            { disconnectPanic = false },
+        ) { p.panicTrigger = null }
     }
     if (confirmWipeMessages) {
         ConfirmDialog("Erase all messages?", "Every message in every chat is destroyed. This can't be undone.", "Erase", true, { confirmWipeMessages = false }) {
@@ -447,45 +595,93 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
     )
 }
 
+/**
+ * Sets or removes the duress PIN, on GoldfishSend's own keypad. In a decoy session it pretends to work but changes
+ * nothing, so the real duress PIN and hidden chats stay intact.
+ */
 @Composable
-private fun DuressDialog(onDismiss: () -> Unit) {
+private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
     val scope = rememberCoroutineScope()
-    var pin by remember { mutableStateOf("") }
     val vault = Graph.vault
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Duress PIN") },
-        text = {
-            Column {
-                Text(
-                    "If someone forces you to unlock GoldfishSend, enter this PIN instead of your passphrase. Everything is silently erased, and the app looks freshly installed.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(12.dp))
-                SecureTextField(pin, { pin = it }, Modifier.fillMaxWidth(), hint = "Duress PIN (4+ digits)", kind = FieldKind.NUMBER_PASSWORD)
-            }
-        },
-        confirmButton = {
-            TextButton(enabled = pin.length >= 4, onClick = {
-                val chars = pin.toCharArray()
-                pin = ""
+    PinEntryDialog(
+        "Duress PIN",
+        "If someone forces you to unlock GoldfishSend, enter this PIN instead of your real one. You choose what it does afterwards: " +
+            "erase everything, or open without your hidden chats.",
+        onDismiss = onDismiss,
+        minLength = 4,
+        removeLabel = if (on) "Remove" else null,
+        onRemove = {
+            if (!s.decoy) {
                 scope.launch(Dispatchers.Default) {
-                    vault.setDuress(chars)
-                    chars.fill('\u0000')
+                    vault.setDuress(null, null)
+                    s.repo.kvPutString(AppLock.KV_DURESS_ON, null)
+                    s.db.notifyChanged()
                 }
-                onDismiss()
-            }) { Text("Save") }
-        },
-        dismissButton = {
-            Row {
-                if (vault.hasDuress) {
-                    TextButton(onClick = {
-                        vault.setDuress(null)
-                        onDismiss()
-                    }) { Text("Remove", color = MaterialTheme.colorScheme.error) }
-                }
-                TextButton(onClick = onDismiss) { Text("Cancel") }
             }
+            onDismiss()
         },
-    )
+        validate = { pin ->
+            // Must differ from the real secret and from the hidden-chats PIN.
+            val copy = pin.copyOf()
+            val clash = runCatching { vault.unlockWithPassphrase(copy) }.getOrNull()?.also { it.fill(0) } != null || vault.isHiddenPin(pin)
+            copy.fill('\u0000')
+            if (clash) "This must be different from your other PINs." else null
+        },
+    ) { pin ->
+        onDismiss()
+        scope.launch(Dispatchers.Default) {
+            if (!s.decoy) {
+                val mk = s.masterKeyCopy()
+                vault.setDuress(pin, mk)
+                mk.fill(0)
+                s.repo.kvPutString(AppLock.KV_DURESS_ON, "1")
+                s.db.notifyChanged()
+            }
+            pin.fill('\u0000')
+        }
+    }
+}
+
+/** Sets or removes the hidden-chats PIN. Removing it un-hides every hidden chat. */
+@Composable
+private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val vault = Graph.vault
+    PinEntryDialog(
+        if (on) "Change hidden-chats PIN" else "Hidden chats",
+        "Choose a PIN for hidden chats. Hide a chat from its contact info. To see hidden chats, long-press \"Chats\" and enter this PIN. " +
+            "They're hidden again when GoldfishSend locks.",
+        onDismiss = onDismiss,
+        removeLabel = if (on) "Turn off" else null,
+        onRemove = {
+            if (!s.decoy) {
+                scope.launch(Dispatchers.Default) {
+                    vault.setHiddenPin(null)
+                    for (id in s.repo.hiddenContactIds()) {
+                        s.repo.setHidden(id, false)
+                    }
+                    s.repo.kvPutString(AppLock.KV_HIDDEN_ON, null)
+                    s.db.notifyChanged()
+                }
+            }
+            onDismiss()
+        },
+        validate = { pin ->
+            val copy = pin.copyOf()
+            val clash = runCatching { vault.unlockWithPassphrase(copy) }.getOrNull()?.also { it.fill(0) } != null ||
+                vault.unlockWithDuress(pin)?.also { it.fill(0) } != null
+            copy.fill('\u0000')
+            if (clash) "This must be different from your other PINs." else null
+        },
+    ) { pin ->
+        onDismiss()
+        scope.launch(Dispatchers.Default) {
+            if (!s.decoy) {
+                vault.setHiddenPin(pin)
+                s.repo.kvPutString(AppLock.KV_HIDDEN_ON, "1")
+                s.db.notifyChanged()
+            }
+            pin.fill('\u0000')
+        }
+    }
 }

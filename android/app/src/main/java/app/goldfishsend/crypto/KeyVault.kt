@@ -29,7 +29,17 @@ import org.bouncycastle.crypto.params.Argon2Parameters
  * MK (master key, 32 bytes) only lives in RAM while the app is unlocked. The DB key and other keys are derived from it.
  * A second Keystore key "gf_msg" wraps the message root key, so wiping on reboot only needs that alias deleted.
  * The optional "gf_bio" key is biometric-bound and holds a second copy of MK for fingerprint/face unlock.
+ *
+ * Unlock methods ([UnlockMethod]):
+ *  - NONE: MK is wrapped by "gf_device" only, and opens whenever the phone is unlocked.
+ *  - APP_SECRET: an app PIN (typed on GoldfishSend's own keypad) or passphrase, stretched with Argon2id, wraps MK inside
+ *    the device wrap. Supports duress PIN, fingerprint and erase-after-failed-attempts.
+ *  - SCREEN_LOCK: MK is wrapped by "gf_syslock", a Keystore key that needs the phone's own credential (PIN, pattern,
+ *    password or strong biometric) for every use. The OS handles the prompt, so the app never sees the secret. Removing
+ *    the phone's screen lock invalidates the key, and the data becomes unrecoverable.
  */
+enum class UnlockMethod { NONE, APP_SECRET, SCREEN_LOCK }
+
 class KeyVault(private val context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("gf_vault", Context.MODE_PRIVATE)
     private val keyStore: KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
@@ -37,14 +47,35 @@ class KeyVault(private val context: Context) {
     val isSetUp: Boolean
         get() = prefs.contains(P_WRAPPED)
 
+    /** An app PIN or passphrase is set (UnlockMethod.APP_SECRET). */
     val hasPassphrase: Boolean
         get() = prefs.getBoolean(P_HAS_PASS, false)
 
+    /** The app secret is a numeric PIN entered on the in-app keypad, not a passphrase typed with the keyboard. */
+    val secretIsPin: Boolean
+        get() = prefs.getString(P_SECRET_KIND, null) == KIND_PIN
+
+    /** Screen-lock unlock needs per-use device-credential keys (Android 11+) and a secure lock screen. */
+    fun screenLockSupported(): Boolean =
+        android.os.Build.VERSION.SDK_INT >= 30 &&
+            context.getSystemService(android.app.KeyguardManager::class.java).isDeviceSecure
+
+    val hasScreenLock: Boolean
+        get() = prefs.getBoolean(P_SCREENLOCK, false)
+
+    /** Opening the app needs the user (app secret or phone screen lock), not just an unlocked phone. */
+    val requiresUserUnlock: Boolean
+        get() = hasPassphrase || hasScreenLock
+
+    val unlockMethod: UnlockMethod
+        get() = when {
+            hasScreenLock -> UnlockMethod.SCREEN_LOCK
+            hasPassphrase -> UnlockMethod.APP_SECRET
+            else -> UnlockMethod.NONE
+        }
+
     val hasBiometric: Boolean
         get() = prefs.contains(P_BIO) && keyStore.containsAlias(ALIAS_BIO)
-
-    val hasDuress: Boolean
-        get() = prefs.contains(P_DURESS)
 
     val usesStrongBox: Boolean
         get() = prefs.getBoolean(P_STRONGBOX, false)
@@ -55,11 +86,12 @@ class KeyVault(private val context: Context) {
         val mk = Rand.bytes(32)
         createKey(ALIAS_DEVICE, preferStrongBox = true, biometric = false)
         writeWrapped(mk, passphrase)
+        ensureDecoySlots()
         return mk
     }
 
     fun unlockWithoutPassphrase(): ByteArray? {
-        if (!isSetUp || hasPassphrase) {
+        if (!isSetUp || requiresUserUnlock) {
             return null
         }
         return try {
@@ -84,32 +116,135 @@ class KeyVault(private val context: Context) {
         }
     }
 
-    fun isDuress(pin: CharArray): Boolean {
-        val stored = prefs.getString(P_DURESS, null) ?: return false
-        val salt = B64.dec(prefs.getString(P_DURESS_SALT, null)!!)
+    // --- duress PIN and hidden-chats PIN ---
+    //
+    // Both slots always hold data of the same shape. When a feature is off, the slot contains random bytes that no PIN
+    // opens, so the files on disk don't reveal whether a duress PIN or hidden chats exist. Whether they're on is
+    // recorded only inside the encrypted database (see Repo kv "duress_on"/"hidden_on").
+
+    /**
+     * The duress PIN is a second wrapping of MK (Argon2id inside the device key), so it can really open the app,
+     * either to erase it or to show a decoy view, depending on Prefs.duressAction.
+     * Returns MK if [pin] is the duress PIN, otherwise null.
+     */
+    fun unlockWithDuress(pin: CharArray): ByteArray? {
+        val blob = prefs.getString(P_DURESS, null)?.let { B64.dec(it) } ?: return null
+        val salt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) } ?: return null
+        val kek = argon2(pin, salt)
+        return try {
+            val inner = keystoreOpen(ALIAS_DEVICE, blob)
+            try {
+                Aead.open(kek, inner, AAD_DURESS)
+            } finally {
+                inner.wipe()
+            }
+        } catch (e: Exception) {
+            null
+        } finally {
+            kek.wipe()
+        }
+    }
+
+    /** Sets the duress PIN (with the current MK), or replaces it with an unopenable decoy slot when [pin] is null. */
+    fun setDuress(pin: CharArray?, mk: ByteArray?) {
+        val salt = Rand.bytes(16)
+        val inner = if (pin != null && mk != null) {
+            val kek = argon2(pin, salt)
+            Aead.seal(kek, mk, AAD_DURESS).also { kek.wipe() }
+        } else {
+            Aead.seal(Rand.bytes(32), Rand.bytes(32), AAD_DURESS)
+        }
+        val blob = if (keyStore.containsAlias(ALIAS_DEVICE)) keystoreSeal(ALIAS_DEVICE, inner) else Rand.bytes(inner.size + 28)
+        inner.wipe()
+        prefs.edit().putString(P_DURESS, B64.enc(blob)).putString(P_DURESS_SALT, B64.enc(salt)).commit()
+    }
+
+    /** Hidden-chats PIN: a plain Argon2id check (the app is already unlocked when it's entered). */
+    fun isHiddenPin(pin: CharArray): Boolean {
+        val stored = prefs.getString(P_HIDDEN, null)?.let { B64.dec(it) } ?: return false
+        val salt = prefs.getString(P_HIDDEN_SALT, null)?.let { B64.dec(it) } ?: return false
         val h = argon2(pin, salt)
-        val eq = MessageDigest.isEqual(h, B64.dec(stored))
+        val eq = MessageDigest.isEqual(h, stored)
         h.wipe()
         return eq
     }
 
-    fun setDuress(pin: CharArray?) {
-        if (pin == null) {
-            prefs.edit().remove(P_DURESS).remove(P_DURESS_SALT).apply()
-            return
-        }
+    fun setHiddenPin(pin: CharArray?) {
         val salt = Rand.bytes(16)
-        val h = argon2(pin, salt)
-        prefs.edit().putString(P_DURESS, B64.enc(h)).putString(P_DURESS_SALT, B64.enc(salt)).apply()
+        val h = if (pin != null) argon2(pin, salt) else Rand.bytes(32)
+        prefs.edit().putString(P_HIDDEN, B64.enc(h)).putString(P_HIDDEN_SALT, B64.enc(salt)).commit()
         h.wipe()
     }
 
-    /** Sets, changes or removes (null) the passphrase. Biometric unlock is reset when removed. */
-    fun changePassphrase(mk: ByteArray, newPassphrase: CharArray?) {
-        writeWrapped(mk, newPassphrase)
+    /** Fills both slots with decoy data, if they're empty (setup, upgrade). */
+    fun ensureDecoySlots() {
+        if (!prefs.contains(P_DURESS) || !prefs.contains(P_DURESS_SALT)) {
+            setDuress(null, null)
+        }
+        if (!prefs.contains(P_HIDDEN) || !prefs.contains(P_HIDDEN_SALT)) {
+            setHiddenPin(null)
+        }
+    }
+
+    /**
+     * Sets, changes or removes (null) the app secret. This also switches away from SCREEN_LOCK. Biometric unlock and the
+     * duress PIN are reset when the secret is removed.
+     */
+    fun changePassphrase(mk: ByteArray, newPassphrase: CharArray?, isPin: Boolean = false) {
+        writeWrapped(mk, newPassphrase, isPin)
         if (newPassphrase == null) {
             disableBiometric()
-            setDuress(null)
+            setDuress(null, null)
+        }
+    }
+
+    // --- phone screen lock (system credential) ---
+
+    /** For enabling SCREEN_LOCK. The cipher must be authenticated with a BiometricPrompt that allows DEVICE_CREDENTIAL. */
+    fun screenLockEncryptCipher(): Cipher {
+        createKey(ALIAS_SYSLOCK, preferStrongBox = false, biometric = false, screenLock = true)
+        return Cipher.getInstance(TRANSFORM).apply { init(Cipher.ENCRYPT_MODE, secretKey(ALIAS_SYSLOCK)) }
+    }
+
+    /** Re-wraps MK so that only the phone's own credential opens it. Fingerprint shortcut and duress PIN no longer apply. */
+    fun enableScreenLock(mk: ByteArray, authenticatedCipher: Cipher) {
+        val blob = authenticatedCipher.iv + authenticatedCipher.doFinal(mk)
+        prefs.edit()
+            .putString(P_WRAPPED, B64.enc(blob))
+            .putBoolean(P_SCREENLOCK, true)
+            .putBoolean(P_HAS_PASS, false)
+            .remove(P_SALT)
+            .remove(P_SECRET_KIND)
+            .commit()
+        disableBiometric()
+        setDuress(null, null)
+    }
+
+    /**
+     * Returns null only when the key is permanently gone (the phone's screen lock was removed or reset), meaning the data
+     * can never be opened again. Any other failure (a busy or temporarily unavailable Keystore) throws, so the caller can
+     * retry instead of offering to erase everything.
+     */
+    fun screenLockDecryptCipher(): Cipher? {
+        val blob = prefs.getString(P_WRAPPED, null)?.let { B64.dec(it) } ?: return null
+        if (!keyStore.containsAlias(ALIAS_SYSLOCK)) {
+            return null
+        }
+        return try {
+            Cipher.getInstance(TRANSFORM).apply {
+                init(Cipher.DECRYPT_MODE, secretKey(ALIAS_SYSLOCK), GCMParameterSpec(128, blob, 0, 12))
+            }
+        } catch (e: android.security.keystore.KeyPermanentlyInvalidatedException) {
+            null
+        }
+    }
+
+    fun unwrapWithScreenLock(authenticatedCipher: Cipher): ByteArray? {
+        val blob = prefs.getString(P_WRAPPED, null)?.let { B64.dec(it) } ?: return null
+        return try {
+            authenticatedCipher.doFinal(blob, 12, blob.size - 12)
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -181,7 +316,7 @@ class KeyVault(private val context: Context) {
 
     /** Destroys every key: everything encrypted becomes unrecoverable. */
     fun destroyAll() {
-        for (alias in listOf(ALIAS_DEVICE, ALIAS_MSG, ALIAS_BIO)) {
+        for (alias in listOf(ALIAS_DEVICE, ALIAS_MSG, ALIAS_BIO, ALIAS_SYSLOCK)) {
             runCatching { keyStore.deleteEntry(alias) }
         }
         prefs.edit().clear().commit()
@@ -189,13 +324,18 @@ class KeyVault(private val context: Context) {
 
     // --- internals ---
 
-    private fun writeWrapped(mk: ByteArray, passphrase: CharArray?) {
-        val edit = prefs.edit()
+    private fun writeWrapped(mk: ByteArray, passphrase: CharArray?, isPin: Boolean = false) {
+        if (!keyStore.containsAlias(ALIAS_DEVICE)) {
+            createKey(ALIAS_DEVICE, preferStrongBox = true, biometric = false)
+        }
+        val edit = prefs.edit().putBoolean(P_SCREENLOCK, false)
         if (passphrase == null || passphrase.isEmpty()) {
             edit.putString(P_WRAPPED, B64.enc(keystoreSeal(ALIAS_DEVICE, mk)))
                 .putBoolean(P_HAS_PASS, false)
                 .remove(P_SALT)
+                .remove(P_SECRET_KIND)
         } else {
+            edit.putString(P_SECRET_KIND, if (isPin) KIND_PIN else KIND_PASSPHRASE)
             val salt = Rand.bytes(16)
             val kek = argon2(passphrase, salt)
             val inner = Aead.seal(kek, mk, AAD_MK)
@@ -206,6 +346,7 @@ class KeyVault(private val context: Context) {
             inner.wipe()
         }
         edit.commit()
+        runCatching { keyStore.deleteEntry(ALIAS_SYSLOCK) }
     }
 
     private fun keystoreSeal(alias: String, plaintext: ByteArray): ByteArray {
@@ -222,7 +363,7 @@ class KeyVault(private val context: Context) {
 
     private fun secretKey(alias: String): SecretKey = keyStore.getKey(alias, null) as SecretKey
 
-    private fun createKey(alias: String, preferStrongBox: Boolean, biometric: Boolean) {
+    private fun createKey(alias: String, preferStrongBox: Boolean, biometric: Boolean, screenLock: Boolean = false) {
         runCatching { keyStore.deleteEntry(alias) }
         val strongBoxAvailable = context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
         fun spec(strongBox: Boolean): KeyGenParameterSpec {
@@ -231,7 +372,16 @@ class KeyVault(private val context: Context) {
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setKeySize(256)
                 .setRandomizedEncryptionRequired(true)
-            if (biometric) {
+            if (screenLock) {
+                // Every use needs the phone's PIN, pattern, password or a strong biometric. New fingerprints don't invalidate it,
+                // but removing the screen lock does.
+                if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
+                    throw UnsupportedOperationException("Screen-lock unlock needs Android 11 or newer")
+                }
+                b.setUserAuthenticationRequired(true)
+                    .setInvalidatedByBiometricEnrollment(false)
+                    .setUserAuthenticationParameters(0, KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG)
+            } else if (biometric) {
                 b.setUserAuthenticationRequired(true)
                     .setInvalidatedByBiometricEnrollment(true)
                 if (android.os.Build.VERSION.SDK_INT >= 30) {
@@ -274,12 +424,20 @@ class KeyVault(private val context: Context) {
         private const val ALIAS_DEVICE = "gf_device"
         private const val ALIAS_MSG = "gf_msg"
         private const val ALIAS_BIO = "gf_bio"
+        private const val ALIAS_SYSLOCK = "gf_syslock"
+        private const val P_SCREENLOCK = "screenlock"
+        private const val P_SECRET_KIND = "secret_kind"
+        private const val KIND_PIN = "pin"
+        private const val KIND_PASSPHRASE = "passphrase"
         private const val P_WRAPPED = "wrapped_mk"
         private const val P_HAS_PASS = "has_pass"
         private const val P_SALT = "salt"
         private const val P_BIO = "bio_mk"
         private const val P_DURESS = "duress"
         private const val P_DURESS_SALT = "duress_salt"
+        private const val P_HIDDEN = "hidden_pin"
+        private const val P_HIDDEN_SALT = "hidden_salt"
+        private val AAD_DURESS = "gf/duress/v1".toByteArray()
         private const val P_STRONGBOX = "strongbox"
         private val AAD_MK = "gf/mk/v1".toByteArray()
 

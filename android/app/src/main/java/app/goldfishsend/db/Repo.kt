@@ -18,6 +18,9 @@ data class Contact(
     val createdAt: Long,
     val lastActivity: Long,
     val unread: Int,
+    /** A changed identity key that hasn't been reviewed yet. Sending is paused while it's set. */
+    val pendingIdentity: ByteArray? = null,
+    val hidden: Boolean = false,
 ) {
     val ready: Boolean
         get() = outServer != null && outSecret != null
@@ -35,6 +38,10 @@ data class Mailbox(
     val createdAt: Long,
     val inviteUsed: Boolean,
     val inviteExpiresAt: Long?,
+    /** Set when a newer mailbox replaced this one for the same contact (rotation). */
+    val replacedAt: Long? = null,
+    /** After this time, a replaced mailbox is deleted. It's set once the contact is seen using the new one. */
+    val drainUntil: Long? = null,
 ) {
     companion object {
         const val PURPOSE_QR = 0
@@ -135,10 +142,13 @@ class Repo(val db: Db, private val vault: MessageVault) {
         createdAt = c.getLong(9),
         lastActivity = c.getLong(10),
         unread = c.getInt(11),
+        pendingIdentity = if (c.isNull(12)) null else c.getBlob(12),
+        hidden = c.getInt(13) != 0,
     )
 
     private val contactCols =
-        "id, name, identity_key, verified, timer_secs, out_server, out_secret, received_any, unreachable, created_at, last_activity, unread"
+        "id, name, identity_key, verified, timer_secs, out_server, out_secret, received_any, unreachable, created_at, last_activity, unread, " +
+            "pending_identity, hidden"
 
     fun contact(id: Long): Contact? = db.queryOne("SELECT $contactCols FROM contacts WHERE id = ?", id, map = ::contact)
 
@@ -161,6 +171,33 @@ class Repo(val db: Db, private val vault: MessageVault) {
     fun renameContact(id: Long, name: String) = db.exec("UPDATE contacts SET name = ? WHERE id = ?", name, id)
 
     fun setVerified(id: Long, v: Boolean) = db.exec("UPDATE contacts SET verified = ? WHERE id = ?", v, id)
+
+    // --- identity changes ---
+
+    fun setPendingIdentity(id: Long, key: ByteArray?) = db.exec("UPDATE contacts SET pending_identity = ? WHERE id = ?", key, id)
+
+    /** Accepts a reviewed identity change: the new key becomes the contact's key, and they're no longer verified. */
+    fun acceptPendingIdentity(id: Long, key: ByteArray) =
+        db.exec("UPDATE contacts SET identity_key = ?, pending_identity = NULL, verified = 0 WHERE id = ?", key, id)
+
+    fun holdIncoming(contactId: Long, tag: ByteArray, blob: ByteArray) {
+        // Bounded: a flood from a hostile peer can't fill storage.
+        if (db.queryOne("SELECT COUNT(*) FROM held_incoming WHERE contact_id = ?", contactId) { it.getLong(0) }!! >= 200) {
+            return
+        }
+        db.insert("INSERT INTO held_incoming (contact_id, tag, blob, received_at) VALUES (?, ?, ?, ?)", contactId, tag, blob, System.currentTimeMillis())
+    }
+
+    fun heldIncoming(contactId: Long): List<Pair<ByteArray, ByteArray>> =
+        db.query("SELECT tag, blob FROM held_incoming WHERE contact_id = ? ORDER BY id", contactId) { it.getBlob(0) to it.getBlob(1) }
+
+    fun clearHeldIncoming(contactId: Long) = db.exec("DELETE FROM held_incoming WHERE contact_id = ?", contactId)
+
+    // --- hidden chats ---
+
+    fun setHidden(id: Long, hidden: Boolean) = db.exec("UPDATE contacts SET hidden = ? WHERE id = ?", hidden, id)
+
+    fun hiddenContactIds(): List<Long> = db.query("SELECT id FROM contacts WHERE hidden = 1") { it.getLong(0) }
 
     fun setTimer(id: Long, secs: Long) = db.exec("UPDATE contacts SET timer_secs = ? WHERE id = ?", secs, id)
 
@@ -417,17 +454,44 @@ class Repo(val db: Db, private val vault: MessageVault) {
         createdAt = c.getLong(8),
         inviteUsed = c.getInt(9) != 0,
         inviteExpiresAt = if (c.isNull(10)) null else c.getLong(10),
+        replacedAt = if (c.isNull(11)) null else c.getLong(11),
+        drainUntil = if (c.isNull(12)) null else c.getLong(12),
     )
 
     private val mbCols =
-        "id, contact_id, purpose, send_secret, owner_secret, tag, state, expires_at, created_at, invite_used, invite_expires_at"
+        "id, contact_id, purpose, send_secret, owner_secret, tag, state, expires_at, created_at, invite_used, invite_expires_at, " +
+            "replaced_at, drain_until"
 
     fun mailboxByTag(tag: ByteArray): Mailbox? = db.queryOne("SELECT $mbCols FROM mailboxes WHERE tag = ?", tag, map = ::mailbox)
 
     fun mailbox(id: Long): Mailbox? = db.queryOne("SELECT $mbCols FROM mailboxes WHERE id = ?", id, map = ::mailbox)
 
-    fun mailboxForContact(contactId: Long): Mailbox? =
-        db.queryOne("SELECT $mbCols FROM mailboxes WHERE contact_id = ? ORDER BY id DESC LIMIT 1", contactId, map = ::mailbox)
+    /** The contact's current inbound mailbox (the newest one that hasn't been replaced). */
+    fun mailboxForContact(contactId: Long): Mailbox? = db.queryOne(
+        "SELECT $mbCols FROM mailboxes WHERE contact_id = ? AND replaced_at IS NULL ORDER BY id DESC LIMIT 1",
+        contactId, map = ::mailbox,
+    )
+
+    // --- rotation ---
+
+    fun markReplaced(id: Long, at: Long) = db.exec("UPDATE mailboxes SET replaced_at = ? WHERE id = ? AND replaced_at IS NULL", at, id)
+
+    /** Once the contact uses the new mailbox, older ones only need to live until in-flight messages (max TTL) have arrived. */
+    fun startDraining(contactId: Long, newerThanId: Long, until: Long) = db.exec(
+        "UPDATE mailboxes SET drain_until = ? WHERE contact_id = ? AND replaced_at IS NOT NULL AND drain_until IS NULL AND id < ?",
+        until, contactId, newerThanId,
+    )
+
+    fun drainedMailboxes(now: Long): List<Mailbox> =
+        db.query("SELECT $mbCols FROM mailboxes WHERE drain_until IS NOT NULL AND drain_until < ?", now, map = ::mailbox)
+
+    /** Contacts whose current mailbox is older than [before] and whose previous rotation has finished. */
+    fun contactsDueForRotation(before: Long): List<Long> = db.query(
+        """SELECT m.contact_id FROM mailboxes m JOIN contacts c ON c.id = m.contact_id
+           WHERE m.replaced_at IS NULL AND m.state = ? AND m.created_at < ? AND c.out_secret IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM mailboxes o WHERE o.contact_id = m.contact_id AND o.replaced_at IS NOT NULL AND o.drain_until IS NULL)""",
+        Mailbox.STATE_ACTIVE, before,
+    ) { it.getLong(0) }
 
     fun allMailboxes(): List<Mailbox> = db.query("SELECT $mbCols FROM mailboxes", map = ::mailbox)
 
@@ -459,7 +523,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
     fun setMailboxExpiry(id: Long, expiresAt: String) = db.exec("UPDATE mailboxes SET expires_at = ? WHERE id = ?", expiresAt, id)
 
     fun bindMailbox(id: Long, contactId: Long) =
-        db.exec("UPDATE mailboxes SET contact_id = ?, invite_used = 1 WHERE id = ?", contactId, id)
+        db.exec("UPDATE mailboxes SET contact_id = ?, invite_used = 1, created_at = ? WHERE id = ?", contactId, System.currentTimeMillis(), id)
 
     fun markInviteUsed(id: Long, expiresAt: Long) =
         db.exec("UPDATE mailboxes SET invite_used = 1, invite_expires_at = ? WHERE id = ?", expiresAt, id)

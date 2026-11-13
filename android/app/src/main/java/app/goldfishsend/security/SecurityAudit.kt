@@ -278,11 +278,12 @@ object SecurityAudit {
         }
 
         // --- App settings ---
-        if (!Graph.vault.hasPassphrase) {
+        if (!Graph.vault.requiresUserUnlock) {
             out += Finding(
                 "applock", Severity.WARNING, "App lock is off",
-                "Anyone who can unlock your phone can read your chats. A passphrase also adds a second layer to your encryption.",
-                Fix.SET_PASSPHRASE, "Set passphrase",
+                "Anyone who can unlock your phone can read your chats. Use your phone's screen lock, or an app PIN on GoldfishSend's " +
+                    "own keypad (which also adds a second layer to your encryption and enables the duress PIN).",
+                Fix.SET_PASSPHRASE, "Choose unlock method",
             )
         }
         if (prefs.notificationContent != NotificationContent.NONE) {

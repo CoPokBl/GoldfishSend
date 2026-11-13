@@ -91,3 +91,21 @@ The audit adds **no extra permissions**. Checks that would need one, such as lis
 - **Locked inbox needs one unlock first.** The inbox key pair is created on first unlock, so a push that arrives before the app has ever been unlocked is dropped.
 - **Key material can't always be wiped from memory.** Text you type in fields passes through `EditText` and `String`, which the JVM can't reliably zero. Raw key arrays are zeroed.
 - **The UI is only smoke-tested** on an emulator (onboarding renders). End-to-end delivery through a real push distributor and server hasn't been exercised yet.
+
+
+## Optional security features
+
+All of these live in **Settings**. Only those with no real downside are on by default.
+
+- **Unlock method.** Choose between:
+  - **Phone screen lock:** the system prompt. GoldfishSend never sees your PIN, pattern or password. It needs Android 11+, and if you ever remove your phone's screen lock, the data can't be recovered.
+  - **App PIN:** typed on GoldfishSend's own keypad, so your keyboard app never sees it. You can scramble the keypad if you want.
+  - **Passphrase:** the advanced option, typed with your keyboard.
+
+  Fingerprint unlock, the duress PIN and erasing after failed attempts all need the app PIN or the passphrase.
+- **Duress PIN.** Choose what it does: erase everything, open normally with hidden chats kept hidden, or delete the hidden chats and then open. It's a real second unlock of your data, and its storage slot looks the same whether it's set or not.
+- **Hidden chats.** Set a separate PIN, then hide chats from their contact info. To see them, long-press "Chats" and enter the PIN. They're hidden again when the app locks. Notifications for hidden chats are off unless you turn them on, and even then they're generic.
+- **Panic button (PanicKit).** Panic apps such as Ripple can lock GoldfishSend. Only the app you approve can erase it. Off by default.
+- **Safety numbers.** If a verified contact's key changes, their messages are held and sending pauses until you review the new number in their contact info. Unverified contacts get a notice instead, or you can choose to pause those too.
+- **Mailbox rotation.** On by default, every 30 days. Each contact gets a fresh mailbox, and the old one is deleted after they've switched.
+- **Clear memory when locking.** On by default.

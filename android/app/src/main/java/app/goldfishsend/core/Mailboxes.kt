@@ -31,6 +31,10 @@ object Mailboxes {
     private const val TAG = "Mailboxes"
     const val POOL_TARGET = 2
     private const val VERIFY_TIMEOUT_MS = 120_000L
+    private const val ROTATIONS_PER_PASS = 3
+
+    /** The server's max message TTL (14 days) plus a day of margin. */
+    private const val DRAIN_MS = 15 * 86_400_000L
 
     private val waiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val poolMutex = Mutex()
@@ -207,6 +211,46 @@ object Mailboxes {
         val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
         s.repo.bindMailbox(fresh.id, cid)
         Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret)))
+    }
+
+    /**
+     * Mailbox rotation (Prefs.mailboxRotationDays). Each contact periodically gets a fresh inbound mailbox, announced through
+     * the E2E `mailbox` message, so the server can't watch one mailbox's traffic for long. The old mailbox keeps working
+     * until the contact is seen using the new one (see [onMessageOnMailbox]), then for one more max-TTL so in-flight messages
+     * still arrive. Only then is it deleted. A few contacts rotate per pass, which spreads the proof-of-work cost.
+     */
+    suspend fun rotateContacts(s: Session) {
+        val now = System.currentTimeMillis()
+        for (m in s.repo.drainedMailboxes(now)) {
+            runCatching { deleteRemote(listOf(item(m))) }.onSuccess { s.repo.deleteMailboxRow(m.id) }
+        }
+        val days = Graph.prefs.mailboxRotationDays
+        if (days <= 0 || endpoint(s) == null) {
+            return
+        }
+        val due = s.repo.contactsDueForRotation(now - days * 86_400_000L)
+        for (cid in due.take(ROTATIONS_PER_PASS)) {
+            val contact = s.repo.contact(cid) ?: continue
+            if (contact.pendingIdentity != null || contact.unreachable) {
+                continue
+            }
+            val old = s.repo.mailboxForContact(cid) ?: continue
+            val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
+            s.repo.bindMailbox(fresh.id, cid)
+            s.repo.markReplaced(old.id, now)
+            Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret)))
+        }
+        if (due.isNotEmpty()) {
+            Graph.scope.launchSafe { ensurePool(s) }
+        }
+    }
+
+    /** A message arrived on [mb]. If it's a contact's current mailbox, their older ones can start draining. */
+    fun onMessageOnMailbox(s: Session, mb: Mailbox) {
+        val cid = mb.contactId ?: return
+        if (mb.replacedAt == null) {
+            s.repo.startDraining(cid, mb.id, System.currentTimeMillis() + DRAIN_MS)
+        }
     }
 
     /** Extends any mailbox expiring within 60 days. */

@@ -1,5 +1,6 @@
 package app.goldfishsend.ui.screens
 
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,6 +21,7 @@ import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -76,7 +78,9 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
     var timer by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
+    var confirmAccept by remember { mutableStateOf(false) }
     val c = contact ?: return
+    val newSafety by rememberQuery(s, c.pendingIdentity?.size) { q -> c.pendingIdentity?.let { safetyNumber(q, it) } }
 
     Scaffold(
         topBar = {
@@ -101,7 +105,15 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
             }
             AssistChip(
                 onClick = {},
-                label = { Text(if (c.verified) "Verified" else "Not verified") },
+                label = {
+                    Text(
+                        when {
+                            c.pendingIdentity != null -> "Safety number changed"
+                            c.verified -> "Verified"
+                            else -> "Not verified"
+                        },
+                    )
+                },
                 leadingIcon = {
                     Icon(
                         if (c.verified) Icons.Rounded.Verified else Icons.Rounded.VerifiedUser, null,
@@ -110,6 +122,36 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                 },
             )
             Spacer(Modifier.height(16.dp))
+
+            if (c.pendingIdentity != null) {
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = MaterialTheme.shapes.large,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                ) {
+                    Column(Modifier.padding(20.dp)) {
+                        Text("${c.name}'s safety number changed", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "This usually means they reinstalled GoldfishSend or got a new phone, but it could also mean someone " +
+                                "is pretending to be them. Messages are paused. Compare the new number below with ${c.name}, in person " +
+                                "or on a call, before accepting.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        newSafety?.chunked(5)?.chunked(4)?.forEach { row ->
+                            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                                for (g in row) {
+                                    Text(g, fontFamily = FontFamily.Monospace, fontSize = 16.sp, letterSpacing = 1.sp)
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { confirmAccept = true }) { Text("Accept new safety number") }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
 
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainer,
@@ -150,6 +192,16 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                     checked = c.verified,
                     onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setVerified(contactId, v); s.db.notifyChanged() } },
                 )
+                val hiddenOn by rememberQuery(s) { q -> !q.decoy && q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
+                if (hiddenOn == true) {
+                    SwitchRow(
+                        "Hide this chat",
+                        "Keeps it out of the chat list until you enter your hidden-chats PIN",
+                        Icons.Rounded.VisibilityOff,
+                        checked = c.hidden,
+                        onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setHidden(contactId, v); s.db.notifyChanged() } },
+                    )
+                }
                 SettingRow(
                     "Disappearing messages",
                     timerLabel(c.timerSecs),
@@ -187,6 +239,13 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
         ConfirmDialog("Clear chat?", "All messages in this chat will be permanently erased from this phone.", "Clear", true, { confirmClear = false }) {
             scope.launch(Dispatchers.IO) { s.repo.clearConversation(contactId); s.db.notifyChanged() }
         }
+    }
+    if (confirmAccept) {
+        ConfirmDialog(
+            "Accept the new safety number?",
+            "Only do this if you've confirmed with ${c.name} that the new number is theirs. They'll be marked as not verified.",
+            "Accept", false, { confirmAccept = false },
+        ) { scope.launch { app.goldfishsend.core.Messenger.acceptIdentityChange(s, contactId) } }
     }
     if (confirmDelete) {
         ConfirmDialog(

@@ -74,6 +74,10 @@ object Outbox {
         if (server == null || secret == null) {
             return false
         }
+        // Their safety number changed and the user hasn't reviewed it: don't encrypt anything to the unreviewed identity.
+        if (contact.pendingIdentity != null) {
+            return false
+        }
         try {
             var blob = item.blob
             if (blob == null) {
