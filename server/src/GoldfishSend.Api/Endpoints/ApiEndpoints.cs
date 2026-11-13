@@ -30,6 +30,7 @@ public static class ApiEndpoints {
         v1.MapPost("/mailboxes/delete", DeleteMailboxes);
 
         v1.MapPost("/messages", SendMessage);
+        v1.MapPost("/messages/batch", SendBatch);
 
         v1.MapPost("/invites", CreateInvite);
         v1.MapGet("/invites/{id}", TakeInvite);
@@ -157,6 +158,35 @@ public static class ApiEndpoints {
         return result.Ok
             ? Results.Json(new IdResponse(B64(result.Value!)), ApiJsonContext.Default.IdResponse, statusCode: 202)
             : Error(result.Error!);
+    }
+
+    private static async Task<IResult> SendBatch(HttpContext context, MessageService messages, CancellationToken ct) {
+        var request = context.Request;
+        if (!IsOctetStream(request)) {
+            return Error(ServiceError.UnsupportedMediaType);
+        }
+        var body = await ReadBodyAsync(request, GatewayCodec.MaxRequestBody, ct);
+        if (body is null) {
+            return Error(ServiceError.TooLarge);
+        }
+        var items = MessageBatch.TryParse(body);
+        if (items is null) {
+            return Error(ServiceError.InvalidRequest);
+        }
+
+        var result = await messages.AcceptBatchAsync(items, ParsePow(request), Subject(context), ct);
+        if (!result.Ok) {
+            return Error(result.Error!);
+        }
+        var results = new BatchItemResult[result.Value!.Count];
+        for (var i = 0; i < results.Length; i++) {
+            var item = result.Value[i];
+            results[i] = item.Ok
+                ? new BatchItemResult(202, Id: B64(item.Value!))
+                : new BatchItemResult(item.Error!.Status, Error: item.Error.Code, Scope: item.Error.Scope,
+                    RetryAfter: item.Error.RetryAfter is { } retry ? Math.Max(1, (int)Math.Ceiling(retry.TotalSeconds)) : null);
+        }
+        return Results.Json(new BatchSendResponse(results), ApiJsonContext.Default.BatchSendResponse);
     }
 
     private static async Task<IResult> CreateInvite(HttpContext context, InviteService invites, CancellationToken ct) {
