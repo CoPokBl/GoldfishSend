@@ -252,10 +252,10 @@ allocation from multiplying its quota by rotating addresses.
 
 | Policy | Subject | Default (`Limit` / `PeriodSeconds`, `Burst`) | Applies to |
 |---|---|---|---|
-| `send-ip` | client IP (/32 or /64) | 60 / 60 s, burst 20 | `POST /v1/messages`. A valid PoW (`GF-PoW` header) bypasses it. |
-| `send-mailbox` | mailbox | 30 / 60 s, burst 30 | `POST /v1/messages`, protects recipients from a hostile contact |
-| `send-mailbox-day` | mailbox | 1000 / 86400 s, burst 1000 | `POST /v1/messages` |
-| `send-global` | whole server | 2000 / 1 s, burst 4000 | `POST /v1/messages`, the overall accept ceiling. Charged last, only for messages about to be accepted, so junk can't drain it. |
+| `send-ip` | client IP (/32 or /64) | 60 / 60 s, burst 20 | `POST /v1/messages` (1 token) and `POST /v1/messages/batch` (`ceil(items / 8)` tokens per batch). A valid PoW (`GF-PoW` header) bypasses it. |
+| `send-mailbox` | mailbox | 30 / 60 s, burst 30 | Every message, single or batched. Protects recipients from a hostile contact. |
+| `send-mailbox-day` | mailbox | 1000 / 86400 s, burst 1000 | Every message, single or batched |
+| `send-global` | whole server | 2000 / 1 s, burst 4000 | Every message, single or batched: the overall accept ceiling. Charged last, only for messages about to be accepted, so junk can't drain it. |
 | `create-ip` | client IP | 10 / 3600 s, burst 10 | `POST /v1/mailboxes` (fails closed if Redis is down) |
 | `create-net` | client network | 100 / 3600 s, burst 50 | `POST /v1/mailboxes` (fails closed) |
 | `pow-ip` | client IP | 30 / 60 s, burst 30 | `POST /v1/pow/challenge` |
@@ -268,8 +268,8 @@ allocation from multiplying its quota by rotating addresses.
 | `invite-fetch-ip` | client IP | 60 / 60 s, burst 20 | `GET /v1/invites/{id}` |
 | `push-host` | push-service host | 200 / 1 s, burst 200 | Outbound pushes to one push host, from all workers together |
 | `push-mailbox` | mailbox | 2 / 1 s, burst 10 | Outbound pushes per mailbox, in front of `push-host`, so a few mailboxes can't take a shared push service's budget |
-| `send-net` | client network | 600 / 60 s, burst 200 | `POST /v1/messages`, checked before `send-ip`. A valid `GF-PoW` pays for either. |
-| `send-lookup-global` | whole server | 3000 / 1 s, burst 6000 | `POST /v1/messages` before the mailbox lookup. It caps how many token lookups reach MySQL. |
+| `send-net` | client network | 600 / 60 s, burst 200 | Like `send-ip` (same per-batch cost), checked before it. A valid `GF-PoW` pays for either. |
+| `send-lookup-global` | whole server | 3000 / 1 s, burst 6000 | Every message (single or batched item) before the mailbox lookup. It caps how many token lookups reach MySQL. |
 | `create-global` | whole server | 3000 / 3600 s, burst 300 | `POST /v1/mailboxes` (after the PoW, fails closed) |
 | `newhost-global` | whole server | 120 / 3600 s, burst 30 | Verification pushes to push hosts no mailbox has used in 30 days. It stops the server being used to POST to arbitrary sites. |
 | `owner-net` | client network | 300 / 60 s, burst 100 | Owner operations. Always charged. (`owner-ip` is only charged on **failed** ownership or verification, so junk from a shared address can't lock out real owners.) |
@@ -694,6 +694,7 @@ encrypted request too.
 | POST | `/v1/mailboxes/refresh` | owner | Extend expiry for a batch |
 | POST | `/v1/mailboxes/delete` | owner | Delete a batch (block or delete contact) |
 | POST | `/v1/messages` | `GF-Send-Token` header | Send an E2E blob (`GF-TTL`, `GF-Idempotency-Key`, `GF-PoW` optional) |
+| POST | `/v1/messages/batch` | a `sendSecret` per item | Send up to 32 blobs in one request (group fan-out); per-item results. Format in [`docs/groups.md`](../docs/groups.md#server-batch-send). |
 | POST | `/v1/invites` | none | Upload a one-time invite blob |
 | GET | `/v1/invites/{id}` | none | Fetch and delete an invite blob |
 | GET | `/healthz`, `/readyz` | internal only | Liveness and readiness |

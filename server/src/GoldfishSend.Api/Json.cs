@@ -22,6 +22,11 @@ public sealed record ExpiresResponse(string ExpiresAt, bool EndpointGone);
 
 public sealed record IdResponse(string Id);
 
+/// <summary>One entry of a batch send response: <c>202</c> with <c>id</c>, or an error exactly as a single send would return it.</summary>
+public sealed record BatchItemResult(int Status, string? Id = null, string? Error = null, string? Scope = null, int? RetryAfter = null);
+
+public sealed record BatchSendResponse(BatchItemResult[] Results);
+
 public sealed record ErrorResponse(string Error, string? Scope = null);
 
 public sealed record PowChallengeResponse(string Challenge, int Difficulty, long ExpiresAt);
@@ -41,6 +46,7 @@ public sealed record InfoResponse(
 [JsonSerializable(typeof(StatusResponse))]
 [JsonSerializable(typeof(ExpiresResponse))]
 [JsonSerializable(typeof(IdResponse))]
+[JsonSerializable(typeof(BatchSendResponse))]
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(PowChallengeResponse))]
 [JsonSerializable(typeof(InfoResponse))]

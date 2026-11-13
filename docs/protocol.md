@@ -254,6 +254,12 @@ resumes on its own if one starts accepting again. Clients that call refresh peri
   longer `GF-TTL` was asked for.
 - A `202` means the server accepted the message durably. It holds the message until the push server accepts it, or the TTL expires.
 
+### `POST /v1/messages/batch`: send up to 32 messages in one request
+For group fan-out. Each item is a send exactly as above (its own `sendSecret`, idempotency key, TTL and blob), and the
+response reports each item in order. The client (IP and network) buckets are charged `ceil(count / 8)` tokens once
+for the whole batch, and `GF-PoW` pays for all of it. The binary body format, results and limits are in
+[`docs/groups.md`](groups.md#server-batch-send).
+
 ### `POST /v1/invites`: upload a one-time invite blob
 - Body: raw bytes, 1 to `maxInviteBytes`, with **`Content-Type: application/octet-stream`** (`415` otherwise). Header `GF-TTL` is
   60 to 86400 seconds (default 900).

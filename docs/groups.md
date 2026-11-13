@@ -155,10 +155,18 @@ per item: sendSecret(32) ‖ idempotencyKey(16) ‖ u32 ttlSeconds (0 = default)
 ```
 - **Body limit:** the whole body stays within the normal 16 KiB inner limit. Clients split larger fan-outs.
 - **`GF-PoW`:** optional, and pays for the whole batch.
-- **Response:** `200 { "results": [ { "status": 202, "id": "b64u" } | { "status": 404|413|429|507, "error": "...",
-  "scope": "...", "retryAfter": n } ] }`, in item order. Each item is handled exactly like `POST /v1/messages`.
+- **Parsing is strict:** `count` 1 to 32, every `len` 1 to `maxMessageBytes`, and the items must use up the body exactly.
+  Anything else rejects the whole batch with `400 invalid_request`, and a wrong `Content-Type` gets `415`.
+- **Response:** `200 { "results": [ { "status": 202, "id": "b64u" } | { "status": 404|429|507, "error": "...",
+  "scope": "...", "retryAfter": n } ] }`, in item order. `retryAfter` is in seconds. Each item is handled exactly like
+  `POST /v1/messages`, including its idempotency key: retrying a whole batch with the same keys returns the same ids
+  and delivers nothing twice. A repeated key inside one batch also returns the first item's id.
+- **Whole-batch errors:** the client rate limit (`429` with `Retry-After` and `scope` `ip` or `network`), the errors
+  above, and server failures. After a failure, retry the whole batch with the same idempotency keys.
 - **Rate limits:**
-  - **Per item:** per-mailbox and global limits, like single sends.
+  - **Per item:** the mailbox-lookup cap, per-mailbox and global limits, and the held-message quotas, like single sends.
+    A batch can't probe mailboxes any faster than single sends.
   - **Per batch:** the per-IP and per-network buckets are charged `ceil(count / 8)` tokens for the whole batch. A batch
-    leaks nothing new: the server already sees fan-out as N sends from one IP at one moment.
+    leaks nothing new: the server already sees fan-out as N sends from one IP at one moment. If the bucket can't cover
+    the cost, the whole batch gets `429`.
 - **Fallback:** if the server doesn't have the endpoint (`404` for the path), clients fall back to single sends.

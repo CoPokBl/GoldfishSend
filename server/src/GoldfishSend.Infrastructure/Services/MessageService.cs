@@ -67,10 +67,44 @@ public sealed class MessageService {
             return ServiceError.TooLarge;
         }
 
-        // Client limits run widest first (network, then address), so one allocation can't multiply its budget by rotating
-        // addresses. Shared-address users (Tor, CGNAT) who hit either can pay with a proof of work instead.
+        var limited = await ChargeClientAsync(client, pow, cost: 1);
+        if (limited is not null) {
+            return limited;
+        }
+        return await AcceptItemAsync(sendSecret, body, ttlSeconds, idempotencyKey, ct);
+    }
+
+    /// <summary>
+    /// <c>POST /v1/messages/batch</c>. The client (IP and network) buckets are charged
+    /// <see cref="MessageBatch.ClientCost"/> tokens once for the whole batch, and a valid PoW pays for all of it. Each item is
+    /// then handled exactly like a single send: lookup, per-mailbox, held-quota and global limits, and idempotency.
+    /// </summary>
+    /// <returns>One result per item, in order, or an error for the whole batch (only a client rate limit).</returns>
+    public async Task<ServiceResult<IReadOnlyList<ServiceResult<byte[]>>>> AcceptBatchAsync(
+        IReadOnlyList<BatchItem> items, PowToken? pow, ClientSubject client, CancellationToken ct) {
+        if (items.Count is < 1 or > MessageBatch.MaxItems) {
+            return ServiceError.InvalidRequest;
+        }
+        var limited = await ChargeClientAsync(client, pow, MessageBatch.ClientCost(items.Count));
+        if (limited is not null) {
+            return limited;
+        }
+        // Sequential on purpose: a batch is at most 32 items, and the per-mailbox and global buckets then see the same
+        // order of events as single sends would produce.
+        var results = new List<ServiceResult<byte[]>>(items.Count);
+        foreach (var item in items) {
+            results.Add(await AcceptItemAsync(item.SendSecret, item.Blob, item.TtlSeconds, item.IdempotencyKey, ct));
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Client limits run widest first (network, then address), so one allocation can't multiply its budget by rotating
+    /// addresses. Shared-address users (Tor, CGNAT) who hit either can pay with a proof of work instead.
+    /// </summary>
+    private async Task<ServiceError?> ChargeClientAsync(ClientSubject client, PowToken? pow, int cost) {
         foreach (var (policy, subject) in new[] { (RatePolicies.SendPerNetwork, client.Network), (RatePolicies.SendPerIp, client.Host) }) {
-            var decision = await _limiter.CheckAsync(policy, subject);
+            var decision = await _limiter.CheckAsync(policy, subject, cost: cost);
             if (!decision.Allowed) {
                 if (pow is null || !await _pow.RedeemAsync(pow.Challenge, pow.Nonce, countsTowardLoad: false)) {
                     return ServiceError.RateLimited(decision);
@@ -78,8 +112,13 @@ public sealed class MessageService {
                 break; // A valid PoW pays for this request at every client scope.
             }
         }
+        return null;
+    }
 
-        // Caps how many token lookups can reach MySQL, whatever the source.
+    private async Task<ServiceResult<byte[]>> AcceptItemAsync(
+        byte[] sendSecret, byte[] body, int? ttlSeconds, byte[]? idempotencyKey, CancellationToken ct) {
+        // Caps how many token lookups can reach MySQL, whatever the source. Charged per item, so a batch can't probe
+        // mailboxes any faster than single sends.
         var lookup = await _limiter.CheckAsync(RatePolicies.SendLookupGlobal, GlobalSubject);
         if (!lookup.Allowed) {
             return ServiceError.RateLimited(lookup);
