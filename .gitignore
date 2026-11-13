@@ -31,3 +31,7 @@ android/captures/
 .vscode/
 *.swp
 .DS_Store
+
+# Release signing (never commit)
+android/keystore.properties
+keystore.properties

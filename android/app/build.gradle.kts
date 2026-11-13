@@ -1,12 +1,32 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
+// Release signing is optional: it's configured from an untracked android/keystore.properties, or from
+// environment variables (see docs/RELEASING.md). Without either, assembleRelease produces an unsigned APK,
+// which is what reproducible-build verifiers and F-Droid's build server use.
+val signingProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.isFile) {
+        f.inputStream().use { load(it) }
+    }
+}
+
+fun signingValue(key: String, env: String): String? =
+    (signingProps.getProperty(key) ?: providers.environmentVariable(env).orNull)?.takeIf { it.isNotBlank() }
+
+val releaseStoreFile = signingValue("storeFile", "GF_KEYSTORE_FILE")
+
 android {
     namespace = "app.goldfishsend"
     compileSdk = 37
+    // Pinned for reproducible builds: the build tools (aapt2, zipalign, d8) and the NDK (it strips the
+    // prebuilt libsignal/sqlcipher .so files, so its version changes the packaged bytes).
+    buildToolsVersion = "37.0.0"
     ndkVersion = "27.1.12297006"
 
     defaultConfig {
@@ -15,12 +35,29 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        // Deterministic: the APK depends only on this value, never on the build time or the VCS state.
+        // Verifiers must build with the same -Pgf.defaultServer as the release (or none for the default).
         val defaultServer = (project.findProperty("gf.defaultServer") as String?) ?: "https://relay.goldfishsend.app"
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"$defaultServer\"")
         // Only the arm64 / x86_64 native libs (libsignal, sqlcipher) are shipped.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = file(releaseStoreFile)
+                storePassword = signingValue("storePassword", "GF_KEYSTORE_PASSWORD")
+                keyAlias = signingValue("keyAlias", "GF_KEY_ALIAS")
+                keyPassword = signingValue("keyPassword", "GF_KEY_PASSWORD")
+                // minSdk 29: v2+v3 cover every supported device. v3 enables future key rotation.
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
         }
     }
 
@@ -33,7 +70,19 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             buildConfigField("boolean", "ALLOW_HTTP", "false")
+            if (releaseStoreFile != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+            // No git commit/branch/state in the APK: it would differ between source tarballs and checkouts.
+            vcsInfo.include = false
         }
+    }
+
+    // F-Droid rejects the "dependency metadata" block AGP otherwise embeds (encrypted with a Google key and
+    // useless to anyone else). Leaving it out also removes a source of difference between builds.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
 
     buildFeatures {
