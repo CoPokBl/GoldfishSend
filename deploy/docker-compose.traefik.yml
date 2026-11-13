@@ -47,7 +47,7 @@ services:
       traefik.http.routers.goldfish.rule: "Host(`${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}`) && PathPrefix(`/v1/`)"
       traefik.http.routers.goldfish.entrypoints: "${GOLDFISH_TRAEFIK_ENTRYPOINT:-websecure}"
       traefik.http.routers.goldfish.tls: "true"
-      traefik.http.routers.goldfish.tls.certresolver: "${GOLDFISH_TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      traefik.http.routers.goldfish.tls.certresolver: "${GOLDFISH_TRAEFIK_CERTRESOLVER-letsencrypt}"
       traefik.http.routers.goldfish.middlewares: "goldfish-body,goldfish-headers"
       traefik.http.routers.goldfish.service: "goldfish"
 

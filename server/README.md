@@ -386,10 +386,31 @@ The api trusts `X-Forwarded-For` only from `GOLDFISH_TRAEFIK_SUBNET` (plus optio
 `Ignoring X-Forwarded-For from untrusted proxy <traefik's address>` (at most every 10 minutes). Until that's fixed,
 every client shares one rate limit.
 
-**Key pinning.** Clients with "Pin server keys" turned on pin your certificate's public key. Traefik's ACME resolver may
-generate a new key on renewal, which would warn pinned users every couple of months. To check, compare the fingerprint
-(see below) before and after a renewal. If it changes, either tell users not to enable pinning, or give Traefik a
-certificate with a stable key through its file provider (for example certbot with `--reuse-key`).
+**Key pinning.** Clients with "Pin server keys" turned on pin your certificate's public key. Traefik's ACME resolver has
+no setting to keep the key, so it may generate a new one on renewal and warn pinned users every couple of months. To
+check, compare the fingerprint (see below) before and after a renewal. If it changes, let certbot manage this one
+certificate with a fixed key and have Traefik serve it from its file provider:
+
+1. Get the certificate with certbot and `--reuse-key`. The flag is saved in the renewal config, so every
+   `certbot renew` keeps the key. A DNS-01 plugin is simplest, because Traefik already owns port 80:
+   ```bash
+   certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/cf.ini \
+     --key-type ecdsa --reuse-key -d push.example.com
+   ```
+2. Mount `/etc/letsencrypt` read-only into Traefik (the whole directory, because `live/` holds symlinks into
+   `archive/`) and enable the file provider with `watch: true`. Add a dynamic config file:
+   ```yaml
+   tls:
+     certificates:
+       - certFile: /etc/letsencrypt/live/push.example.com/fullchain.pem
+         keyFile: /etc/letsencrypt/live/push.example.com/privkey.pem
+   ```
+   Traefik reloads the files on renewal by itself.
+3. Set `GOLDFISH_TRAEFIK_CERTRESOLVER=` (empty) in `deploy/.env`, so Traefik doesn't also request its own certificate
+   for the domain, and recreate the api container.
+
+To rotate the key on purpose later, run `certbot renew --force-renewal --new-key` once, and publish the new
+fingerprint first (see "Publishing your TLS key fingerprint").
 
 **Onion service with Traefik.** `--profile onion` still works. Tor forwards straight to the api, which gets a fixed
 address on the onion network (`GOLDFISH_ONION_API_IP`), because Tor can't target a hostname. On that path only Kestrel's
