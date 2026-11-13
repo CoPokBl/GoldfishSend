@@ -41,7 +41,8 @@ There are no accounts. A recipient creates **one mailbox per contact** and gives
 **Limits of the model.** This protects against retrospective disclosure: a seized disk, a leaked backup or a
 subpoenaed database. Someone who controls the *running* server can watch requests as they arrive (IPs,
 endpoints at the moment of delivery, traffic timing), just as any relay operator could. Run it on hardware you
-trust, and don't put a logging CDN or WAF in front of it.
+trust, and don't put a logging CDN or WAF in front of it. The full picture, for the server and the app, is in
+[`docs/threat-model.md`](../docs/threat-model.md).
 
 ## Architecture
 
