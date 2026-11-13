@@ -8,6 +8,7 @@ import androidx.work.WorkManager
 import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.OutboxItem
 import app.goldfishsend.db.OutboxKind
+import app.goldfishsend.db.isGroup
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
@@ -75,7 +76,13 @@ object Outbox {
                         return@launch
                     }
                     try {
-                        parallel.withPermit { drainContact(s, cid) }
+                        parallel.withPermit {
+                            if (s.repo.isGroup(cid)) {
+                                GroupOutbox.drain(s, cid)
+                            } else {
+                                drainContact(s, cid)
+                            }
+                        }
                     } finally {
                         lock.unlock()
                     }

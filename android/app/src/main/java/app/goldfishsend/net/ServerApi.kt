@@ -69,6 +69,81 @@ data class ExpiresResponse(val expiresAt: String, val endpointGone: Boolean = fa
 @Serializable
 data class IdResponse(val id: String)
 
+/** One item of `POST /v1/messages/batch`. [ttlSeconds] null means the server default. */
+class BatchItem(val sendSecret: ByteArray, val idempotencyKey: ByteArray, val ttlSeconds: Long?, val blob: ByteArray)
+
+/** Per-item result: 202 with [id], or 404/429/507 with [error], [scope] and [retryAfter] (seconds). */
+@Serializable
+data class BatchResult(
+    val status: Int,
+    val id: String? = null,
+    val error: String? = null,
+    val scope: String? = null,
+    val retryAfter: Long? = null,
+)
+
+@Serializable
+data class BatchResponse(val results: List<BatchResult>)
+
+/** The server doesn't have `POST /v1/messages/batch`: send one by one. */
+class BatchUnsupportedException : IOException("batch send unsupported")
+
+/** `u8 count ‖ count × (sendSecret(32) ‖ idempotencyKey(16) ‖ u32 ttlSeconds ‖ u16 len ‖ blob)`, big-endian. */
+object MessageBatch {
+    const val MAX_ITEMS = 32
+    const val ITEM_HEADER = 32 + 16 + 4 + 2
+
+    /** Inner body budget: the gateway's 16 KiB inner body limit. */
+    const val MAX_BODY = 16 * 1024
+
+    fun size(blobs: List<Int>): Int = 1 + blobs.sumOf { ITEM_HEADER + it }
+
+    fun encode(items: List<BatchItem>): ByteArray {
+        require(items.size in 1..MAX_ITEMS) { "batch size" }
+        val out = java.io.ByteArrayOutputStream(size(items.map { it.blob.size }))
+        val d = java.io.DataOutputStream(out)
+        d.writeByte(items.size)
+        for (i in items) {
+            require(i.sendSecret.size == 32 && i.idempotencyKey.size == 16 && i.blob.size in 1..0xFFFF)
+            d.write(i.sendSecret)
+            d.write(i.idempotencyKey)
+            d.writeInt(((i.ttlSeconds ?: 0L).coerceIn(0L, 0xFFFFFFFFL)).toInt())
+            d.writeShort(i.blob.size)
+            d.write(i.blob)
+        }
+        d.flush()
+        return out.toByteArray()
+    }
+
+    /** The reverse of [encode], strict (used by tests and the in-memory server). Null if malformed. */
+    fun decode(body: ByteArray): List<BatchItem>? {
+        if (body.isEmpty()) {
+            return null
+        }
+        val count = body[0].toInt() and 0xff
+        if (count !in 1..MAX_ITEMS) {
+            return null
+        }
+        val buf = java.nio.ByteBuffer.wrap(body, 1, body.size - 1)
+        val items = ArrayList<BatchItem>(count)
+        repeat(count) {
+            if (buf.remaining() < ITEM_HEADER) {
+                return null
+            }
+            val secret = ByteArray(32).also { buf.get(it) }
+            val idem = ByteArray(16).also { buf.get(it) }
+            val ttl = buf.int.toLong() and 0xFFFFFFFFL
+            val len = buf.short.toInt() and 0xFFFF
+            if (len < 1 || buf.remaining() < len) {
+                return null
+            }
+            val blob = ByteArray(len).also { buf.get(it) }
+            items += BatchItem(secret, idem, if (ttl == 0L) null else ttl, blob)
+        }
+        return if (buf.remaining() == 0) items else null
+    }
+}
+
 @Serializable
 private data class ErrorBody(val error: String = "unknown", val scope: String? = null)
 
@@ -242,6 +317,34 @@ class ServerApi(
             }
             exchange("POST", "v1/messages", headers, blob) { r -> decode(r, IdResponse.serializer()).id }
         }
+
+    /**
+     * Sends up to 32 E2E blobs in one request (docs/groups.md, "Server: batch send"). Per-item results come back in order.
+     * A whole-batch failure throws [ApiException], to be retried as a whole with the same idempotency keys. A server
+     * without the endpoint throws [BatchUnsupportedException].
+     */
+    suspend fun sendBatch(items: List<BatchItem>, pow: String? = null): List<BatchResult> = withContext(Dispatchers.IO) {
+        val headers = mutableListOf("content-type" to OCTET_TYPE)
+        if (pow != null) {
+            headers += "gf-pow" to pow
+        }
+        try {
+            exchange("POST", "v1/messages/batch", headers, MessageBatch.encode(items)) { r ->
+                val results = decode(r, BatchResponse.serializer()).results
+                if (results.size != items.size) {
+                    throw ApiException("bad_server", 502, retryAfterSeconds = 60)
+                }
+                results
+            }
+        } catch (e: ApiException) {
+            // Through the gateway, an unknown inner route is a bare 404 from routing (no JSON error code), unlike a send's
+            // `not_found`.
+            if (e.status == 404 && e.code == "http_404") {
+                throw BatchUnsupportedException()
+            }
+            throw e
+        }
+    }
 
     suspend fun uploadInvite(blob: ByteArray, ttlSeconds: Long): String = withContext(Dispatchers.IO) {
         val headers = listOf("content-type" to OCTET_TYPE, "gf-ttl" to ttlSeconds.toString())

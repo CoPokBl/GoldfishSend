@@ -314,3 +314,8 @@ next multiple of 256. The maximum padded plaintext is 2048 B for PreKey messages
 | `timer` | `secs` | Sets the conversation's disappearing timer (0 = off) |
 | `delete` | `ids[]` | Delete for everyone (best effort) |
 | `mailbox` | `server`, `serverKey`, `sendSecret` | The sender moved its inbox for this contact |
+| `chunk` | `id`, `part`, `parts`, `data` | One part of any content too large for one message ([`docs/groups.md`](groups.md#chunking)) |
+| `g*` | see [`docs/groups.md`](groups.md) | Group content: invitations, forwarded cards and rosters arrive over 1:1 too |
+
+Group chats, their blob format (`0x12`/`0x13` plus a sender hint) and their content types are specified in
+[`docs/groups.md`](groups.md).

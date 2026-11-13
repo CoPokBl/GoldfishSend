@@ -55,6 +55,16 @@ class LiveServerDeviceTest {
     }
 
     @Test
+    fun batchSendReportsEachItem() = runBlocking {
+        assumeTrue(server != null && key != null)
+        val items = (1..3).map { app.goldfishsend.net.BatchItem(Rand.bytes(32), Rand.bytes(16), null, Rand.bytes(300)) }
+        val results = api().sendBatch(items)
+        assertEquals(3, results.size)
+        // Unknown mailboxes: each item fails on its own, the batch as a whole succeeds.
+        assertTrue(results.all { it.status == 404 })
+    }
+
+    @Test
     fun trustOnFirstUseLearnsTheRealKey() = runBlocking {
         assumeTrue(server != null && key != null)
         assertEquals(key, api(pin = null).identity())

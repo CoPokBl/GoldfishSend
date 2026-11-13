@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 4
+    const val VERSION = 5
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -209,9 +209,71 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 5) {
+                for (s in V5) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Group chats (docs/groups.md). A group is a `contacts` row with is_group = 1, so chats, timers and wipes cover it. */
+    internal val V5 = listOf(
+        "ALTER TABLE contacts ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0",
+        // The hint key of a group inbox (each inbox has its own; a rotated one keeps its old key while draining).
+        "ALTER TABLE mailboxes ADD COLUMN hint_key BLOB",
+        // Group fan-out: the member (identity key, b64u) this row goes to.
+        "ALTER TABLE outbox ADD COLUMN member_key TEXT",
+        // Group messages: who sent it (identity key, b64u), and how many members an outgoing one went to.
+        "ALTER TABLE messages ADD COLUMN sender_key TEXT",
+        "ALTER TABLE messages ADD COLUMN recipients INTEGER NOT NULL DEFAULT 0",
+        // A group's last-resort prekeys are reused by every member who starts a session, so they aren't deleted on use.
+        "ALTER TABLE sig_kyber_prekey ADD COLUMN last_resort INTEGER NOT NULL DEFAULT 0",
+        """CREATE TABLE groups (
+            cid INTEGER PRIMARY KEY REFERENCES contacts(id) ON DELETE CASCADE,
+            gid TEXT NOT NULL UNIQUE,
+            state INTEGER NOT NULL,
+            roster BLOB,
+            roster_sig BLOB,
+            my_card BLOB,
+            my_card_sig BLOB,
+            invited_by TEXT,
+            pending_op TEXT,
+            pending_hash TEXT,
+            rotate_needed INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )""",
+        """CREATE TABLE group_cards (
+            cid INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            member TEXT NOT NULL,
+            card BLOB NOT NULL,
+            sig BLOB NOT NULL,
+            seq INTEGER NOT NULL,
+            pending_server_key TEXT,
+            unreachable INTEGER NOT NULL DEFAULT 0,
+            -- No longer a member: kept only until what's queued to them (the roster that removed them) is delivered.
+            gone INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (cid, member)
+        )""",
+        """CREATE TABLE group_rosters (
+            cid INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            ver INTEGER NOT NULL,
+            hash TEXT NOT NULL,
+            roster BLOB NOT NULL,
+            sig BLOB NOT NULL,
+            PRIMARY KEY (cid, hash)
+        )""",
+        """CREATE TABLE group_held (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cid INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            hint_key BLOB NOT NULL,
+            blob BLOB NOT NULL,
+            received_at INTEGER NOT NULL
+        )""",
+        // Read receipts per member for our outgoing group messages.
+        "CREATE TABLE group_receipts (message_id TEXT NOT NULL, member TEXT NOT NULL, PRIMARY KEY (message_id, member))",
+    )
 
     /** Server identity pins (gateway v1). */
     internal val V4 = listOf(

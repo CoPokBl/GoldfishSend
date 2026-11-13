@@ -83,6 +83,7 @@ import app.goldfishsend.core.timerLabel
 import app.goldfishsend.db.Message
 import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
+import app.goldfishsend.db.groupReaders
 import app.goldfishsend.security.ClipboardGuard
 import app.goldfishsend.ui.components.Avatar
 import app.goldfishsend.ui.components.FieldKind
@@ -141,23 +142,41 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
     }
 
     val c = contact
+    val group by rememberQuery(s, contactId) { q -> if (q.repo.contact(contactId)?.isGroup == true) chatGroup(q, contactId) else null }
+    val isGroup = c?.isGroup == true
+    val g = group
+    val snackbar = remember { androidx.compose.material3.SnackbarHostState() }
+    val canSetTimer = !isGroup || (g != null && g.canEdit)
     Scaffold(
+        snackbarHost = { androidx.compose.material3.SnackbarHost(snackbar) },
         topBar = {
             TopAppBar(
                 navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
                 title = {
                     Row(Modifier.clickable(onClick = openInfo), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(c?.name ?: "", contactId, 36.dp)
+                        if (isGroup) {
+                            app.goldfishsend.ui.components.GroupAvatar(contactId, 36.dp)
+                        } else {
+                            Avatar(c?.name ?: "", contactId, 36.dp)
+                        }
                         Spacer(Modifier.width(12.dp))
                         Column {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(c?.name ?: "", maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                                if (c?.verified == true) {
+                                if (c?.verified == true && !isGroup) {
                                     Spacer(Modifier.width(4.dp))
                                     Icon(Icons.Rounded.Verified, "Verified", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                                 }
                             }
-                            if (c != null && c.timerSecs > 0) {
+                            if (g != null) {
+                                Text(
+                                    g.subtitle + if ((c?.timerSecs ?: 0) > 0) " · disappearing: ${timerLabel(c!!.timerSecs).lowercase()}" else "",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            } else if (c != null && c.timerSecs > 0) {
                                 Text(
                                     "Disappearing: ${timerLabel(c.timerSecs).lowercase()}",
                                     style = MaterialTheme.typography.labelSmall,
@@ -168,7 +187,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                     }
                 },
                 actions = {
-                    Box {
+                    if (canSetTimer) Box {
                         IconButton(onClick = { timerMenu = true }) {
                             Icon(if ((c?.timerSecs ?: 0) > 0) Icons.Rounded.Timer else Icons.Rounded.TimerOff, "Disappearing messages")
                         }
@@ -186,7 +205,13 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                                     } else null,
                                     onClick = {
                                         timerMenu = false
-                                        scope.launch(Dispatchers.IO) { Messenger.setTimer(s, contactId, secs) }
+                                        scope.launch(Dispatchers.IO) {
+                                            if (isGroup) {
+                                                app.goldfishsend.core.Groups.setTimer(s, contactId, secs)
+                                            } else {
+                                                Messenger.setTimer(s, contactId, secs)
+                                            }
+                                        }
                                     },
                                 )
                             }
@@ -203,7 +228,9 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                 .fillMaxSize()
                 .imePadding(),
         ) {
-            if (c != null && c.pendingServerKey != null) {
+            if (isGroup) {
+                // Groups: membership notices are system lines; delivery issues show per member in group info.
+            } else if (c != null && c.pendingServerKey != null) {
                 Banner("Can't verify ${c.name}'s server. Messages will wait until it's sorted out. Tap to review.", onClick = openInfo)
             } else if (c != null && c.unreachable) {
                 Banner("This contact can't be reached right now. They may have removed you.")
@@ -225,6 +252,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                             Bubble(
                                 m, now,
                                 Modifier.animateItem(),
+                                sender = if (g != null && !m.outgoing) m.senderKey?.let { k -> (g.names[k] ?: "Former member") to k } else null,
                                 onLongPress = { selected = m },
                                 onTap = {
                                     if (m.viewOnce && !m.outgoing) {
@@ -252,13 +280,27 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                     }
                 }
             }
-            Composer(draft, { draft = it }) {
-                val text = draft.trim()
-                if (text.isNotEmpty()) {
-                    draft = ""
-                    scope.launch {
-                        withContext(Dispatchers.IO) { Messenger.sendText(s, contactId, text) }
-                        listState.animateScrollToItem(0)
+            when (g?.state) {
+                app.goldfishsend.group.GroupModel.INVITED -> GroupInvitationBar(
+                    s, contactId, g.inviter,
+                    onError = { msg -> scope.launch { snackbar.showSnackbar(msg) } },
+                    onDeclined = back,
+                )
+                app.goldfishsend.group.GroupModel.REMOVED, app.goldfishsend.group.GroupModel.LEFT -> Banner(
+                    if (g.state == app.goldfishsend.group.GroupModel.REMOVED) {
+                        "You were removed from this group, so you can't send messages here."
+                    } else {
+                        "You left this group, so you can't send messages here."
+                    },
+                )
+                else -> Composer(draft, { draft = it }) {
+                    val text = draft.trim()
+                    if (text.isNotEmpty()) {
+                        draft = ""
+                        scope.launch {
+                            withContext(Dispatchers.IO) { Messenger.sendText(s, contactId, text) }
+                            listState.animateScrollToItem(0)
+                        }
                     }
                 }
             }
@@ -276,7 +318,10 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
             onRetry = { scope.launch(Dispatchers.IO) { Outbox.retry(s, m.id) } },
         )
     }
-    info?.let { m -> MessageInfo(m) { info = null } }
+    info?.let { m ->
+        val readers by rememberQuery(s, m.id) { q -> if (isGroup && m.outgoing) q.repo.groupReaders(m.id).size else null }
+        MessageInfo(m, readers) { info = null }
+    }
     viewing?.let { body ->
         AlertDialog(
             onDismissRequest = { viewing = null },
@@ -316,9 +361,29 @@ private fun SystemChip(text: String, modifier: Modifier) {
     }
 }
 
+/** A group as the chat screen needs it: our state, who invited us, member names and whether we may edit its info. */
+private class ChatGroup(val state: Int, val inviter: String, val names: Map<String, String>, val canEdit: Boolean, val subtitle: String)
+
+private fun chatGroup(s: Session, cid: Long): ChatGroup? {
+    val m = app.goldfishsend.core.Groups.model(s, cid) ?: return null
+    val r = m.roster?.roster ?: return null
+    val me = app.goldfishsend.core.Groups.me(s)
+    val names = r.members.associate { it.id to app.goldfishsend.core.Groups.memberName(s, m, it.id).name }
+    val inviter = m.invitedBy?.let { app.goldfishsend.core.Groups.memberName(s, m, it).name } ?: "Someone"
+    val active = r.members.count { it.role != app.goldfishsend.proto.Role.INVITED }
+    return ChatGroup(m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), "$active ${if (active == 1) "member" else "members"}")
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: Message, now: Long, modifier: Modifier, onLongPress: () -> Unit, onTap: () -> Unit) {
+private fun Bubble(
+    m: Message,
+    now: Long,
+    modifier: Modifier,
+    sender: Pair<String, String>? = null,
+    onLongPress: () -> Unit,
+    onTap: () -> Unit,
+) {
     val out = m.outgoing
     val bg = if (out) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest
     val fg = if (out) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
@@ -332,6 +397,15 @@ private fun Bubble(m: Message, now: Long, modifier: Modifier, onLongPress: () ->
                 .combinedClickable(onClick = onTap, onLongClick = onLongPress)
                 .padding(start = 14.dp, end = 12.dp, top = 9.dp, bottom = 6.dp),
         ) {
+            sender?.let { (name, key) ->
+                Text(
+                    name,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = app.goldfishsend.ui.components.memberColor(key),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             if (m.viewOnce && !out) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Rounded.Visibility, null, Modifier.size(18.dp), tint = fg)
@@ -440,7 +514,7 @@ private fun MessageActions(
 }
 
 @Composable
-private fun MessageInfo(m: Message, onDismiss: () -> Unit) {
+private fun MessageInfo(m: Message, readers: Int? = null, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Message info") },
@@ -460,6 +534,9 @@ private fun MessageInfo(m: Message, onDismiss: () -> Unit) {
                             else -> "Not sent"
                         },
                     )
+                    if (readers != null && m.recipients > 0) {
+                        InfoLine("Read by", "$readers of ${m.recipients}")
+                    }
                 }
                 if (m.expSecs > 0) {
                     InfoLine("Disappears", m.expiresAt?.let { fullTime(it) } ?: "${formatTimer(m.expSecs)} after reading")

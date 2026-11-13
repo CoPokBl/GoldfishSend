@@ -11,6 +11,8 @@ import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
+import app.goldfishsend.proto.GroupBlob
+import app.goldfishsend.db.memberRoutes
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.PushEnvelope
 import app.goldfishsend.proto.Sanitize
@@ -66,6 +68,13 @@ object Messenger {
 
     private suspend fun receive(s: Session, tag: ByteArray, raw: ByteArray) {
         val mb = s.repo.mailboxByTag(tag) ?: return
+        if (mb.purpose == Mailbox.PURPOSE_GROUP) {
+            // A group inbox: only group blobs (docs/groups.md), from whichever member the sender hint names.
+            if (GroupBlob.isGroup(raw)) {
+                Groups.receive(s, mb, raw)
+            }
+            return
+        }
         val blob = E2eBlob.decode(raw) ?: return
         val d = try {
             s.lock.withLock { decrypt(s, mb, blob) }
@@ -131,7 +140,30 @@ object Messenger {
 
     private suspend fun dispatch(s: Session, d: Decrypted) {
         val cid = d.contactId
-        when (val c = d.content) {
+        val c0 = d.content
+        if (c0 is Content.Chunk) {
+            // Any content split into parts (docs/groups.md, "Chunking"): reassemble, then handle the whole.
+            if (c0.parts !in 2..Chunker.MAX_PARTS || c0.part !in 0 until c0.parts || c0.data.length > 4096) {
+                return
+            }
+            val key = "k:" + c0.id.take(32)
+            s.repo.storeChunk(cid, key, c0.part, c0.parts, c0.data)
+            val joined = s.repo.assembleChunks(cid, key, c0.parts) ?: return
+            val inner = runCatching { Content.decode(B64.dec(joined)) }.getOrNull() ?: return
+            if (inner !is Content.Chunk && inner !is Content.Hello) {
+                dispatch(s, Decrypted(cid, inner, false))
+            }
+            return
+        }
+        if (c0.groupId != null) {
+            // Group content over our 1:1 session: invitations, forwarded cards, rosters while invited.
+            s.lock.withLock { s.db.tx { Groups.onDirect(s, cid, c0) } }
+            Outbox.kick()
+            return
+        }
+        when (val c = c0) {
+            is Content.Chunk, is Content.GText, is Content.GReceipt, is Content.GDelete, is Content.GRoster,
+            is Content.GCard, is Content.GSync, is Content.GLeave -> Unit
             is Content.Hello -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
                 if (secret == null || secret.size != 32 || !ServerApi.isValidContactServer(c.server)) {
@@ -285,7 +317,7 @@ object Messenger {
      * Hidden chats post nothing, unless the user allowed it and this isn't a decoy session. Even then the notification
      * is generic, with no name and no text.
      */
-    private fun notify(s: Session, cid: Long, text: String?) {
+    internal fun notify(s: Session, cid: Long, text: String?) {
         val c = s.repo.contact(cid)
         if (c?.hidden == true) {
             if (Graph.prefs.notifyHiddenChats && !s.decoy) {
@@ -302,6 +334,10 @@ object Messenger {
 
     fun sendText(s: Session, cid: Long, body: String, viewOnce: Boolean = false) {
         val contact = s.repo.contact(cid) ?: return
+        if (contact.isGroup) {
+            Groups.sendText(s, cid, body, viewOnce)
+            return
+        }
         val wire = Content.newId()
         val now = System.currentTimeMillis()
         val exp = contact.timerSecs
@@ -331,6 +367,10 @@ object Messenger {
         val cutoff = System.currentTimeMillis() - 6 * 3600_000L
         for (m in s.repo.unreceipted(cutoff, 3)) {
             val c = s.repo.contact(m.contactId) ?: continue
+            // Groups don't send delivery receipts (docs/groups.md), so "no receipt" means nothing there.
+            if (c.isGroup) {
+                continue
+            }
             s.repo.incrementResend(m.id)
             enqueueText(s, c.receivedAny, m.contactId, m.id, m.wireId, m.body, m.ts, m.expSecs, m.viewOnce)
         }
@@ -340,12 +380,27 @@ object Messenger {
     /** Re-queues an existing outgoing message's content (manual retry). */
     fun sendControlRaw(s: Session, m: app.goldfishsend.db.Message) {
         val c = s.repo.contact(m.contactId) ?: return
+        if (c.isGroup) {
+            Groups.resend(s, m)
+            s.db.notifyChanged()
+            return
+        }
         enqueueText(s, c.receivedAny, m.contactId, m.id, m.wireId, m.body, m.ts, m.expSecs, m.viewOnce)
         s.db.notifyChanged()
     }
 
     fun sendControl(s: Session, cid: Long, content: Content) {
         s.repo.enqueue(cid, null, OutboxKind.CONTENT, content.encode())
+        Outbox.kick()
+    }
+
+    /** Control content that may not fit one message (group cards, rosters): split into `chunk` parts if needed. */
+    fun sendControlChunked(s: Session, cid: Long, content: Content) {
+        val c = s.repo.contact(cid) ?: return
+        val max = if (c.receivedAny) Padding.MAX_PLAINTEXT else Padding.MAX_PREKEY_PLAINTEXT
+        for (p in Chunker.splitContent(content, max)) {
+            s.repo.enqueue(cid, null, OutboxKind.CONTENT, p.encode())
+        }
         Outbox.kick()
     }
 
@@ -359,7 +414,11 @@ object Messenger {
     fun deleteForEveryone(s: Session, messageId: String) {
         val m = s.repo.message(messageId) ?: return
         if (m.outgoing) {
-            sendControl(s, m.contactId, Content.Delete(listOf(m.wireId)))
+            if (s.repo.contact(m.contactId)?.isGroup == true) {
+                Groups.deleteForEveryone(s, m.contactId, m.wireId)
+            } else {
+                sendControl(s, m.contactId, Content.Delete(listOf(m.wireId)))
+            }
         }
         s.repo.deleteMessage(messageId)
         s.db.notifyChanged()
@@ -390,7 +449,9 @@ object Messenger {
     fun markChatRead(s: Session, cid: Long) {
         val ids = s.repo.markRead(cid, System.currentTimeMillis())
         if (ids.isNotEmpty()) {
-            if (Graph.prefs.readReceipts) {
+            if (s.repo.contact(cid)?.isGroup == true) {
+                Groups.sendReadReceipts(s, cid, ids)
+            } else if (Graph.prefs.readReceipts) {
                 sendControl(s, cid, Content.Receipt(ids, Content.Receipt.READ))
             }
             Sweeper.schedule(s)
@@ -401,9 +462,20 @@ object Messenger {
 
     /** Deletes a contact everywhere: our inbound mailbox on the server (best effort), then local state. */
     suspend fun deleteContact(s: Session, cid: Long) {
+        val members = if (s.repo.contact(cid)?.isGroup == true) {
+            // Leave first (best effort), so the others stop sending to us, and try to get the goodbyes out.
+            runCatching { Groups.leave(s, cid) }
+            runCatching { Outbox.process(s) }
+            s.repo.memberRoutes(cid).keys
+        } else {
+            emptySet()
+        }
         // All of them, including mailboxes replaced by rotation that are still draining.
         val boxes = s.repo.mailboxesForContact(cid)
         s.repo.deleteContact(cid)
+        if (members.isNotEmpty()) {
+            s.lock.withLock { Groups.forgetSessions(s, members) }
+        }
         s.repo.markNeedsVacuum()
         s.db.notifyChanged()
         Notifier.cancel(Graph.app)

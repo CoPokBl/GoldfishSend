@@ -26,6 +26,8 @@ data class Contact(
     val outServerKey: String? = null,
     /** A different fingerprint [outServer] presented. Messages to this contact wait until it's resolved. */
     val pendingServerKey: String? = null,
+    /** A group chat (docs/groups.md): [name] is the group name, [timerSecs] the group timer. */
+    val isGroup: Boolean = false,
 ) {
     val ready: Boolean
         get() = outServer != null && outSecret != null
@@ -50,11 +52,14 @@ data class Mailbox(
     /** The signed prekey id published in this mailbox's invite. A first hello must use exactly this prekey. */
     val inviteSpkId: Int? = null,
     val inviteKyberId: Int? = null,
+    /** A group inbox's hint key (docs/groups.md, "Blob"). Null for 1:1 mailboxes. */
+    val hintKey: ByteArray? = null,
 ) {
     companion object {
         const val PURPOSE_QR = 0
         const val PURPOSE_LINK = 1
         const val PURPOSE_CONTACT = 2
+        const val PURPOSE_GROUP = 3
 
         const val STATE_CREATING = 0
         const val STATE_PENDING_VERIFY = 1
@@ -89,9 +94,21 @@ data class Message(
     val viewOnce: Boolean,
     val expiresAt: Long?,
     val status: Int,
+    /** Groups: the sender of an incoming message (identity key, b64u). */
+    val senderKey: String? = null,
+    /** Groups: how many members an outgoing message was sent to. */
+    val recipients: Int = 0,
 )
 
-data class ChatSummary(val contact: Contact, val lastBody: String?, val lastTs: Long?, val lastOutgoing: Boolean, val lastStatus: Int)
+data class ChatSummary(
+    val contact: Contact,
+    val lastBody: String?,
+    val lastTs: Long?,
+    val lastOutgoing: Boolean,
+    val lastStatus: Int,
+    /** Groups: who sent the last message (identity key, b64u). */
+    val lastSender: String? = null,
+)
 
 object OutboxKind {
     const val CONTENT = 0
@@ -108,6 +125,8 @@ data class OutboxItem(
     val idem: ByteArray,
     val attempts: Int,
     val nextAt: Long,
+    /** Group fan-out: the member this row goes to (identity key, b64u). Null for 1:1 rows. */
+    val memberKey: String? = null,
 )
 
 /** Typed data access over [Db]. Message bodies are always stored through [MessageVault]. */
@@ -157,15 +176,33 @@ class Repo(val db: Db, private val vault: MessageVault) {
         hidden = c.getInt(13) != 0,
         outServerKey = if (c.isNull(14)) null else c.getString(14),
         pendingServerKey = if (c.isNull(15)) null else c.getString(15),
+        isGroup = c.getInt(16) != 0,
     )
 
     private val contactCols =
         "id, name, identity_key, verified, timer_secs, out_server, out_secret, received_any, unreachable, created_at, last_activity, unread, " +
-            "pending_identity, hidden, out_server_key, pending_server_key"
+            "pending_identity, hidden, out_server_key, pending_server_key, is_group"
 
     fun contact(id: Long): Contact? = db.queryOne("SELECT $contactCols FROM contacts WHERE id = ?", id, map = ::contact)
 
+    /** Every chat: people and groups. */
     fun contacts(): List<Contact> = db.query("SELECT $contactCols FROM contacts ORDER BY last_activity DESC", map = ::contact)
+
+    /** People only (1:1 contacts), without group chats. */
+    fun people(): List<Contact> = db.query("SELECT $contactCols FROM contacts WHERE is_group = 0 ORDER BY name COLLATE NOCASE", map = ::contact)
+
+    /** The 1:1 contact with this identity key (b64u), if any. */
+    fun personByIdentity(identityKey: ByteArray): Contact? =
+        db.queryOne("SELECT $contactCols FROM contacts WHERE is_group = 0 AND identity_key = ?", identityKey, map = ::contact)
+
+    /** A new group chat row (name and timer from its roster). */
+    fun createGroupContact(name: String, timerSecs: Long): Long {
+        val now = System.currentTimeMillis()
+        return db.insert(
+            "INSERT INTO contacts (name, verified, timer_secs, is_group, created_at, last_activity) VALUES (?, 1, ?, 1, ?, ?)",
+            Sanitize.name(name) ?: "Group", timerSecs, now, now,
+        )
+    }
 
     fun createContact(
         name: String,
@@ -262,11 +299,12 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun clearUnread(id: Long) = db.exec("UPDATE contacts SET unread = 0 WHERE id = ?", id)
 
-    fun unverifiedCount(): Long = db.long("SELECT COUNT(*) FROM contacts WHERE verified = 0")
+    fun unverifiedCount(): Long = db.long("SELECT COUNT(*) FROM contacts WHERE verified = 0 AND is_group = 0")
 
-    /** Deletes the contact, all its messages (shredding keys first), session state and outbox rows. */
+    /** Deletes the contact, all its messages (shredding keys first), session state and outbox rows. Group rows cascade. */
     fun deleteContact(id: Long) {
         db.tx {
+            db.exec("DELETE FROM group_receipts WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", id)
             db.exec("DELETE FROM message_keys WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", id)
             db.exec("DELETE FROM messages WHERE contact_id = ?", id)
             db.exec("DELETE FROM chunks WHERE contact_id = ?", id)
@@ -282,7 +320,8 @@ class Repo(val db: Db, private val vault: MessageVault) {
         val contacts = contacts()
         return contacts.map { c ->
             val last = db.queryOne(
-                "SELECT m.id, m.ciphertext, mk.key, m.ts, m.outgoing, m.status, m.view_once, m.kind, mk.bucket FROM messages m JOIN message_keys mk ON mk.message_id = m.id " +
+                "SELECT m.id, m.ciphertext, mk.key, m.ts, m.outgoing, m.status, m.view_once, m.kind, mk.bucket, m.sender_key FROM messages m " +
+                    "JOIN message_keys mk ON mk.message_id = m.id " +
                     "WHERE m.contact_id = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY m.ts DESC LIMIT 1",
                 c.id, now,
             ) { cur ->
@@ -291,7 +330,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
                 } else {
                     openBody(cur.getString(0), cur.getBlob(2), cur.getBlob(1), if (cur.isNull(8)) null else cur.getLong(8))
                 }
-                ChatSummary(c, body, cur.getLong(3), cur.getInt(4) != 0, cur.getInt(5))
+                ChatSummary(c, body, cur.getLong(3), cur.getInt(4) != 0, cur.getInt(5), if (cur.isNull(9)) null else cur.getString(9))
             }
             last ?: ChatSummary(c, null, null, false, 0)
         }
@@ -306,7 +345,8 @@ class Repo(val db: Db, private val vault: MessageVault) {
     }
 
     private val msgCols =
-        "m.id, m.contact_id, m.wire_id, m.outgoing, m.kind, m.ciphertext, mk.key, m.ts, m.received_at, m.read_at, m.exp_secs, m.view_once, m.expires_at, m.status, mk.bucket"
+        "m.id, m.contact_id, m.wire_id, m.outgoing, m.kind, m.ciphertext, mk.key, m.ts, m.received_at, m.read_at, m.exp_secs, m.view_once, m.expires_at, m.status, mk.bucket, " +
+            "m.sender_key, m.recipients"
 
     private fun message(c: Cursor) = Message(
         id = c.getString(0),
@@ -322,6 +362,8 @@ class Repo(val db: Db, private val vault: MessageVault) {
         viewOnce = c.getInt(11) != 0,
         expiresAt = if (c.isNull(12)) null else c.getLong(12),
         status = c.getInt(13),
+        senderKey = if (c.isNull(15)) null else c.getString(15),
+        recipients = c.getInt(16),
     )
 
     /** Expired messages are filtered at query time, so nothing expired is ever shown even if the sweeper is late. */
@@ -353,6 +395,8 @@ class Repo(val db: Db, private val vault: MessageVault) {
         viewOnce: Boolean,
         expiresAt: Long?,
         status: Int,
+        senderKey: String? = null,
+        recipients: Int = 0,
     ): String? {
         if (db.long("SELECT COUNT(*) FROM messages WHERE contact_id = ? AND wire_id = ? AND outgoing = ?", contactId, wireId, outgoing) > 0) {
             return null
@@ -361,9 +405,9 @@ class Repo(val db: Db, private val vault: MessageVault) {
         val sealed = vault.seal(id, body.toByteArray(Charsets.UTF_8), expiresAt)
         db.tx {
             db.exec(
-                "INSERT INTO messages (id, contact_id, wire_id, outgoing, kind, ciphertext, ts, received_at, exp_secs, view_once, expires_at, status) " +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                id, contactId, wireId, outgoing, kind, sealed.ciphertext, ts, receivedAt, expSecs, viewOnce, expiresAt, status,
+                "INSERT INTO messages (id, contact_id, wire_id, outgoing, kind, ciphertext, ts, received_at, exp_secs, view_once, expires_at, status, " +
+                    "sender_key, recipients) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                id, contactId, wireId, outgoing, kind, sealed.ciphertext, ts, receivedAt, expSecs, viewOnce, expiresAt, status, senderKey, recipients,
             )
             db.exec("INSERT INTO message_keys (message_id, key, bucket) VALUES (?, ?, ?)", id, sealed.wrappedKey, sealed.bucket)
         }
@@ -428,6 +472,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun deleteMessage(id: String) {
         db.tx {
+            db.exec("DELETE FROM group_receipts WHERE message_id = ?", id)
             db.exec("DELETE FROM message_keys WHERE message_id = ?", id)
             db.exec("DELETE FROM outbox WHERE message_id = ?", id)
             db.exec("DELETE FROM messages WHERE id = ?", id)
@@ -462,6 +507,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun clearConversation(contactId: Long) {
         db.tx {
+            db.exec("DELETE FROM group_receipts WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
             db.exec("DELETE FROM message_keys WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
             db.exec("DELETE FROM messages WHERE contact_id = ?", contactId)
         }
@@ -470,10 +516,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
     /** Deletes every message and its key. The contacts and sessions stay. */
     fun wipeAllMessages() {
         db.tx {
+            db.exec("DELETE FROM group_receipts")
             db.exec("DELETE FROM message_keys")
             db.exec("DELETE FROM messages")
             db.exec("DELETE FROM chunks")
-            db.exec("DELETE FROM outbox WHERE kind = ?", OutboxKind.CONTENT)
+            // Undelivered group messages that arrived before their sender's roster are messages too.
+            db.exec("DELETE FROM group_held")
+            // Group membership traffic (rosters, cards) isn't a message: keep it so the groups stay consistent.
+            db.exec("DELETE FROM outbox WHERE kind = ? AND (member_key IS NULL OR message_id IS NOT NULL)", OutboxKind.CONTENT)
             db.exec("UPDATE contacts SET unread = 0")
             db.exec("DELETE FROM kv WHERE k LIKE 'bk/%'")
         }
@@ -541,11 +591,22 @@ class Repo(val db: Db, private val vault: MessageVault) {
         drainUntil = if (c.isNull(12)) null else c.getLong(12),
         inviteSpkId = if (c.isNull(13)) null else c.getInt(13),
         inviteKyberId = if (c.isNull(14)) null else c.getInt(14),
+        hintKey = if (c.isNull(15)) null else c.getBlob(15),
     )
 
     private val mbCols =
         "id, contact_id, purpose, send_secret, owner_secret, tag, state, expires_at, created_at, invite_used, invite_expires_at, " +
-            "replaced_at, drain_until, invite_spk_id, invite_kyber_id"
+            "replaced_at, drain_until, invite_spk_id, invite_kyber_id, hint_key"
+
+    /** Binds a claimed mailbox to a group as its inbox, with its hint key. */
+    fun bindGroupInbox(id: Long, groupCid: Long, hintKey: ByteArray) = db.exec(
+        "UPDATE mailboxes SET contact_id = ?, invite_used = 1, purpose = ?, hint_key = ?, created_at = ? WHERE id = ?",
+        groupCid, Mailbox.PURPOSE_GROUP, hintKey, System.currentTimeMillis(), id,
+    )
+
+    /** A group inbox replaced by a fresh one: it keeps receiving until in-flight messages (max TTL) have arrived, then goes. */
+    fun retireGroupInbox(id: Long, now: Long, drainUntil: Long) =
+        db.exec("UPDATE mailboxes SET replaced_at = ?, drain_until = ? WHERE id = ?", now, drainUntil, id)
 
     fun mailboxByTag(tag: ByteArray): Mailbox? = db.queryOne("SELECT $mbCols FROM mailboxes WHERE tag = ?", tag, map = ::mailbox)
 
@@ -673,12 +734,12 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     // --- outbox ---
 
-    fun enqueue(contactId: Long, messageId: String?, kind: Int, content: ByteArray?): Long {
+    fun enqueue(contactId: Long, messageId: String?, kind: Int, content: ByteArray?, memberKey: String? = null): Long {
         val now = System.currentTimeMillis()
         val sealed = content?.let { vault.sealBlob("outbox", it) }
         return db.insert(
-            "INSERT INTO outbox (contact_id, message_id, kind, content, idem, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            contactId, messageId, kind, sealed, Rand.bytes(16), now, now,
+            "INSERT INTO outbox (contact_id, message_id, kind, content, idem, next_at, created_at, member_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            contactId, messageId, kind, sealed, Rand.bytes(16), now, now, memberKey,
         )
     }
 
@@ -694,11 +755,24 @@ class Repo(val db: Db, private val vault: MessageVault) {
         idem = c.getBlob(6),
         attempts = c.getInt(7),
         nextAt = c.getLong(8),
+        memberKey = if (c.isNull(9)) null else c.getString(9),
     )
 
-    fun outboxAll(): List<OutboxItem> = db.query(
-        "SELECT seq, contact_id, message_id, kind, content, blob, idem, attempts, next_at FROM outbox ORDER BY contact_id, seq", map = ::outbox,
-    )
+    private val outboxCols = "seq, contact_id, message_id, kind, content, blob, idem, attempts, next_at, member_key"
+
+    fun outboxAll(): List<OutboxItem> = db.query("SELECT $outboxCols FROM outbox ORDER BY contact_id, seq", map = ::outbox)
+
+    fun outboxFor(contactId: Long): List<OutboxItem> =
+        db.query("SELECT $outboxCols FROM outbox WHERE contact_id = ? ORDER BY seq", contactId, map = ::outbox)
+
+    /** Drops every queued row to one group member (removed, left, or their inbox is gone). Returns the affected message ids. */
+    fun outboxDropMember(contactId: Long, memberKey: String): List<String> {
+        val ids = db.query(
+            "SELECT DISTINCT message_id FROM outbox WHERE contact_id = ? AND member_key = ? AND message_id IS NOT NULL", contactId, memberKey,
+        ) { it.getString(0) }
+        db.exec("DELETE FROM outbox WHERE contact_id = ? AND member_key = ?", contactId, memberKey)
+        return ids
+    }
 
     fun outboxSetBlob(seq: Long, blob: ByteArray) = db.exec("UPDATE outbox SET blob = ?, content = NULL WHERE seq = ?", blob, seq)
 

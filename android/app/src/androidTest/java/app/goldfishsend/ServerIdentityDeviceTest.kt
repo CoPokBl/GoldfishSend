@@ -51,7 +51,8 @@ class ServerIdentityDeviceTest {
         val keep = mk.copyOf()
         var s = Graph.openSession(mk)
         val cid = s.repo.createContact("Bob", true, 0, "https://bob.example", ByteArray(32) { 9 })
-        // Turn this into a version-3 database: without the v4 columns.
+        // Turn this into a version-3 database: without the v4 (and v5) columns.
+        downgradeToV4(s.db)
         s.db.exec("ALTER TABLE contacts DROP COLUMN out_server_key")
         s.db.exec("ALTER TABLE contacts DROP COLUMN pending_server_key")
         s.db.exec("PRAGMA user_version = 3")
