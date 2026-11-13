@@ -161,7 +161,7 @@ fun NewGroupScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                         val r = withContext(Dispatchers.IO) { runCatching { Groups.create(s, name, picked.toList()) } }
                         busy = false
                         r.onSuccess(openChat).onFailure {
-                            snackbar.showSnackbar((it as? GroupException)?.human ?: "Couldn't create the group. Try again.")
+                            snackbar.showSnackbar(groupError(it, "Couldn't create the group. Try again."))
                         }
                     }
                 },
@@ -234,7 +234,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     fun act(block: suspend () -> Unit) {
         scope.launch {
             val res = withContext(Dispatchers.IO) { runCatching { block() } }
-            res.onFailure { snackbar.showSnackbar((it as? GroupException)?.human ?: "Something went wrong. Try again.") }
+            res.onFailure { snackbar.showSnackbar(groupError(it, "Something went wrong. Try again.")) }
         }
     }
 
@@ -543,7 +543,7 @@ fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String)
                     scope.launch {
                         val r = withContext(Dispatchers.IO) { runCatching { Groups.join(s, cid) } }
                         busy = false
-                        r.onFailure { onError((it as? GroupException)?.human ?: "Couldn't join. Try again.") }
+                        r.onFailure { onError(groupError(it, "Couldn't join. Try again.")) }
                     }
                 }, modifier = Modifier.weight(1f).blockWhenObscured()) {
                     if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Text("Join")
@@ -551,4 +551,13 @@ fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String)
             }
         }
     }
+}
+
+/** The message to show for a failed group action. Unexpected errors are logged by class (with the stack in debug builds). */
+private fun groupError(e: Throwable, fallback: String): String {
+    if (e is GroupException) {
+        return e.human
+    }
+    android.util.Log.w("GoldfishSend", "group action failed: ${e.javaClass.simpleName}", e.takeIf { app.goldfishsend.BuildConfig.DEBUG })
+    return fallback
 }

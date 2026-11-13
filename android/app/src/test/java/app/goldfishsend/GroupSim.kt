@@ -113,10 +113,18 @@ class GroupNet {
 
     var dropped = 0
 
+    /** Reorders what's queued at the start of [deliverAll] (pushes aren't ordered). */
+    var reorder: ((List<Envelope>) -> List<Envelope>)? = null
+
     fun peer(name: String): Peer = Peer(name, this).also { peers += it }
 
     /** Delivers everything queued (and whatever that causes), in order. */
     fun deliverAll(limit: Int = 100_000) {
+        reorder?.let { r ->
+            val batch = r(queue.toList())
+            queue.clear()
+            queue.addAll(batch)
+        }
         var n = 0
         while (queue.isNotEmpty()) {
             check(n++ < limit) { "message storm" }
@@ -197,11 +205,31 @@ class Peer(val name: String, private val net: GroupNet) {
     fun publish(gid: String, op: app.goldfishsend.proto.RosterOp) = engine.publish(model(gid), op)
 
     /** What the app does for a text: one gtext per member with a card. */
+    /** Like the app: every active member gets it, and members whose card we don't have yet get it once it arrives. */
     fun say(gid: String, body: String) {
         val m = model(gid)
         check(m.state == GroupModel.JOINED)
-        for (to in m.cards.keys) {
-            sendGroup(gid, to, Content.GText(gid, Content.newId(), body, System.currentTimeMillis()))
+        val content = Content.GText(gid, Content.newId(), body, System.currentTimeMillis())
+        val r = m.roster!!.roster
+        for (to in r.members.map { it.id }.filter { it != id && r.isActive(it) }) {
+            if (m.cards[to] != null) {
+                sendGroup(gid, to, content)
+            } else {
+                waiting += Triple(gid, to, content)
+            }
+        }
+    }
+
+    private val waiting = mutableListOf<Triple<String, String, Content>>()
+
+    private fun flushWaiting() {
+        val it = waiting.iterator()
+        while (it.hasNext()) {
+            val (g, to, content) = it.next()
+            if (store.load(g)?.cards?.get(to) != null) {
+                it.remove()
+                sendGroup(g, to, content)
+            }
         }
     }
 
@@ -228,6 +256,7 @@ class Peer(val name: String, private val net: GroupNet) {
         while (deferred.isNotEmpty()) {
             deferred.removeFirst()()
         }
+        flushWaiting()
     }
 
     fun roster(gid: String) = model(gid).roster!!

@@ -58,11 +58,21 @@ data class InviteLink(val server: String, val serverKey: String, val id: String,
     companion object {
         const val SCHEME_PREFIX = "gfsend://invite"
 
-        private fun params(raw: String): Map<String, String>? {
-            val text = raw.trim()
-            if (!text.startsWith(SCHEME_PREFIX)) {
+        /**
+         * The link inside [raw]. People often copy the whole shared message ("Let's chat… gfsend://invite#…"), so the
+         * link may be surrounded by other text. It runs up to the first whitespace.
+         */
+        private fun extract(raw: String): String? {
+            val start = raw.indexOf(SCHEME_PREFIX)
+            if (start < 0) {
                 return null
             }
+            val end = (start until raw.length).firstOrNull { raw[it].isWhitespace() } ?: raw.length
+            return raw.substring(start, end)
+        }
+
+        private fun params(raw: String): Map<String, String>? {
+            val text = extract(raw) ?: return null
             val hash = text.indexOf('#')
             if (hash < 0) {
                 return null

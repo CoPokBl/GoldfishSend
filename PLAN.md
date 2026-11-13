@@ -222,7 +222,7 @@ GCRA token buckets live in Redis through a single atomic Lua script. Every limit
 |---|---|---|
 | Send, per client | IP (IPv4 /32, IPv6 /64) | 60/min, burst 20 |
 | Send, per recipient mailbox | `mailbox_id` | 30/min, 1000/day (protects recipients from a hostile contact) |
-| Mailbox create | IP | PoW plus 10/hour |
+| Mailbox create | IP | PoW plus 30/hour |
 | Verify attempts | `mailbox_id` | 5 total |
 | Owner ops | IP | 30/min |
 | Outbound, per push host | host | 50/s, plus circuit breaker |

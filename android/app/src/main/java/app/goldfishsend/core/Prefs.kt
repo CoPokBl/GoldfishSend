@@ -1,6 +1,7 @@
 package app.goldfishsend.core
 
 import android.content.Context
+import androidx.compose.runtime.mutableLongStateOf
 import app.goldfishsend.BuildConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,26 +29,49 @@ class Prefs(context: Context) {
     /** Bumped on every change, so Compose can recompose. */
     val version: StateFlow<Long> = _version
 
+    /**
+     * Snapshot state read by every getter, so any composable that reads a preference (including inside LazyColumn items,
+     * which don't recompose with their parent) redraws when it changes.
+     */
+    private val tick = mutableLongStateOf(0L)
+
     private fun changed() {
         _version.value = _version.value + 1
+        tick.longValue = tick.longValue + 1
     }
 
-    private fun bool(key: String, def: Boolean) = sp.getBoolean(key, def)
+    private fun observe() {
+        tick.longValue
+    }
+
+    private fun bool(key: String, def: Boolean): Boolean {
+        observe()
+        return sp.getBoolean(key, def)
+    }
     private fun setBool(key: String, v: Boolean) {
         sp.edit().putBoolean(key, v).apply()
         changed()
     }
-    private fun int(key: String, def: Int) = sp.getInt(key, def)
+    private fun int(key: String, def: Int): Int {
+        observe()
+        return sp.getInt(key, def)
+    }
     private fun setInt(key: String, v: Int) {
         sp.edit().putInt(key, v).apply()
         changed()
     }
-    private fun long(key: String, def: Long) = sp.getLong(key, def)
+    private fun long(key: String, def: Long): Long {
+        observe()
+        return sp.getLong(key, def)
+    }
     private fun setLong(key: String, v: Long) {
         sp.edit().putLong(key, v).apply()
         changed()
     }
-    private fun str(key: String): String? = sp.getString(key, null)
+    private fun str(key: String): String? {
+        observe()
+        return sp.getString(key, null)
+    }
     private fun setStr(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
         changed()
@@ -252,7 +276,10 @@ class Prefs(context: Context) {
 
     /** Dismiss keys of Security-tab findings the user chose to hide (see Finding.dismissKey). */
     val dismissedFindings: Set<String>
-        get() = sp.getStringSet("dismissed_findings", null)?.toSet() ?: emptySet()
+        get() {
+            observe()
+            return sp.getStringSet("dismissed_findings", null)?.toSet() ?: emptySet()
+        }
 
     fun dismissFinding(key: String) {
         // Bounded: stale keys from situations that no longer exist are harmless but shouldn't pile up forever.

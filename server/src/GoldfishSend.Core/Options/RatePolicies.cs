@@ -37,7 +37,8 @@ public static class RatePolicies {
         [SendPerMailbox] = new(30, 60, 30),
         [SendPerMailboxDaily] = new(1000, 86400, 1000),
         [SendGlobal] = new(2000, 1, 4000),
-        [CreatePerIp] = new(10, 3600, 10),
+        // Each contact, group joined and group removal costs a mailbox, plus a PoW each.
+        [CreatePerIp] = new(30, 3600, 20),
         [CreatePerNetwork] = new(100, 3600, 50),
         [CreateGlobal] = new(3000, 3600, 300),
         [NewHostGlobal] = new(120, 3600, 30),

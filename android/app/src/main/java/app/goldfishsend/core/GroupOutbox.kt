@@ -28,6 +28,9 @@ import kotlinx.coroutines.sync.withLock
 object GroupOutbox {
     private const val TAG = "GroupOutbox"
 
+    /** Backoff tops out at 30 minutes, so this is roughly a week of waiting for a member's card. */
+    private const val CARD_WAIT_ATTEMPTS = 340
+
     /** Servers without the batch endpoint (until when): sent one by one meanwhile. */
     private val noBatch = ConcurrentHashMap<String, Long>()
 
@@ -68,9 +71,13 @@ object GroupOutbox {
             heads[member] = r
         }
         val ready = mutableListOf<Ready>()
+        val roster = Groups.model(s, cid)?.roster?.roster
         for ((member, item) in heads) {
             val route = routes[member]
             when {
+                // An active member whose card hasn't reached us yet: wait for it (about a week at most).
+                route == null && roster?.isActive(member) == true ->
+                    if (item.attempts >= CARD_WAIT_ATTEMPTS) failRow(s, item) else backoff(s, item, 30)
                 // No card any more (gone and pruned): nothing can reach them.
                 route == null -> dropMember(s, cid, member)
                 // Their inbox is gone, or their server's identity changed: wait for a new card (or the old key again).

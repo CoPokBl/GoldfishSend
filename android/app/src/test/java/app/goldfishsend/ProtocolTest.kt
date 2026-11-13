@@ -188,6 +188,14 @@ class InviteTest {
     }
 
     @Test
+    fun parseFindsTheLinkInsideASharedMessage() {
+        val link = InviteLink("https://x.example", fp, id, key)
+        val shared = "Let's chat privately on GoldfishSend. This link works once, for 24 hours:\n${link.toUri()}\n"
+        assertEquals(link, InviteLink.parse(shared))
+        assertEquals(link, InviteLink.parse("  ${link.toUri()} and some trailing words"))
+    }
+
+    @Test
     fun parseRejectsBadInput() {
         val good = InviteLink("https://x.example", fp, id, key).toUri()
         assertNull(InviteLink.parse("https://x.example/#v=2"))

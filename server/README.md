@@ -256,7 +256,7 @@ allocation from multiplying its quota by rotating addresses.
 | `send-mailbox` | mailbox | 30 / 60 s, burst 30 | Every message, single or batched. Protects recipients from a hostile contact. |
 | `send-mailbox-day` | mailbox | 1000 / 86400 s, burst 1000 | Every message, single or batched |
 | `send-global` | whole server | 2000 / 1 s, burst 4000 | Every message, single or batched: the overall accept ceiling. Charged last, only for messages about to be accepted, so junk can't drain it. |
-| `create-ip` | client IP | 10 / 3600 s, burst 10 | `POST /v1/mailboxes` (fails closed if Redis is down) |
+| `create-ip` | client IP | 30 / 3600 s, burst 20 | `POST /v1/mailboxes` (fails closed if Redis is down) |
 | `create-net` | client network | 100 / 3600 s, burst 50 | `POST /v1/mailboxes` (fails closed) |
 | `pow-ip` | client IP | 30 / 60 s, burst 30 | `POST /v1/pow/challenge` |
 | `pow-net` | client network | 300 / 60 s, burst 100 | `POST /v1/pow/challenge` |

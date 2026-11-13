@@ -72,13 +72,18 @@ For a received roster R, with current roster C:
 3. **Order:**
    - If `R.ver == C.ver + 1` and `R.prev == hash(C)`, accept.
    - If `R.ver == C.ver` and `hash(R) != hash(C)` (two admins changed it at once), keep the one with the larger hash.
-     If C loses and we authored it, re-apply our change on top of R as `ver + 1`.
+   - **Our own changes aren't lost.** Whenever we accept someone else's roster while a change of ours is still pending
+     and that roster doesn't contain it (our change lost a tie, possibly to a sibling we never saw), we re-apply it on
+     top as the next version. A change is no longer pending once a roster by someone else builds on it.
    - If `R.ver > C.ver` but it doesn't chain onto C (we missed some versions, or it builds on a concurrent sibling we
      never saw), accept only if `R.by` is an admin in C, then ask that admin for the missing history with `gsync`.
    - Otherwise ignore it.
    - **Departures can't be lost.** A roster signed by X that doesn't list X means "X is leaving" (or declining),
      whatever its version. If it lost a tie or arrived too late to apply, the leaver won't try again, so an admin who
      sees it while X is still in C publishes a roster removing X.
+   - **Acceptances can't be lost either.** Likewise, a roster signed by X that makes X a `member` while C still lists X
+     as `invited` is X's acceptance: an admin who sees it but can't apply it publishes a roster making X a member.
+     (Found on a real device: two invitees who join at about the same time produce concurrent rosters.)
 4. **Diff against the old roster:**
    - **Removed members:** stop sending to them. Their card is kept only until what's already queued to them (the roster
      that removed them) is delivered, then deleted, and so is their session once they're in no other group.
@@ -92,8 +97,11 @@ admin forwarded when inviting them). Admins, who keep every card, close the gaps
 - **Rosters by non-admins** (accepting, leaving, declining, or a rename when `adminsOnly` is off): an admin who accepts
   one sends it on to every member whose card they have.
 - **A newcomer's first card:** an admin who receives a member's first card sends it on to every other member.
-- **Invited members** have no inbox yet: rosters reach them only over 1:1, from an author who has them as a contact.
+- **Invited members** have no inbox yet: rosters reach them only over 1:1, from an author who has them as a contact. An
+  admin relaying a roster sends it to invitees over 1:1 too, so they don't build their acceptance on a stale roster.
   On joining they send `gsync` to their inviter.
+- **`gsync` answers start one version early:** the rosters from `have` onwards (not just after it), because the asker's
+  copy of version `have` may be a concurrent sibling that lost, and they need the winner.
 
 Duplicates are harmless: a roster already held is ignored, and a card with a `seq` already held is ignored.
 
@@ -111,6 +119,13 @@ rotated inbox keeps its old one while it drains), to find the sender. That's che
 messages from the same sender, because the nonce is random. A blob with no matching member is dropped. A PreKey message
 whose hint matches the identity inside it, but who isn't a member yet, is held for up to 7 days waiting for a roster
 that adds them, then dropped.
+
+Pushes aren't ordered, so a newcomer's first messages can arrive before their acceptance. A `gtext`, `greceipt` or
+`gdelete` from someone C still lists as `invited` is kept (already decrypted, in the encrypted database, for at most
+7 days) and replayed once a roster makes them a member.
+
+**Senders address every active member**, not only the members whose card they hold. A row for a member whose card hasn't
+arrived yet (a newcomer's card can come after their roster) waits in the outbox, for about a week at most.
 
 The plaintext uses the same padding as 1:1 messages, at most **2048 B padded** for every group message: content is
 encrypted once per member, and any member's session may still be at the PreKey stage.

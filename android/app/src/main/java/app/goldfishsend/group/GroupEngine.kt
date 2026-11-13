@@ -166,6 +166,7 @@ class GroupEngine(
             return null
         }
         val signed = GroupCrypto.signRoster(identity.privateKey, next)
+        dbg { "publish v${next.ver} op=${op.javaClass.simpleName}" }
         m.pendingOp = op
         m.pendingHash = signed.hashB64
         val cardsBefore = m.cards.toMap()
@@ -279,6 +280,7 @@ class GroupEngine(
         val sender = r.ids().firstOrNull { id ->
             id != me && GroupCrypto.hint(inboxHintKey, blob.nonce, B64.dec(id)).contentEquals(blob.mac)
         }
+        dbg { "receive g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
         if (sender == null) {
             // A newcomer whose roster hasn't reached us yet: keep it (bounded, 7 days) if the hint really is theirs.
             if (blob.type == PREKEY) {
@@ -314,6 +316,7 @@ class GroupEngine(
     } catch (e: DuplicateMessageException) {
         null
     } catch (e: Exception) {
+        dbg { "decrypt from ${who(sender)} failed: ${e.javaClass.simpleName}" }
         null
     }
 
@@ -341,16 +344,31 @@ class GroupEngine(
         if (content.groupId != gid) {
             return
         }
+        dbg { "content ${content.javaClass.simpleName} g=${gid.take(6)} from=${who(from)} direct=$direct" }
         when (content) {
             is Content.GRoster -> onRoster(from, content, direct)
             is Content.GCard -> onCard(content)
             is Content.GSync -> onSync(from, content)
             is Content.GLeave -> onLeave(from, content)
-            is Content.GText -> active(gid, from)?.let { io.onText(it, from, content) }
-            is Content.GReceipt -> active(gid, from)?.let { io.onReceipt(it, from, content) }
-            is Content.GDelete -> active(gid, from)?.let { io.onDelete(it, from, content) }
+            is Content.GText -> active(gid, from)?.let { io.onText(it, from, content) } ?: holdFromInvitee(gid, from, content)
+            is Content.GReceipt -> active(gid, from)?.let { io.onReceipt(it, from, content) } ?: holdFromInvitee(gid, from, content)
+            is Content.GDelete -> active(gid, from)?.let { io.onDelete(it, from, content) } ?: holdFromInvitee(gid, from, content)
             else -> Unit
         }
+    }
+
+    /**
+     * A message from someone our roster still lists as invited: their acceptance hasn't reached us yet (pushes arrive out of
+     * order, and concurrent joins can need a round of re-applying). Keep it until it does, bounded like other held blobs.
+     * It's already decrypted (the session has moved on), so it's kept as content, then replayed by [processHeld].
+     */
+    private fun holdFromInvitee(gid: String, from: String, content: Content) {
+        val m = store.load(gid) ?: return
+        if (m.state != GroupModel.JOINED || m.roster?.roster?.role(from) != Role.INVITED) {
+            return
+        }
+        dbg { "holding ${content.javaClass.simpleName} from invitee ${who(from)}" }
+        store.hold(gid, HELD_CONTENT, B64.dec(from) + content.encode())
     }
 
     /** The group, if we're in it and [from] is a current member (not just invited). */
@@ -381,7 +399,9 @@ class GroupEngine(
             return
         }
         val cur = m.roster ?: return
-        when (val d = RosterRules.decide(cur, signed) { h -> store.history(c.g, h)?.roster }) {
+        val decision = RosterRules.decide(cur, signed) { h -> store.history(c.g, h)?.roster }
+        dbg { "roster v${r.ver} by=${who(r.by)} vs cur v${cur.roster.ver} by=${who(cur.roster.by)} -> $decision" }
+        when (val d = decision) {
             is RosterRules.Decision.Accept -> {
                 val had = cur.roster.ver
                 val cardsBefore = m.cards.toMap()
@@ -392,21 +412,31 @@ class GroupEngine(
                 }
             }
             RosterRules.Decision.Replace -> {
-                // A concurrent roster beat ours: take it, and if the loser was our own change, re-apply it on top.
-                val ours = cur.roster.by == me && m.pendingHash == cur.hashB64
+                // A concurrent roster beat ours: take it. If the loser was our own change, accept() re-applies it on top.
                 val cardsBefore = m.cards.toMap()
                 accept(m, signed)
                 relay(m, signed, cardsBefore)
-                val op = m.pendingOp
-                if (ours && op != null) {
-                    publish(m, op)
-                }
             }
             RosterRules.Decision.Keep -> {
                 store.addHistory(c.g, signed)
                 enforceDeparture(m, r)
+                enforceAcceptance(m, r)
             }
-            is RosterRules.Decision.Ignore -> if (d.reason != "same") enforceDeparture(m, r)
+            is RosterRules.Decision.Ignore -> if (d.reason != "same") {
+                enforceDeparture(m, r)
+                enforceAcceptance(m, r)
+            }
+        }
+    }
+
+    /**
+     * The mirror of [enforceDeparture]: a roster signed by an invitee that makes them a member is their acceptance. If it
+     * lost a tie or arrived late, an admin records it, so the join isn't lost if the invitee's app doesn't retry.
+     */
+    private fun enforceAcceptance(m: GroupModel, r: Roster) {
+        val cur = m.roster?.roster ?: return
+        if (r.role(r.by) == Role.MEMBER && cur.role(r.by) == Role.INVITED && r.by != me && m.state == GroupModel.JOINED && cur.isAdmin(me)) {
+            publish(m, RosterOp.Admit(r.by))
         }
     }
 
@@ -431,9 +461,11 @@ class GroupEngine(
             return
         }
         val content = rosterContent(signed)
-        for (id in cardsBefore.keys) {
-            if (id != r.by) {
-                io.sendGroup(m.gid, id, content)
+        for (id in (cardsBefore.keys + r.ids()).toSet() - me - r.by) {
+            when {
+                cardsBefore[id] != null -> io.sendGroup(m.gid, id, content)
+                // Invitees have no group inbox yet. Without this they'd build their acceptance on a stale roster.
+                r.role(id) == Role.INVITED -> io.sendDirect(m.gid, id, content)
             }
         }
     }
@@ -468,7 +500,9 @@ class GroupEngine(
         if (m.state != GroupModel.JOINED || !cur.roster.isAdmin(me) || cur.roster.role(from) == null) {
             return
         }
-        val rosters = store.historySince(c.g, c.have.coerceAtLeast(0)).takeLast(50).toMutableList()
+        // From the version before theirs: their copy of `have` may be a concurrent sibling that lost, and they need the winner.
+        val rosters = store.historySince(c.g, (c.have - 1).coerceAtLeast(0)).takeLast(50).toMutableList()
+        dbg { "sync from ${who(from)} have=${c.have}: ${rosters.size} rosters, via ${if (m.cards[from] != null) "group" else "direct"}" }
         if (rosters.none { it.hashB64 == cur.hashB64 }) {
             rosters += cur
         }
@@ -512,7 +546,28 @@ class GroupEngine(
         if (events.isNotEmpty()) {
             io.onEvents(m, events)
         }
+        reapplyLost(m, signed)
         processHeld(m.gid)
+    }
+
+    /**
+     * We accepted someone else's roster while a change of ours was still pending, and that roster doesn't contain it (our
+     * change was on a sibling that lost, possibly one we never learned about). Publish it again on top.
+     */
+    private fun reapplyLost(m: GroupModel, signed: SignedRoster) {
+        val op = m.pendingOp ?: return
+        if (signed.roster.by == me || m.state != GroupModel.JOINED) {
+            return
+        }
+        if (op.apply(signed.roster, me) == null) {
+            // Already reflected (or no longer possible): nothing to redo.
+            m.pendingOp = null
+            m.pendingHash = null
+            store.save(m)
+            return
+        }
+        dbg { "re-applying lost ${op.javaClass.simpleName} on v${signed.roster.ver}" }
+        publish(m, op)
     }
 
     private fun diff(m: GroupModel, old: Roster?, new: Roster): List<GroupEvent> {
@@ -555,7 +610,8 @@ class GroupEngine(
             for (id in newIds.intersect(oldIds)) {
                 val before = old.role(id)
                 val after = new.role(id)
-                if (before == after || after == null) {
+                // A step back to "invited" only happens while concurrent rosters settle (it isn't a real role change).
+                if (before == after || after == null || after == Role.INVITED || before == Role.INVITED && after != Role.MEMBER) {
                     continue
                 }
                 events += if (before == Role.INVITED && after == Role.MEMBER) GroupEvent.Joined(id) else GroupEvent.RoleChanged(by, id, after)
@@ -580,6 +636,7 @@ class GroupEngine(
         val content = rosterContent(signed)
         val targets = (old.ids() + signed.roster.ids()).toSet() - me
         val addedInvitees = signed.roster.members.filter { it.role == Role.INVITED && old.role(it.id) == null }.map { it.id }.toSet()
+        dbg { "broadcast v${signed.roster.ver} to ${targets.map { who(it) + (if (cardsBefore[it] != null) "/g" else "/d") }}" }
         for (id in targets) {
             if (cardsBefore[id] != null) {
                 io.sendGroup(m.gid, id, content)
@@ -614,13 +671,34 @@ class GroupEngine(
             store.dropHeld(h.id)
         }
         for (h in held) {
-            receive(gid, h.hintKey, h.blob)
+            if (h.hintKey.contentEquals(HELD_CONTENT)) {
+                val from = B64.enc(h.blob.copyOfRange(0, IDENTITY_LEN))
+                val content = runCatching { Content.decode(h.blob.copyOfRange(IDENTITY_LEN, h.blob.size)) }.getOrNull()
+                content?.let { onContent(gid, from, it, direct = false) }
+            } else {
+                receive(gid, h.hintKey, h.blob)
+            }
         }
     }
 
     companion object {
         val LOCAL = SignalProtocolAddress("self", 1)
         private const val PREKEY = 3
+
+        /** Marks a held row as already-decrypted content from an invitee (a real hint key is 32 bytes). */
+        private val HELD_CONTENT = byteArrayOf(0x43)
+        private const val IDENTITY_LEN = 33
+
+        /** Protocol decisions, for debugging. The app routes this to logcat in debug builds only; it never carries content. */
+        @Volatile
+        var debugLog: ((String) -> Unit)? = null
+
+        private fun dbg(msg: () -> String) {
+            debugLog?.invoke(msg())
+        }
+
+        /** A short, stable label for a member in debug output. */
+        private fun who(id: String): String = id.takeLast(6)
 
         fun rosterContent(r: SignedRoster) = Content.GRoster(r.roster.g, B64.enc(r.bytes), B64.enc(r.sig))
 

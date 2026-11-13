@@ -54,7 +54,8 @@ android {
         // Only the arm64 / x86_64 native libs (libsignal, sqlcipher) are shipped.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            // -Pgf.abis=x86_64 builds a smaller APK for emulator testing. Releases use the default.
+            abiFilters += ((project.findProperty("gf.abis") as String?)?.split(",") ?: listOf("arm64-v8a", "x86_64"))
         }
     }
 
@@ -76,6 +77,8 @@ android {
     buildTypes {
         debug {
             buildConfigField("boolean", "ALLOW_HTTP", "true")
+            // Install several debug copies side by side for multi-party testing on one device: -Pgf.debugIdSuffix=.a
+            applicationIdSuffix = (project.findProperty("gf.debugIdSuffix") as String?) ?: ""
         }
         release {
             isMinifyEnabled = true
@@ -153,6 +156,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-process:2.11.0")
     implementation("androidx.work:work-runtime-ktx:2.12.0")
     implementation("androidx.biometric:biometric:1.1.0")
+    // biometric 1.1.0 pulls in fragment 1.2.5, whose FragmentActivity rejects the 32-bit request codes of the
+    // Activity Result API (crash on the notification-permission request in onboarding). Pin a current fragment.
+    implementation("androidx.fragment:fragment-ktx:1.9.1")
     implementation("androidx.datastore:datastore-preferences:1.2.1")
 
     implementation("androidx.camera:camera-camera2:1.6.2")

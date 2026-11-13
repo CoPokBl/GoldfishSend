@@ -201,6 +201,67 @@ class GroupSimulationTest {
         assertTrue(texts(dave).contains("hi dave"))
     }
 
+    /**
+     * Found on the emulator: Bob joins (v2) while Carol, still invited, never hears about it. Carol then joins on top of v1,
+     * so her acceptance is a concurrent v2 that may lose the tie. Whichever wins, everyone must end up agreeing that Bob
+     * and Carol are both members, and Bob and Carol must be able to talk, even when the first thing Carol hears afterwards is
+     * a later roster from Alice. Repeated so both tie outcomes are covered.
+     */
+    @Test
+    fun aLateJoinOnAStaleRosterStillLands() {
+        repeat(8) { run ->
+            val net = GroupNet()
+            val a = net.peer("alice")
+            val b = net.peer("bob")
+            val c = net.peer("carol")
+            a.befriend(b)
+            a.befriend(c)
+            val g = B64.enc(Rand.bytes(32))
+            a.create(g, "Trip", b, c)
+            net.deliverAll()
+            // Carol hears nothing from Alice while Bob joins.
+            net.filter = { e -> !(e.to() == c && e.from() == a) }
+            b.join(g)
+            net.deliverAll()
+            assertEquals(1L, c.roster(g).roster.ver)
+            // Carol joins, but Alice's replies (including the sync answer) are lost too.
+            c.join(g)
+            net.deliverAll()
+            // Connectivity is back. Alice's next change is the first thing Carol hears from her.
+            net.filter = { true }
+            a.publish(g, RosterOp.Meta(name = "Trip $run"))
+            net.deliverAll()
+            val hashes = listOf(a, b, c).map { it.roster(g).hashB64 }.toSet()
+            assertEquals("run $run: rosters differ: ${listOf(a, b, c).map { it.roster(g).roster.ver }}", 1, hashes.size)
+            val r = a.roster(g).roster
+            assertEquals("run $run", listOf(Role.ADMIN, Role.MEMBER, Role.MEMBER), listOf(a.id, b.id, c.id).map { r.role(it) })
+            b.say(g, "hi carol")
+            c.say(g, "hi bob")
+            net.deliverAll()
+            assertTrue("run $run", c.texts.any { it.first == g && it.third == "hi carol" })
+            assertTrue("run $run", b.texts.any { it.first == g && it.third == "hi bob" })
+        }
+    }
+
+    /** A new member's first message can overtake their acceptance (pushes aren't ordered). It must wait, not be dropped. */
+    @Test
+    fun aMessageThatOvertakesTheSendersJoinIsKept() {
+        alice.create(gid, "Trip", bob, carol)
+        net.deliverAll()
+        bob.join(gid)
+        net.deliverAll()
+        // Carol joins and speaks at once, but Bob gets her text before anything telling him she joined.
+        carol.join(gid)
+        carol.say(gid, "first words")
+        net.reorder = { batch -> batch.sortedBy { e -> if (e.to() == bob && e.from() == carol) 0 else 1 } }
+        net.deliverAll()
+        net.reorder = null
+        net.deliverAll()
+        assertConverged(alice, bob, carol)
+        assertTrue(texts(bob).contains("first words"))
+        assertTrue(texts(alice).contains("first words"))
+    }
+
     @Test
     fun nonAdminsCantChangeMembership() {
         threeMembers()

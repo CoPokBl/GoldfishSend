@@ -20,6 +20,7 @@ import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupEvent
 import app.goldfishsend.group.GroupIo
 import app.goldfishsend.group.GroupModel
+import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.CardBundle
@@ -49,6 +50,12 @@ class GroupException(val human: String) : Exception(human)
  * A group is a `contacts` row with is_group = 1, so the chat list, timers, hidden chats and wipes all cover it.
  */
 object Groups {
+    init {
+        if (app.goldfishsend.BuildConfig.DEBUG) {
+            app.goldfishsend.group.GroupEngine.debugLog = { Log.d("GoldfishGroup", it) }
+        }
+    }
+
     private const val TAG = "Groups"
 
     /** Group content is chunked for the worst case (a first, PreKey message to a member). */
@@ -198,7 +205,7 @@ object Groups {
             return
         }
         val contact = s.repo.contact(cid) ?: return
-        val targets = m.cards.keys.toList()
+        val targets = recipients(s, m)
         val wire = Content.newId()
         val now = System.currentTimeMillis()
         val exp = contact.timerSecs
@@ -225,6 +232,15 @@ object Groups {
         Outbox.kick()
     }
 
+    /**
+     * Who a group message goes to: every active member but us, including members whose card hasn't reached us yet (a
+     * newcomer's card can arrive after their roster). Their rows wait in the outbox until the card does.
+     */
+    private fun recipients(s: Session, m: GroupModel): List<String> {
+        val me = B64.enc(s.signal.identityKeyPair.publicKey.serialize())
+        return m.roster?.roster?.members.orEmpty().filter { it.id != me && m.roster!!.roster.isActive(it.id) }.map { it.id }
+    }
+
     /** Group fan-out of control content (rosters, cards, receipts). */
     private fun enqueueGroup(s: Session, cid: Long, to: String, content: Content, messageId: String? = null) {
         for (p in Chunker.splitContent(content, MAX_PLAINTEXT)) {
@@ -238,7 +254,7 @@ object Groups {
         if (m.state != GroupModel.JOINED) {
             return
         }
-        for (to in m.cards.keys) {
+        for (to in recipients(s, m)) {
             enqueueGroup(s, cid, to, Content.GDelete(m.gid, listOf(wireId)))
         }
     }
@@ -276,6 +292,8 @@ object Groups {
         }
         Mailboxes.onMessageOnMailbox(s, s.repo.mailbox(mb.id) ?: mb)
         s.db.notifyChanged()
+        // A member's card may just have arrived, unblocking rows that were waiting for it.
+        Outbox.kick()
     }
 
     /** Group content over a 1:1 session (invitations, forwarded cards, rosters for invitees). */
@@ -287,6 +305,7 @@ object Groups {
             Log.w(TAG, "dropping group content: ${e.javaClass.simpleName}")
         }
         s.db.notifyChanged()
+        Outbox.kick()
     }
 
     /** Retries a failed group message: queued again to every member (a member who has it already drops the copy). */
@@ -386,8 +405,18 @@ object Groups {
 
     /** A fresh inbox mailbox (from the pool when it's warm) and our server's identity fingerprint. */
     private suspend fun inbox(s: Session): Pair<Mailbox, String> {
-        val mb = Mailboxes.take(s, Mailbox.PURPOSE_GROUP)
-            ?: throw GroupException("Still getting things ready. This only takes a moment the first time.")
+        val mb = try {
+            Mailboxes.take(s, Mailbox.PURPOSE_GROUP)
+        } catch (e: ApiException) {
+            throw GroupException(
+                if (e.status == 429) {
+                    val mins = ((e.retryAfterSeconds ?: 60) + 59) / 60
+                    "Your server is limiting new chats from your network right now. Try again in ${if (mins <= 1) "a minute" else "$mins minutes"}."
+                } else {
+                    "Couldn't reach your server. Check your connection and try again."
+                },
+            )
+        } ?: throw GroupException("Still getting things ready. This only takes a moment the first time.")
         val serverKey = try {
             Graph.ownServerKey()
         } catch (e: Exception) {

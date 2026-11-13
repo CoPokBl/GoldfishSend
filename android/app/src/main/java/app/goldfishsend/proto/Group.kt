@@ -266,6 +266,17 @@ sealed class RosterOp {
             if (base.role(me) == null) null else base.copy(members = base.members.filter { it.id != me })
     }
 
+    /**
+     * An admin records an invitee's acceptance that lost a version tie (the invitee signed it, but a concurrent roster won).
+     * Only used when we hold that signed acceptance; see GroupEngine.enforceAcceptance.
+     */
+    @Serializable
+    @SerialName("admit")
+    data class Admit(val id: String) : RosterOp() {
+        override fun apply(base: Roster, me: String): Roster? =
+            if (base.role(id) != Role.INVITED) null else base.copy(members = base.members.map { if (it.id == id) it.copy(role = Role.MEMBER) else it })
+    }
+
     @Serializable
     @SerialName("accept")
     data object Accept : RosterOp() {
