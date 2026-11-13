@@ -345,7 +345,7 @@ Flash wear-levelling and SQLite free pages and WAL mean "delete" doesn't reliabl
 
 ### Additional security controls
 - **App lock**: PIN, passphrase or biometric, with configurable auto-lock (immediately, 1 min, 5 min, and so on).
-- **Wrong-PIN wipe**: optionally, N failed attempts trigger a full wipe. A **duress PIN** opens an empty profile or wipes silently.
+- **Wrong-PIN wipe**: optionally, N failed attempts trigger a full wipe. A **duress PIN** (a verifier that can't decrypt real data) wipes silently or opens a separate decoy profile.
 - **Panic wipe**: an in-app action plus an optional quick-settings tile. It destroys the Keystore keys and MK first (instant crypto-shred) and then deletes files.
 - **Notifications**: by default they say only "New message", with no name or content, and nothing on the lock screen (`VISIBILITY_SECRET`).
 - **Screen**: `FLAG_SECURE` (blocks screenshots and recents thumbnails) is on by default. Android 14+ screen-capture detection can optionally notify the contact.
@@ -392,7 +392,8 @@ signal_* (identity, prekeys, signed_prekeys, kyber_prekeys, sessions)
     | Mailbox rotation: a fresh inbound mailbox per contact every N days, with the old one drained after the contact switches | **every 30 days** (invisible, no downside) |
     | PanicKit responder: panic apps may lock; only the user-approved app may erase | off |
     | Safety-number changes: verified contacts are always paused for review, and unverified ones are accepted with a notice (option: pause all) | pause verified |
-    | Hidden chats behind a separate PIN, and the duress PIN may open a decoy view (hidden chats kept hidden, or deleted) instead of erasing | off / erase |
+    | Hidden chats behind a separate PIN (real profile only, UI-level) | off |
+    | Duress PIN: a verifier only (it can never decrypt real data), which either erases everything or opens a separate decoy profile (its own database, keyed by the duress PIN; real data stays encrypted, and pushes wait in the locked inbox) | off / erase |
     | Clear app memory on lock | **on** (only cost is a brief CPU spike) |
     | Trust-on-first-use server key pinning | off (servers legitimately rotate keys) |
     | Built-in Tor and `.onion` servers | off |
