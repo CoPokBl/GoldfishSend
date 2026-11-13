@@ -53,7 +53,7 @@ object PushHub {
         Graph.prefs.pushStatus = "ok"
         Graph.prefs.pushHost = runCatching { java.net.URI(data.url).host }.getOrNull()
         Graph.scope.launchSafe {
-            val s = Graph.session.value ?: Graph.tryAutoUnlock()
+            val s = Graph.realSession ?: Graph.tryAutoUnlock()
             if (s == null) {
                 LockedInbox.put(
                     LockedInbox.KIND_ENDPOINT,

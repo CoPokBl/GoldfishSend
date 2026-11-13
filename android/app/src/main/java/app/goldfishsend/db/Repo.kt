@@ -1,5 +1,6 @@
 package app.goldfishsend.db
 
+import app.goldfishsend.proto.Sanitize
 import android.database.Cursor
 import app.goldfishsend.crypto.MessageVault
 import app.goldfishsend.proto.B64
@@ -42,6 +43,9 @@ data class Mailbox(
     val replacedAt: Long? = null,
     /** After this time, a replaced mailbox is deleted. It's set once the contact is seen using the new one. */
     val drainUntil: Long? = null,
+    /** The signed prekey id published in this mailbox's invite. A first hello must use exactly this prekey. */
+    val inviteSpkId: Int? = null,
+    val inviteKyberId: Int? = null,
 ) {
     companion object {
         const val PURPOSE_QR = 0
@@ -103,6 +107,9 @@ data class OutboxItem(
 )
 
 /** Typed data access over [Db]. Message bodies are always stored through [MessageVault]. */
+/** Incomplete chunked messages kept per contact (64 parts × 4 messages). */
+const val MAX_CHUNKS_PER_CONTACT = 256L
+
 class Repo(val db: Db, private val vault: MessageVault) {
     // --- kv ---
 
@@ -158,7 +165,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
         val now = System.currentTimeMillis()
         return db.insert(
             "INSERT INTO contacts (name, verified, timer_secs, out_server, out_secret, created_at, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            name, verified, timerSecs, outServer, outSecret, now, now,
+            Sanitize.name(name) ?: "Contact", verified, timerSecs, outServer, outSecret, now, now,
         )
     }
 
@@ -168,7 +175,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun setContactIdentity(id: Long, key: ByteArray) = db.exec("UPDATE contacts SET identity_key = ? WHERE id = ?", key, id)
 
-    fun renameContact(id: Long, name: String) = db.exec("UPDATE contacts SET name = ? WHERE id = ?", name, id)
+    fun renameContact(id: Long, name: String) {
+        val clean = Sanitize.name(name) ?: return
+        db.exec("UPDATE contacts SET name = ? WHERE id = ?", clean, id)
+    }
+
+    /** Every inbound mailbox of a contact, including replaced ones still draining. */
+    fun mailboxesForContact(contactId: Long): List<Mailbox> =
+        db.query("SELECT $mbCols FROM mailboxes WHERE contact_id = ?", contactId, map = ::mailbox)
 
     fun setVerified(id: Long, v: Boolean) = db.exec("UPDATE contacts SET verified = ? WHERE id = ?", v, id)
 
@@ -234,14 +248,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
         val contacts = contacts()
         return contacts.map { c ->
             val last = db.queryOne(
-                "SELECT m.id, m.ciphertext, mk.key, m.ts, m.outgoing, m.status, m.view_once, m.kind FROM messages m JOIN message_keys mk ON mk.message_id = m.id " +
+                "SELECT m.id, m.ciphertext, mk.key, m.ts, m.outgoing, m.status, m.view_once, m.kind, mk.bucket FROM messages m JOIN message_keys mk ON mk.message_id = m.id " +
                     "WHERE m.contact_id = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY m.ts DESC LIMIT 1",
                 c.id, now,
             ) { cur ->
                 val body = if (cur.getInt(6) != 0) {
                     "View-once message"
                 } else {
-                    openBody(cur.getString(0), cur.getBlob(2), cur.getBlob(1))
+                    openBody(cur.getString(0), cur.getBlob(2), cur.getBlob(1), if (cur.isNull(8)) null else cur.getLong(8))
                 }
                 ChatSummary(c, body, cur.getLong(3), cur.getInt(4) != 0, cur.getInt(5))
             }
@@ -251,14 +265,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     // --- messages ---
 
-    private fun openBody(id: String, key: ByteArray, ct: ByteArray): String = try {
-        vault.open(id, key, ct).toString(Charsets.UTF_8)
+    private fun openBody(id: String, key: ByteArray, ct: ByteArray, bucket: Long?): String = try {
+        vault.open(id, key, ct, bucket).toString(Charsets.UTF_8)
     } catch (e: Exception) {
         ""
     }
 
     private val msgCols =
-        "m.id, m.contact_id, m.wire_id, m.outgoing, m.kind, m.ciphertext, mk.key, m.ts, m.received_at, m.read_at, m.exp_secs, m.view_once, m.expires_at, m.status"
+        "m.id, m.contact_id, m.wire_id, m.outgoing, m.kind, m.ciphertext, mk.key, m.ts, m.received_at, m.read_at, m.exp_secs, m.view_once, m.expires_at, m.status, mk.bucket"
 
     private fun message(c: Cursor) = Message(
         id = c.getString(0),
@@ -266,7 +280,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
         wireId = c.getString(2),
         outgoing = c.getInt(3) != 0,
         kind = c.getInt(4),
-        body = openBody(c.getString(0), c.getBlob(6), c.getBlob(5)),
+        body = openBody(c.getString(0), c.getBlob(6), c.getBlob(5), if (c.isNull(14)) null else c.getLong(14)),
         ts = c.getLong(7),
         receivedAt = if (c.isNull(8)) null else c.getLong(8),
         readAt = if (c.isNull(9)) null else c.getLong(9),
@@ -310,14 +324,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
             return null
         }
         val id = B64.enc(Rand.bytes(16))
-        val sealed = vault.seal(id, body.toByteArray(Charsets.UTF_8))
+        val sealed = vault.seal(id, body.toByteArray(Charsets.UTF_8), expiresAt)
         db.tx {
             db.exec(
                 "INSERT INTO messages (id, contact_id, wire_id, outgoing, kind, ciphertext, ts, received_at, exp_secs, view_once, expires_at, status) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 id, contactId, wireId, outgoing, kind, sealed.ciphertext, ts, receivedAt, expSecs, viewOnce, expiresAt, status,
             )
-            db.exec("INSERT INTO message_keys (message_id, key) VALUES (?, ?)", id, sealed.wrappedKey)
+            db.exec("INSERT INTO message_keys (message_id, key, bucket) VALUES (?, ?, ?)", id, sealed.wrappedKey, sealed.bucket)
         }
         return id
     }
@@ -345,14 +359,37 @@ class Repo(val db: Db, private val vault: MessageVault) {
         }
         db.tx {
             for ((id, _, exp) in unread) {
+                val startsNow = exp > 0 && db.long("SELECT COUNT(*) FROM messages WHERE id = ? AND expires_at IS NULL", id) > 0
                 db.exec(
                     "UPDATE messages SET read_at = ?, expires_at = CASE WHEN expires_at IS NULL AND ? > 0 THEN ? ELSE expires_at END WHERE id = ?",
                     now, exp, now + exp * 1000, id,
                 )
+                if (startsNow) {
+                    // The timer just started: move the key into its expiry bucket so it's destroyed on time, even while locked.
+                    rewrapForExpiry(id, now + exp * 1000)
+                }
             }
             clearUnread(contactId)
         }
         return unread.map { it.second }
+    }
+
+    private fun rewrapForExpiry(id: String, expiresAt: Long) {
+        val row = db.queryOne("SELECT key, bucket FROM message_keys WHERE message_id = ?", id) {
+            it.getBlob(0) to (if (it.isNull(1)) null else it.getLong(1))
+        } ?: return
+        val (wk, bucket) = vault.rewrap(id, row.first, row.second, expiresAt) ?: return
+        db.exec("UPDATE message_keys SET key = ?, bucket = ? WHERE message_id = ?", wk, bucket, id)
+    }
+
+    /** After bulk deletes, an idle VACUUM rewrites the file so freed pages don't linger (see MaintenanceWorker). */
+    fun markNeedsVacuum() = kvPutString("needs_vacuum", "1")
+
+    fun vacuumIfNeeded() {
+        if (kvString("needs_vacuum") == "1") {
+            kvPutString("needs_vacuum", null)
+            db.exec("VACUUM")
+        }
     }
 
     fun deleteMessage(id: String) {
@@ -379,6 +416,9 @@ class Repo(val db: Db, private val vault: MessageVault) {
             deleteMessage(id)
         }
         db.exec("DELETE FROM chunks WHERE created_at < ?", now - 7 * 24 * 3600_000L)
+        if (ids.size >= 20) {
+            markNeedsVacuum()
+        }
         return ids.size
     }
 
@@ -401,7 +441,9 @@ class Repo(val db: Db, private val vault: MessageVault) {
             db.exec("DELETE FROM chunks")
             db.exec("DELETE FROM outbox WHERE kind = ?", OutboxKind.CONTENT)
             db.exec("UPDATE contacts SET unread = 0")
+            db.exec("DELETE FROM kv WHERE k LIKE 'bk/%'")
         }
+        markNeedsVacuum()
     }
 
     /** Outgoing text messages still awaiting a delivery receipt after [olderThan]. */
@@ -417,6 +459,13 @@ class Repo(val db: Db, private val vault: MessageVault) {
     // --- chunks ---
 
     fun storeChunk(contactId: Long, wireId: String, part: Int, parts: Int, body: String) {
+        // Bounded per contact: a hostile peer can't fill storage with chunks that never complete.
+        if (db.long("SELECT COUNT(*) FROM chunks WHERE contact_id = ?", contactId) >= MAX_CHUNKS_PER_CONTACT) {
+            db.exec(
+                "DELETE FROM chunks WHERE contact_id = ? AND created_at = (SELECT MIN(created_at) FROM chunks WHERE contact_id = ?)",
+                contactId, contactId,
+            )
+        }
         val sealed = vault.sealBlob("chunk/$contactId/$wireId/$part", body.toByteArray(Charsets.UTF_8))
         db.exec(
             "INSERT OR REPLACE INTO chunks (contact_id, wire_id, part, parts, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -456,11 +505,13 @@ class Repo(val db: Db, private val vault: MessageVault) {
         inviteExpiresAt = if (c.isNull(10)) null else c.getLong(10),
         replacedAt = if (c.isNull(11)) null else c.getLong(11),
         drainUntil = if (c.isNull(12)) null else c.getLong(12),
+        inviteSpkId = if (c.isNull(13)) null else c.getInt(13),
+        inviteKyberId = if (c.isNull(14)) null else c.getInt(14),
     )
 
     private val mbCols =
         "id, contact_id, purpose, send_secret, owner_secret, tag, state, expires_at, created_at, invite_used, invite_expires_at, " +
-            "replaced_at, drain_until"
+            "replaced_at, drain_until, invite_spk_id, invite_kyber_id"
 
     fun mailboxByTag(tag: ByteArray): Mailbox? = db.queryOne("SELECT $mbCols FROM mailboxes WHERE tag = ?", tag, map = ::mailbox)
 
@@ -524,6 +575,37 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun bindMailbox(id: Long, contactId: Long) =
         db.exec("UPDATE mailboxes SET contact_id = ?, invite_used = 1, created_at = ? WHERE id = ?", contactId, System.currentTimeMillis(), id)
+
+    /**
+     * Atomically claims a ready pool mailbox for [purpose], so two invites (or an invite and a new contact) can never
+     * share one. Returns null if the pool is empty.
+     */
+    fun claimPoolMailbox(purpose: Int, provisionalExpiry: Long): Mailbox? = db.tx {
+        var claimed: Mailbox? = null
+        for (m in pooledMailboxes()) {
+            if (claimMailbox(m.id, purpose, provisionalExpiry)) {
+                claimed = mailbox(m.id)
+                break
+            }
+        }
+        claimed
+    }
+
+    /** Claims a specific unclaimed mailbox. False if someone else got it first. */
+    fun claimMailbox(id: Long, purpose: Int, provisionalExpiry: Long): Boolean = db.update(
+        "UPDATE mailboxes SET invite_used = 1, purpose = ?, invite_expires_at = ? WHERE id = ? AND invite_used = 0 AND contact_id IS NULL",
+        purpose, provisionalExpiry, id,
+    ) == 1
+
+    /** Returns a claimed but never-advertised mailbox to the pool (the invite upload failed). */
+    fun releasePoolMailbox(id: Long) = db.exec(
+        "UPDATE mailboxes SET invite_used = 0, invite_expires_at = NULL, invite_spk_id = NULL, invite_kyber_id = NULL " +
+            "WHERE id = ? AND contact_id IS NULL",
+        id,
+    )
+
+    fun setInvitePrekeys(id: Long, spkId: Int, kyberId: Int) =
+        db.exec("UPDATE mailboxes SET invite_spk_id = ?, invite_kyber_id = ? WHERE id = ?", spkId, kyberId, id)
 
     fun markInviteUsed(id: Long, expiresAt: Long) =
         db.exec("UPDATE mailboxes SET invite_used = 1, invite_expires_at = ? WHERE id = ?", expiresAt, id)

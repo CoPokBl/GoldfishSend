@@ -1,5 +1,6 @@
 package app.goldfishsend.ui.screens
 
+import app.goldfishsend.ui.components.rememberReAuth
 import androidx.compose.material.icons.rounded.GppMaybe
 import androidx.compose.material.icons.rounded.Autorenew
 import androidx.compose.material.icons.rounded.Link
@@ -117,6 +118,8 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     var pushPicker by remember { mutableStateOf(false) }
     var networkSettings by remember { mutableStateOf(false) }
     var duress by remember { mutableStateOf(false) }
+    // Security-relevant changes need the current secret (or the phone's screen lock) first.
+    val reauth = rememberReAuth(s, activity)
     var hiddenPinDialog by remember { mutableStateOf(false) }
     var disconnectPanic by remember { mutableStateOf(false) }
     // Feature flags live inside the encrypted DB. In a decoy session they always read as off.
@@ -246,34 +249,32 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     }
                     SettingRow(
                         "Erase after failed attempts",
-                        if (p.maxFailedAttempts == 0) "Off" else "After ${p.maxFailedAttempts} wrong ${if (vault.secretIsPin) "PINs" else "passphrases"}",
+                        if (p.maxFailedAttempts == 0 || s.decoy) "Off" else "After ${p.maxFailedAttempts} wrong ${if (vault.secretIsPin) "PINs" else "passphrases"}",
                         Icons.Rounded.Warning,
-                        onClick = { picker = Picker.FAILED },
+                        onClick = { reauth.require("Changing when everything is erased.") { picker = Picker.FAILED } },
                     )
                     SettingRow(
                         "Duress PIN",
                         if (duressOn == true) {
                             "On · " + when (p.duressAction) {
                                 DuressAction.WIPE_ALL -> "silently erases everything"
-                                DuressAction.HIDE_HIDDEN_CHATS -> "opens without hidden chats"
-                                DuressAction.DELETE_HIDDEN_CHATS -> "deletes hidden chats, then opens"
+                                DuressAction.DECOY -> "opens a separate decoy profile"
                             }
                         } else {
                             "Off · a second PIN for when you're forced to unlock"
                         },
                         Icons.Rounded.PhonelinkLock,
-                        onClick = { duress = true },
+                        onClick = { reauth.require("Changing the duress PIN.") { duress = true } },
                     )
                     if (duressOn == true) {
                         SettingRow(
                             "When the duress PIN is entered",
                             when (p.duressAction) {
                                 DuressAction.WIPE_ALL -> "Erase everything"
-                                DuressAction.HIDE_HIDDEN_CHATS -> "Open normally, with hidden chats kept hidden"
-                                DuressAction.DELETE_HIDDEN_CHATS -> "Delete hidden chats, then open normally"
+                                DuressAction.DECOY -> "Open a decoy profile. Your real chats stay locked and untouched."
                             },
                             Icons.Rounded.TheaterComedy,
-                            onClick = { picker = Picker.DURESS_ACTION },
+                            onClick = { reauth.require("Changing what the duress PIN does.") { picker = Picker.DURESS_ACTION } },
                         )
                     }
                 }
@@ -284,7 +285,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     "Hidden chats",
                     if (hiddenOn == true) "On · long-press \"Chats\" and enter your hidden-chats PIN to show them" else "Off · keep chosen chats out of the list behind a separate PIN",
                     Icons.Rounded.VisibilityOff,
-                    onClick = { hiddenPinDialog = true },
+                    onClick = { reauth.require("Changing hidden chats.") { hiddenPinDialog = true } },
                 )
                 if (hiddenOn == true) {
                     SwitchRow(
@@ -299,14 +300,14 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                 SectionHeader("Panic button")
                 SettingRow(
                     "Response to a panic app",
-                    when (p.panicResponse) {
+                    when (if (s.decoy) PanicResponse.OFF else p.panicResponse) {
                         PanicResponse.OFF -> "Off"
                         PanicResponse.LOCK -> "Lock GoldfishSend"
                         PanicResponse.WIPE_MESSAGES -> "Lock and erase all messages"
                         PanicResponse.WIPE_EVERYTHING -> "Erase everything"
                     },
                     Icons.Rounded.Emergency,
-                    onClick = { picker = Picker.PANIC },
+                    onClick = { reauth.require("Changing the panic response.") { picker = Picker.PANIC } },
                 )
                 val trigger = p.panicTrigger
                 SettingRow(
@@ -318,7 +319,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                             .getOrDefault(trigger) + " · tap to disconnect"
                     },
                     Icons.Rounded.Link,
-                    onClick = { if (trigger != null) disconnectPanic = true },
+                    onClick = { if (trigger != null) reauth.require("Disconnecting the panic app.") { disconnectPanic = true } },
                 )
             }
             item {
@@ -342,13 +343,13 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     "Erase messages on restart",
                     "All messages are destroyed whenever your phone reboots",
                     Icons.Rounded.RestartAlt,
-                    p.wipeOnReboot,
-                ) { p.wipeOnReboot = it }
+                    p.wipeOnReboot && !s.decoy,
+                ) { v -> reauth.require("Changing erase settings.") { if (!s.decoy) p.wipeOnReboot = v } }
                 SettingRow(
                     "Erase everything if unused",
-                    if (p.inactivityWipeDays == 0) "Off" else "If not unlocked for ${p.inactivityWipeDays} days",
+                    if (p.inactivityWipeDays == 0 || s.decoy) "Off" else "If not unlocked for ${p.inactivityWipeDays} days",
                     Icons.Rounded.DeleteSweep,
-                    onClick = { picker = Picker.INACTIVITY },
+                    onClick = { reauth.require("Changing erase settings.") { picker = Picker.INACTIVITY } },
                 )
             }
             item {
@@ -359,7 +360,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     Icons.Rounded.NotificationsActive,
                     onClick = { pushPicker = true },
                 )
-                SettingRow("Connection", connectionSummary(), Icons.Rounded.VpnLock, onClick = { networkSettings = true })
+                SettingRow("Connection", connectionSummary(), Icons.Rounded.VpnLock, onClick = { reauth.require("Changing how GoldfishSend connects.") { networkSettings = true } })
                 SettingRow("Server", p.serverUrl, Icons.Rounded.Dns, onClick = { editServer = true })
             }
             item {
@@ -405,20 +406,19 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
         Picker.FAILED -> ChoiceDialog(
             "Erase after failed attempts", listOf(0 to "Off", 5 to "5 attempts", 10 to "10 attempts", 20 to "20 attempts"),
             p.maxFailedAttempts, { picker = null },
-        ) { p.maxFailedAttempts = it }
+        ) { if (!s.decoy) p.maxFailedAttempts = it }
         Picker.INACTIVITY -> ChoiceDialog(
             "Erase everything if unused", listOf(0 to "Off", 3 to "3 days", 7 to "7 days", 14 to "14 days", 30 to "30 days", 90 to "90 days"),
             p.inactivityWipeDays, { picker = null },
-        ) { p.inactivityWipeDays = it }
+        ) { if (!s.decoy) p.inactivityWipeDays = it }
         Picker.DURESS_ACTION -> ChoiceDialog(
             "When the duress PIN is entered",
             listOf(
                 DuressAction.WIPE_ALL to "Erase everything",
-                DuressAction.HIDE_HIDDEN_CHATS to "Open normally, hidden chats stay hidden",
-                DuressAction.DELETE_HIDDEN_CHATS to "Delete hidden chats, then open normally",
+                DuressAction.DECOY to "Open a separate decoy profile (your real chats stay locked)",
             ),
             p.duressAction, { picker = null },
-        ) { p.duressAction = it }
+        ) { if (!s.decoy) p.duressAction = it }
         Picker.PANIC -> ChoiceDialog(
             "Response to a panic app",
             listOf(
@@ -428,7 +428,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                 PanicResponse.WIPE_EVERYTHING to "Erase everything",
             ),
             p.panicResponse, { picker = null },
-        ) { p.panicResponse = it }
+        ) { if (!s.decoy) p.panicResponse = it }
         Picker.ROTATION -> ChoiceDialog(
             "Rotate mailboxes", listOf(0 to "Never", 7 to "Every 7 days", 14 to "Every 14 days", 30 to "Every 30 days", 90 to "Every 90 days"),
             p.mailboxRotationDays, { picker = null },
@@ -485,7 +485,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
             "Panic wipe?",
             "All keys, contacts and messages are destroyed immediately. Your contacts won't be able to reach you. This can't be undone.",
             "Wipe everything", true, { confirmPanic = false },
-        ) { Wiper.wipeEverything(ctx) }
+        ) { Wiper.wipeEverything(ctx, killProcess = true) }
     }
 }
 
@@ -602,14 +602,15 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
     PinEntryDialog(
         "Duress PIN",
         "If someone forces you to unlock GoldfishSend, enter this PIN instead of your real one. You choose what it does afterwards: " +
-            "erase everything, or open without your hidden chats.",
+            "erase everything, or open a separate decoy profile. The duress PIN can never decrypt your real chats.",
         onDismiss = onDismiss,
         minLength = 4,
         removeLabel = if (on) "Remove" else null,
         onRemove = {
             if (!s.decoy) {
                 scope.launch(Dispatchers.Default) {
-                    vault.setDuress(null, null)
+                    vault.setDuress(null)
+                    app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
                     s.repo.kvPutString(AppLock.KV_DURESS_ON, null)
                     s.db.notifyChanged()
                 }
@@ -627,9 +628,9 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         onDismiss()
         scope.launch(Dispatchers.Default) {
             if (!s.decoy) {
-                val mk = s.masterKeyCopy()
-                vault.setDuress(pin, mk)
-                mk.fill(0)
+                // A verifier only: the duress PIN can't decrypt anything real. A new PIN starts a fresh decoy profile.
+                vault.setDuress(pin)
+                app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
                 s.repo.kvPutString(AppLock.KV_DURESS_ON, "1")
                 s.db.notifyChanged()
             }
@@ -665,7 +666,7 @@ private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         validate = { pin ->
             val copy = pin.copyOf()
             val clash = runCatching { vault.unlockWithPassphrase(copy) }.getOrNull()?.also { it.fill(0) } != null ||
-                vault.unlockWithDuress(pin)?.also { it.fill(0) } != null
+                vault.isDuress(pin)
             copy.fill('\u0000')
             if (clash) "This must be different from your other PINs." else null
         },

@@ -12,6 +12,7 @@ import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.PushEnvelope
+import app.goldfishsend.proto.Sanitize
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.sync.withLock
 import org.signal.libsignal.protocol.DuplicateMessageException
@@ -38,10 +39,11 @@ object Messenger {
 
     /** Entry point for every decrypted UnifiedPush payload. */
     suspend fun onPushPayload(bytes: ByteArray) {
-        val s = Graph.session.value ?: Graph.tryAutoUnlock()
+        val s = Graph.realSession ?: Graph.tryAutoUnlock()
         if (s == null) {
             LockedInbox.put(LockedInbox.KIND_PUSH, bytes)
-            if (PushEnvelope.parse(bytes) is PushEnvelope.Message) {
+            // Kept for the next real unlock. No notification while a decoy profile is on screen: it would give it away.
+            if (PushEnvelope.parse(bytes) is PushEnvelope.Message && Graph.session.value?.decoy != true) {
                 Notifier.newMessage(Graph.app, null, null)
             }
             return
@@ -82,12 +84,22 @@ object Messenger {
 
     private fun decrypt(s: Session, mb: Mailbox, blob: E2eBlob): Decrypted? = s.db.tx {
         val newContact = mb.contactId == null
-        if (newContact && blob.type != E2eBlob.PREKEY) {
-            return@tx null
+        if (newContact) {
+            // A new contact may only appear on a mailbox that was advertised in an invite, using that invite's own
+            // prekey. Pool or never-advertised mailboxes, or a hello re-tagged by a hostile relay onto another
+            // mailbox, are rejected.
+            if (blob.type != E2eBlob.PREKEY || !mb.inviteUsed || mb.inviteSpkId == null) {
+                return@tx null
+            }
+            if (PreKeySignalMessage(blob.body).signedPreKeyId != mb.inviteSpkId) {
+                return@tx null
+            }
         }
         val cid = mb.contactId ?: s.repo.createContact(
             name = Invites.DEFAULT_NAME,
-            verified = mb.purpose == Mailbox.PURPOSE_QR,
+            // Never verified on the inviter's side: whoever showed the code can't tell who scanned it (a photo, a
+            // shared screen). Only the scanner, who saw the code on the inviter's own phone, starts out verified.
+            verified = false,
             timerSecs = Graph.prefs.defaultTimerSecs,
             outServer = null,
             outSecret = null,
@@ -121,17 +133,18 @@ object Messenger {
         when (val c = d.content) {
             is Content.Hello -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
-                if (secret == null || secret.size != 32 || !ServerApi.isValidServer(c.server)) {
+                if (secret == null || secret.size != 32 || !ServerApi.isValidContactServer(c.server)) {
                     return
                 }
                 s.repo.updateContactOutbound(cid, c.server, secret)
                 val contact = s.repo.contact(cid)
-                val name = c.name?.take(64)?.trim()
-                if (!name.isNullOrEmpty() && contact?.name == Invites.DEFAULT_NAME) {
+                val name = Sanitize.name(c.name)
+                if (name != null && contact?.name == Invites.DEFAULT_NAME) {
                     s.repo.renameContact(cid, name)
                 }
                 if (d.newContact) {
                     systemMessage(s, cid, "Messages are end-to-end encrypted.")
+                    systemMessage(s, cid, "To make sure it's really them, compare safety numbers in their contact info.")
                     s.repo.touchContact(cid, false)
                     notify(s, cid, "Connected")
                 }
@@ -150,10 +163,14 @@ object Messenger {
                     systemMessage(s, cid, "Disappearing messages: ${timerLabel(secs)}")
                 }
             }
-            is Content.Delete -> s.repo.deleteIncomingByWire(cid, c.ids.take(500))
+            is Content.Delete -> {
+                s.repo.deleteIncomingByWire(cid, c.ids.take(500))
+                // The deleted text may still be in a notification.
+                Notifier.cancel(Graph.app)
+            }
             is Content.Mailbox -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
-                if (secret != null && secret.size == 32 && ServerApi.isValidServer(c.server)) {
+                if (secret != null && secret.size == 32 && ServerApi.isValidContactServer(c.server)) {
                     s.repo.updateContactOutbound(cid, c.server, secret)
                 }
             }
@@ -173,7 +190,8 @@ object Messenger {
             t.body
         }
         val now = System.currentTimeMillis()
-        val exp = (t.exp ?: 0).coerceIn(0, MAX_TIMER)
+        // The chat's own timer is the ceiling: a contact can't make messages outlive it, or keep them forever.
+        val exp = Sanitize.effectiveTimer(s.repo.contact(cid)?.timerSecs ?: 0, t.exp)
         val expiresAt = if (exp > 0 && !Graph.prefs.timerStartsOnRead) now + exp * 1000 else null
         val inserted = s.repo.insertMessage(
             contactId = cid,
@@ -181,7 +199,7 @@ object Messenger {
             outgoing = false,
             kind = MsgKind.TEXT,
             body = body,
-            ts = minOf(t.ts, now),
+            ts = Sanitize.timestamp(t.ts, now),
             receivedAt = now,
             expSecs = exp,
             viewOnce = t.once == true,
@@ -337,11 +355,28 @@ object Messenger {
         }
         s.repo.deleteMessage(messageId)
         s.db.notifyChanged()
+        Notifier.cancel(Graph.app)
+    }
+
+    /**
+     * Opens a received view-once message exactly once: the body is read into memory, then the row and its key are
+     * deleted before anything is displayed. Returns null if it was already viewed.
+     */
+    fun consumeViewOnce(s: Session, messageId: String): String? {
+        val m = s.repo.message(messageId) ?: return null
+        if (!m.viewOnce || m.outgoing) {
+            return null
+        }
+        s.repo.deleteMessage(messageId)
+        s.db.notifyChanged()
+        Notifier.cancel(Graph.app)
+        return m.body
     }
 
     fun deleteForMe(s: Session, messageId: String) {
         s.repo.deleteMessage(messageId)
         s.db.notifyChanged()
+        Notifier.cancel(Graph.app)
     }
 
     fun markChatRead(s: Session, cid: Long) {
@@ -358,11 +393,14 @@ object Messenger {
 
     /** Deletes a contact everywhere: our inbound mailbox on the server (best effort), then local state. */
     suspend fun deleteContact(s: Session, cid: Long) {
-        val mb = s.repo.mailboxForContact(cid)
+        // All of them, including mailboxes replaced by rotation that are still draining.
+        val boxes = s.repo.mailboxesForContact(cid)
         s.repo.deleteContact(cid)
+        s.repo.markNeedsVacuum()
         s.db.notifyChanged()
-        if (mb != null) {
-            runCatching { Mailboxes.deleteRemote(listOf(Mailboxes.item(mb))) }
+        Notifier.cancel(Graph.app)
+        if (boxes.isNotEmpty()) {
+            runCatching { Mailboxes.deleteRemote(boxes.map(Mailboxes::item)) }
         }
     }
 }

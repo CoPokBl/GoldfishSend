@@ -215,10 +215,13 @@ fun ConfirmDialog(title: String, text: String, confirm: String, destructive: Boo
         title = { Text(title) },
         text = { Text(text) },
         confirmButton = {
-            TextButton(onClick = {
-                onDismiss()
-                onConfirm()
-            }) {
+            TextButton(
+                onClick = {
+                    onDismiss()
+                    onConfirm()
+                },
+                modifier = Modifier.blockWhenObscured(),
+            ) {
                 Text(confirm, color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
             }
         },

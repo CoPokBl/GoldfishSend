@@ -58,8 +58,12 @@ data class RotateRequest(val items: List<MailboxItem>, val endpoint: String, val
 @Serializable
 data class ItemsRequest(val items: List<MailboxItem>)
 
+/**
+ * [endpointGone]: the server can no longer deliver to the push endpoint it has for these mailboxes. The client should
+ * re-register with its distributor (or re-run endpoint verification so the server probes again). Absent means false.
+ */
 @Serializable
-data class ExpiresResponse(val expiresAt: String)
+data class ExpiresResponse(val expiresAt: String, val endpointGone: Boolean = false)
 
 @Serializable
 data class IdResponse(val id: String)
@@ -79,9 +83,12 @@ class ApiException(
     /** For `rate_limited`: which limit was hit, one of `ip`, `network`, `mailbox` or `global` (docs/protocol.md). */
     val scope: String? = null,
 ) : IOException("api error $code ($status)", cause) {
-    /** Only the per-IP send limit can be paid off with a proof of work. Retrying any other scope just wastes CPU. */
+    /**
+     * On sends, the per-IP and per-network limits can be paid off with a proof of work (shared IPs, Tor, CGNAT).
+     * Mailbox and global limits can't, so retrying them with PoW just wastes CPU.
+     */
     val powCanHelp: Boolean
-        get() = status == 429 && scope == "ip"
+        get() = status == 429 && (scope == "ip" || scope == "network")
 
     val retryable: Boolean
         get() = code == "network" || code == "rate_limited" || status >= 500 || status == 0
@@ -93,6 +100,8 @@ class ApiException(
         fun humanize(code: String): String = when (code) {
             "network" -> "Couldn't reach the server. We'll keep trying."
             "rate_limited" -> "Things are busy right now. We'll try again shortly."
+            "bad_server" -> "That server sent something unexpected. We'll try again later."
+            "response_too_large" -> "That server sent something unexpected. We'll try again later."
             "not_found" -> "This contact can't be reached anymore."
             "too_large" -> "That message is too long."
             "mailbox_full" -> "Waiting for them to come back online."
@@ -166,7 +175,7 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
     suspend fun fetchInvite(id: String): ByteArray? = withContext(Dispatchers.IO) {
         val req = Request.Builder().url(url("v1/invites/$id")).get().build()
         try {
-            execute(req) { r -> r.body.bytes() }
+            execute(req) { r -> readCapped(r) }
         } catch (e: ApiException) {
             if (e.status == 404) null else throw e
         }
@@ -206,7 +215,7 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
                 return onOk(r)
             }
             val body = try {
-                lenient.decodeFromString(ErrorBody.serializer(), r.body.string())
+                lenient.decodeFromString(ErrorBody.serializer(), readCapped(r).toString(Charsets.UTF_8))
             } catch (e: Exception) {
                 ErrorBody("http_${r.code}")
             }
@@ -214,9 +223,36 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
         }
     }
 
-    private fun <T> decode(r: Response, ser: KSerializer<T>): T = lenient.decodeFromString(ser, r.body.string())
+    private fun <T> decode(r: Response, ser: KSerializer<T>): T = lenient.decodeFromString(ser, readCapped(r).toString(Charsets.UTF_8))
 
     companion object {
+        /**
+         * The largest response body we'll read. Every protocol response is far smaller (invites are at most 4 KiB). A hostile
+         * server (for example a contact's) can't stream gigabytes into memory.
+         */
+        const val MAX_RESPONSE_BYTES = 64 * 1024L
+
+        /** Reads at most [max] bytes of the body, failing instead of buffering anything larger. */
+        fun readCapped(r: Response, max: Long = MAX_RESPONSE_BYTES): ByteArray {
+            val body = r.body
+            val declared = body.contentLength()
+            if (declared > max) {
+                throw ApiException("response_too_large", r.code)
+            }
+            val source = body.source()
+            val buf = okio.Buffer()
+            while (true) {
+                val n = source.read(buf, 8192)
+                if (n == -1L) {
+                    break
+                }
+                if (buf.size > max) {
+                    throw ApiException("response_too_large", r.code)
+                }
+            }
+            return buf.readByteArray()
+        }
+
         private val JSON = "application/json".toMediaType()
         /** Required verbatim by POST /v1/messages and /v1/invites. */
         val OCTET = "application/octet-stream".toMediaType()
@@ -247,6 +283,20 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
             true
         } catch (e: ApiException) {
             false
+        }
+
+        /**
+         * Stricter check for server URLs that come from other people (invites, `hello`, `mailbox` messages): https on the
+         * default port 443, or a valid v3 onion. That keeps a contact from steering our requests at arbitrary ports or
+         * local services. Debug builds keep the looser rule for local testing.
+         */
+        fun isValidContactServer(raw: String): Boolean {
+            val u = try {
+                parseBase(raw)
+            } catch (e: ApiException) {
+                return false
+            }
+            return NetRules.isAcceptableContactServer(u.scheme, u.host, u.port, BuildConfig.ALLOW_HTTP)
         }
 
         /**

@@ -43,13 +43,19 @@ class MainActivity : FragmentActivity() {
         handleIntent(intent)
     }
 
+    /**
+     * Invite links are never acted on automatically: AppRoot asks the user first (after unlock). The intent is replaced by
+     * a clean one with no data and no extras, so the invite secret isn't kept in the activity, and Navigation can't act on
+     * deep-link extras.
+     */
     private fun handleIntent(intent: Intent?) {
-        val data = intent?.dataString ?: return
-        if (InviteLink.parse(data) != null) {
+        val data = intent?.dataString
+        if (data != null && InviteLink.parse(data) != null) {
             pendingLink.value = data
         }
-        // Don't keep the invite secret in the activity's intent.
-        intent.data = null
+        if (intent != null && (intent.data != null || intent.extras != null)) {
+            setIntent(Intent(this, MainActivity::class.java))
+        }
     }
 
     /** FLAG_SECURE blocks screenshots and screen recording, and blanks the recent-apps preview. It's on by default. */

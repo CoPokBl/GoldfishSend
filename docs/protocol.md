@@ -137,6 +137,14 @@ resumes on its own if one starts accepting again. Clients that call refresh peri
 ### `GET /v1/invites/{id}`: fetch an invite blob and delete it atomically
 - `200` with raw bytes, or `404 not_found`. **Fetching deletes it**: an invite works exactly once.
 
+## Client notes
+
+- Verification bodies may be padded. The code is always the first 16 bytes.
+- An `endpointGone: true` on refresh or verify makes the client re-register with its distributor and rotate its mailboxes, which triggers a fresh verification push. It does this at most once every 6 hours.
+- On `POST /v1/messages`, a `429` with scope `ip` or `network` is retried once with `GF-PoW`. Clients refuse challenges harder than 28 bits.
+- Clients read at most 64 KiB of any response body.
+- A first PreKey `hello` is only accepted on the mailbox whose invite published that signed prekey.
+
 ## Client-side formats (opaque to the server)
 
 ### Invite QR code / link

@@ -17,38 +17,70 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Destruction paths. Keys are always destroyed first, so data is unrecoverable even if file deletion is interrupted. */
 object Wiper {
-    /** Erases all messages. While locked this works by destroying the message root key (instant crypto-shred). */
+    /**
+     * Erases all messages, including pushes waiting in the locked inbox. While locked this works by destroying the message
+     * root key (an instant crypto-shred) and the per-expiry bucket keys. The inbox key pair is replaced at the next unlock,
+     * so remnants of old sealed pushes can never be opened again.
+     */
     fun wipeMessages() {
-        val s = Graph.session.value
+        val s = Graph.realSession
+        LockedInbox.clear()
         if (s != null) {
             s.repo.wipeAllMessages()
+            LockedInbox.rotateKeys(s)
             s.db.notifyChanged()
         } else {
             Graph.vault.destroyMessageKey()
+            Graph.prefs.inboxRotatePending = true
         }
+        app.goldfishsend.crypto.BucketKeys.destroyAll()
         Notifier.cancelAll(Graph.app)
     }
 
-    /** Restart detection: BOOT_COMPLETED *and* a BOOT_COUNT comparison at every start, so a reboot can't be missed. */
+    /**
+     * Restart detection: BOOT_COMPLETED *and* a BOOT_COUNT comparison at every start, so a reboot can't be missed. The
+     * handled boot count is persisted, so the same boot is never handled twice (which would shred messages received since).
+     */
     fun checkBoot(ctx: Context, fromBootBroadcast: Boolean) {
         val count = Settings.Global.getInt(ctx.contentResolver, Settings.Global.BOOT_COUNT, -1)
         val prefs = Graph.prefs
-        val rebooted = fromBootBroadcast || (count != -1 && prefs.lastBootCount != -1 && count != prefs.lastBootCount)
+        val rebooted = if (count != -1) {
+            prefs.lastBootCount != -1 && count != prefs.lastBootCount
+        } else {
+            // No boot counter on this device: the broadcast is the only signal.
+            fromBootBroadcast
+        }
         if (count != -1) {
             prefs.lastBootCount = count
         }
         if (rebooted && prefs.wipeOnReboot && prefs.onboarded) {
-            Graph.vault.destroyMessageKey()
+            wipeMessages()
         }
     }
 
-    /** Dead-man switch: wipe everything if the app hasn't been unlocked for N days. */
+    /** Records that the user is here (interactive unlock, or the app is in the foreground while unlocked). */
+    fun recordPresence(ctx: Context = Graph.app) {
+        Graph.prefs.presence = Presence.Mark(
+            System.currentTimeMillis(),
+            android.os.SystemClock.elapsedRealtime(),
+            Settings.Global.getInt(ctx.contentResolver, Settings.Global.BOOT_COUNT, -1),
+        )
+    }
+
+    /** Dead-man switch: wipe everything if the user hasn't been present for N days. Background wake-ups don't count. */
     fun checkInactivity(ctx: Context) {
         val days = Graph.prefs.inactivityWipeDays
         if (days <= 0 || !Graph.prefs.onboarded) {
             return
         }
-        if (System.currentTimeMillis() - Graph.prefs.lastUnlockAt > days * 86_400_000L) {
+        val last = Graph.prefs.presence
+        if (last == null) {
+            // First run with the feature (or an upgrade): start the clock now rather than erasing.
+            recordPresence(ctx)
+            return
+        }
+        val boot = Settings.Global.getInt(ctx.contentResolver, Settings.Global.BOOT_COUNT, -1)
+        if (Presence.shouldWipe(last, days, System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime(), boot)) {
             wipeEverything(ctx)
         }
     }
@@ -58,13 +90,20 @@ object Wiper {
      * Inbound mailboxes are then deleted on the server on a best-effort basis, from a snapshot taken before the keys went.
      */
     @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun wipeEverything(ctx: Context) {
-        val s = Graph.session.value
+    fun wipeEverything(ctx: Context, killProcess: Boolean = false) {
+        val s = Graph.realSession
         val remote = s?.let { runCatching { it.repo.allMailboxes().map(Mailboxes::item) }.getOrNull() }.orEmpty()
         val server = Graph.prefs.serverUrl
         Graph.lock()
         Graph.vault.destroyAll()
+        app.goldfishsend.crypto.BucketKeys.destroyAll()
+        // Anything copied from a chat goes too.
+        runCatching {
+            val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+            cm.clearPrimaryClip()
+        }
         Db.deleteFiles(ctx)
+        Db.deleteFiles(ctx, Db.DECOY_NAME)
         LockedInbox.clear()
         PushHub.unregister(ctx)
         Notifier.cancelAll(ctx)
@@ -77,6 +116,10 @@ object Wiper {
             NetPrefs.clear()
             TorManager.deleteState(ctx)
             Graph.resetHttp()
+            if (killProcess) {
+                // Panic wipe: nothing of this process (decrypted strings, caches) survives in memory.
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }
         }
         if (remote.isNotEmpty()) {
             GlobalScope.launch {

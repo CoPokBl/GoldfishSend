@@ -39,15 +39,33 @@ object AppLock {
 
     fun onBackground() {
         backgroundedAt = SystemClock.elapsedRealtime()
-        if (lockable && Graph.prefs.lockTimeoutSecs == 0) {
+        val timeout = Graph.prefs.lockTimeoutSecs
+        if (lockable && timeout == 0) {
             Graph.lock()
+        } else if (lockable) {
+            // Lock on schedule while in the background too, so the key doesn't stay in RAM (and pushes don't get processed
+            // with names in notifications) until the user happens to come back.
+            handler.removeCallbacks(timedLock)
+            handler.postDelayed(timedLock, timeout * 1000L)
         }
     }
 
     fun onForeground() {
+        handler.removeCallbacks(timedLock)
         val at = backgroundedAt
         backgroundedAt = null
         if (lockable && at != null && SystemClock.elapsedRealtime() - at >= Graph.prefs.lockTimeoutSecs * 1000L) {
+            Graph.lock()
+        }
+        // The user is looking at the app. Background auto-unlocks never count as presence.
+        if (Graph.isUnlocked) {
+            Wiper.recordPresence()
+        }
+    }
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val timedLock = Runnable {
+        if (lockable && backgroundedAt != null) {
             Graph.lock()
         }
     }
@@ -75,18 +93,18 @@ object AppLock {
                     prefs.failedAttempts = failed - 1
                     return@withLock UnlockResult.DeviceLocked
                 }
-                // Always check the duress slot too, so timing doesn't reveal whether a duress PIN exists.
-                val duress = vault.unlockWithDuress(passphrase)
+                // Always check the duress verifier too, so timing doesn't reveal whether a duress PIN exists.
+                val duress = real == null && vault.isDuress(passphrase)
                 when {
                     real != null -> {
-                        duress?.wipe()
                         prefs.failedAttempts = 0
                         afterUnlock(Graph.openSession(real))
+                        Wiper.recordPresence()
                         UnlockResult.Ok
                     }
-                    duress != null -> {
+                    duress -> {
                         prefs.failedAttempts = 0
-                        onDuress(duress)
+                        onDuress(passphrase)
                     }
                     else -> {
                         val max = prefs.maxFailedAttempts
@@ -104,37 +122,39 @@ object AppLock {
         }
     }
 
-    /** The duress PIN was entered. Depending on the user's choice: erase everything, or open a decoy view without hidden chats. */
-    private suspend fun onDuress(mk: ByteArray): UnlockResult {
-        val action = Graph.prefs.duressAction
-        if (action == DuressAction.WIPE_ALL) {
-            mk.wipe()
+    /**
+     * The duress PIN was entered. It can't decrypt anything real. Either everything is erased, or the separate decoy
+     * profile opens (keyed by the duress PIN alone), and the real data stays encrypted and untouched.
+     */
+    private suspend fun onDuress(pin: CharArray): UnlockResult {
+        if (Graph.prefs.duressAction == DuressAction.WIPE_ALL) {
             Wiper.wipeEverything(Graph.app)
             return UnlockResult.Wiped
         }
-        val s = Graph.openSession(mk)
-        s.decoy = true
-        s.hiddenRevealed.value = false
-        if (action == DuressAction.DELETE_HIDDEN_CHATS) {
-            for (cid in s.repo.hiddenContactIds()) {
-                runCatching { Messenger.deleteContact(s, cid) }
-            }
-            Graph.vault.setHiddenPin(null)
-            s.repo.kvPutString(KV_HIDDEN_ON, null)
-        }
-        afterUnlock(s)
+        Graph.openDecoySession(Graph.vault.decoyKey(pin))
         return UnlockResult.Ok
     }
 
     suspend fun unlockWithMasterKey(mk: ByteArray) {
         Graph.prefs.failedAttempts = 0
         afterUnlock(Graph.openSession(mk))
+        Wiper.recordPresence()
     }
 
     /** Catch-up work once the DB is open: locked inbox, expiry sweep, outbox, mailbox pool. */
     fun afterUnlock(s: Session) {
+        // A decoy session never touches real data or the server.
+        if (s.decoy) {
+            return
+        }
         Graph.scope.launchSafe {
             LockedInbox.drain(s)
+            if (Graph.prefs.inboxRotatePending) {
+                // A reboot wipe happened while locked. Pushes sealed since the reboot were just drained; anything older
+                // was deleted. Replace the key pair so no remnant of an old sealed push can ever be opened.
+                LockedInbox.rotateKeys(s)
+                Graph.prefs.inboxRotatePending = false
+            }
             Sweeper.sweep(s)
             Outbox.kick()
             Mailboxes.cleanup(s)

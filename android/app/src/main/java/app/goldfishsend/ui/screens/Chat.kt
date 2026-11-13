@@ -123,7 +123,8 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
     var draft by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<Message?>(null) }
     var info by remember { mutableStateOf<Message?>(null) }
-    var viewing by remember { mutableStateOf<Message?>(null) }
+    // The text of a view-once message being shown. It exists only in memory: the message was deleted before display.
+    var viewing by remember { mutableStateOf<String?>(null) }
     var timerMenu by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val atBottom by remember { derivedStateOf { listState.firstVisibleItemIndex <= 1 } }
@@ -225,7 +226,11 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                                 onLongPress = { selected = m },
                                 onTap = {
                                     if (m.viewOnce && !m.outgoing) {
-                                        viewing = m
+                                        scope.launch(Dispatchers.IO) {
+                                            // Consumed (deleted, key shredded) *before* it's shown, so rotation, process
+                                            // death, locking or dismissing can never show it twice.
+                                            Messenger.consumeViewOnce(s, m.id)?.let { viewing = it }
+                                        }
                                     } else if (m.status == MsgStatus.FAILED) {
                                         scope.launch(Dispatchers.IO) { Outbox.retry(s, m.id) }
                                     }
@@ -270,20 +275,12 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
         )
     }
     info?.let { m -> MessageInfo(m) { info = null } }
-    viewing?.let { m ->
+    viewing?.let { body ->
         AlertDialog(
-            onDismissRequest = {
-                viewing = null
-                scope.launch(Dispatchers.IO) { Messenger.deleteForMe(s, m.id) }
-            },
+            onDismissRequest = { viewing = null },
             title = { Text("View once") },
-            text = { Text(m.body, style = MaterialTheme.typography.bodyLarge) },
-            confirmButton = {
-                TextButton(onClick = {
-                    viewing = null
-                    scope.launch(Dispatchers.IO) { Messenger.deleteForMe(s, m.id) }
-                }) { Text("Done") }
-            },
+            text = { Text(body, style = MaterialTheme.typography.bodyLarge) },
+            confirmButton = { TextButton(onClick = { viewing = null }) { Text("Done") } },
         )
     }
 }

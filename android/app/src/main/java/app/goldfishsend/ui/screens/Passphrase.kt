@@ -1,5 +1,7 @@
 package app.goldfishsend.ui.screens
 
+import androidx.compose.runtime.LaunchedEffect
+import app.goldfishsend.ui.components.rememberReAuth
 import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -42,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Session
+import app.goldfishsend.crypto.KeyVault
 import app.goldfishsend.crypto.UnlockMethod
 import app.goldfishsend.ui.components.ConfirmDialog
 import app.goldfishsend.ui.components.FieldKind
@@ -85,34 +88,57 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
     var firstPin by remember { mutableStateOf<CharArray?>(null) }
     var pass by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
+    // Reached from Settings and from the Security tab: either way, confirm it's the owner before anything changes.
+    val reauth = rememberReAuth(s, activity)
+    var authed by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        reauth.require("Changing how GoldfishSend unlocks.", cancel = back) { authed = true }
+    }
 
+    /** Every change generates a new master key and rekeys the database (KeyVault: master-key rotation). */
     fun saveSecret(secret: CharArray?, isPin: Boolean) {
+        if (s.decoy) {
+            // Pretend: a decoy session must never change how the real data is protected.
+            secret?.fill('\u0000')
+            back()
+            return
+        }
         busy = true
         scope.launch {
-            withContext(Dispatchers.Default) {
-                val mk = s.masterKeyCopy()
-                vault.changePassphrase(mk, secret, isPin)
-                mk.fill(0)
+            try {
+                withContext(Dispatchers.Default) {
+                    Graph.changeUnlock(s, if (secret == null) KeyVault.Target.None else KeyVault.Target.Secret(secret, isPin))
+                }
+                back()
+            } catch (e: Exception) {
+                busy = false
+                error = "Couldn't change the unlock method. Nothing was changed. Try again."
+            } finally {
                 secret?.fill('\u0000')
             }
-            if (secret == null) {
-                Graph.prefs.biometricUnlock = false
-            }
-            back()
         }
     }
 
     fun enableScreenLock() {
+        if (s.decoy) {
+            back()
+            return
+        }
         val cipher = runCatching { vault.screenLockEncryptCipher() }.getOrElse {
             error = "Your phone's screen lock couldn't be used. Make sure a PIN, pattern or password is set."
             return
         }
         promptScreenLock(activity, "Confirm your screen lock", cipher, onSuccess = { c ->
-            val mk = s.masterKeyCopy()
-            vault.enableScreenLock(mk, c)
-            mk.fill(0)
-            Graph.prefs.biometricUnlock = false
-            back()
+            busy = true
+            scope.launch {
+                try {
+                    withContext(Dispatchers.Default) { Graph.changeUnlock(s, KeyVault.Target.ScreenLock(c)) }
+                    back()
+                } catch (e: Exception) {
+                    busy = false
+                    error = "Couldn't switch to your screen lock. Nothing was changed. Try again."
+                }
+            }
         }, onError = { msg -> if (msg != null) error = msg })
     }
 
@@ -147,7 +173,7 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
             Modifier.padding(pad).fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            when (step) {
+            if (authed) when (step) {
                 Step.CHOOSE -> {
                     Option(
                         "No app lock", "GoldfishSend opens whenever your phone is unlocked.",

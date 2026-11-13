@@ -35,7 +35,9 @@ sealed class PushEnvelope(val tag: ByteArray) {
             val body = bytes.copyOfRange(HEADER, bytes.size)
             return when (bytes[1]) {
                 TYPE_MESSAGE -> if (body.isNotEmpty()) Message(tag, body) else null
-                TYPE_VERIFICATION -> if (body.size == CODE_BYTES) Verification(tag, body) else null
+                // The server may pad the verification body with random bytes so it looks like a message. The code is
+                // always the first 16 bytes.
+                TYPE_VERIFICATION -> if (body.size >= CODE_BYTES) Verification(tag, body.copyOf(CODE_BYTES)) else null
                 else -> null
             }
         }

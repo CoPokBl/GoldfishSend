@@ -15,7 +15,11 @@ enum class NotificationContent { NONE, NAME, NAME_AND_MESSAGE }
  */
 enum class PanicResponse { OFF, LOCK, WIPE_MESSAGES, WIPE_EVERYTHING }
 
-enum class DuressAction { WIPE_ALL, HIDE_HIDDEN_CHATS, DELETE_HIDDEN_CHATS }
+/**
+ * What the duress PIN does. WIPE_ALL erases everything. DECOY opens a separate, independent decoy profile, while the real
+ * data stays encrypted and untouched (the duress PIN can't decrypt it).
+ */
+enum class DuressAction { WIPE_ALL, DECOY }
 
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("gf_prefs", Context.MODE_PRIVATE)
@@ -116,9 +120,30 @@ class Prefs(context: Context) {
         get() = int("inactivity_days", 0)
         set(v) = setInt("inactivity_days", v)
 
-    var lastUnlockAt: Long
-        get() = long("last_unlock", System.currentTimeMillis())
-        set(v) = sp.edit().putLong("last_unlock", v).apply()
+    /** Last time the user was present (interactive unlock or app in the foreground). Null until first recorded. */
+    var presence: app.goldfishsend.security.Presence.Mark?
+        get() {
+            if (!sp.contains("presence_wall")) {
+                return null
+            }
+            return app.goldfishsend.security.Presence.Mark(
+                sp.getLong("presence_wall", 0), sp.getLong("presence_elapsed", 0), sp.getInt("presence_boot", -1),
+            )
+        }
+        set(v) {
+            val e = sp.edit()
+            if (v == null) {
+                e.remove("presence_wall").remove("presence_elapsed").remove("presence_boot")
+            } else {
+                e.putLong("presence_wall", v.wallMs).putLong("presence_elapsed", v.elapsedMs).putInt("presence_boot", v.bootCount)
+            }
+            e.commit()
+        }
+
+    /** Set by a reboot wipe while locked: the locked-inbox key pair is replaced at the next unlock (after draining). */
+    var inboxRotatePending: Boolean
+        get() = bool("inbox_rotate", false)
+        set(v) = setBool("inbox_rotate", v)
 
     /** Disappearing timer applied to new chats. */
     var defaultTimerSecs: Long
@@ -183,7 +208,12 @@ class Prefs(context: Context) {
 
     /** What the duress PIN does. WIPE_ALL keeps the original behaviour. The others open the app without hidden chats. */
     var duressAction: DuressAction
-        get() = runCatching { DuressAction.valueOf(str("duress_action") ?: "") }.getOrDefault(DuressAction.WIPE_ALL)
+        get() = when (val v = str("duress_action")) {
+            null -> DuressAction.WIPE_ALL
+            // Older non-erasing choices (they needed the real key) become the decoy profile.
+            "HIDE_HIDDEN_CHATS", "DELETE_HIDDEN_CHATS" -> DuressAction.DECOY
+            else -> runCatching { DuressAction.valueOf(v) }.getOrDefault(DuressAction.WIPE_ALL)
+        }
         set(v) = setStr("duress_action", v.name)
 
     /** Whether hidden chats post notifications at all (generic ones, never contents). Off by default. */

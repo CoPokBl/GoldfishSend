@@ -5,25 +5,37 @@ import app.goldfishsend.proto.Rand
 import java.io.File
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.signal.libsignal.protocol.ecc.ECPublicKey
 
 /**
  * Pushes that arrive while the app is locked can't touch the encrypted DB. They're sealed (HPKE through libsignal) to the
  * inbox public key and written to disk. The private key lives inside the DB, so they open only after unlock.
+ *
+ * The inbox is bounded (count and bytes), so a flood can't fill storage. File names are random (no receive times), and
+ * items whose processing fails are kept for a few retries instead of being lost.
  */
 object LockedInbox {
     const val KIND_PUSH: Byte = 1
     const val KIND_ENDPOINT: Byte = 2
     private const val INFO = "gf/inbox/v1"
+    const val MAX_FILES = 500
+    const val MAX_BYTES = 8L * 1024 * 1024
+    private const val MAX_RETRIES = 3
     private val mutex = Mutex()
 
     private fun dir(): File = File(Graph.app.noBackupFilesDir, "inbox").apply { mkdirs() }
 
-    fun put(kind: Byte, data: ByteArray) {
-        val pub = Graph.prefs.inboxPublicKey ?: return
+    /** Seals and stores one item. Returns false if the inbox is full (or no key exists yet). */
+    fun put(kind: Byte, data: ByteArray): Boolean {
+        val pub = Graph.prefs.inboxPublicKey ?: return false
         val sealed = ECPublicKey(B64.dec(pub)).seal(byteArrayOf(kind) + data, INFO, ByteArray(0))
-        val name = "%013d-%s.bin".format(System.currentTimeMillis(), B64.enc(Rand.bytes(6)))
-        File(dir(), name).writeBytes(sealed)
+        val existing = dir().listFiles().orEmpty()
+        if (existing.size >= MAX_FILES || existing.sumOf { it.length() } + sealed.size > MAX_BYTES) {
+            return false
+        }
+        File(dir(), "${B64.enc(Rand.bytes(12))}.0.bin").writeBytes(sealed)
+        return true
     }
 
     val isEmpty: Boolean
@@ -31,7 +43,7 @@ object LockedInbox {
 
     /** Opens and processes everything queued while locked, oldest first. */
     suspend fun drain(s: Session) = mutex.withLock {
-        val files = dir().listFiles()?.sortedBy { it.name } ?: return@withLock
+        val files = dir().listFiles()?.sortedBy { it.lastModified() } ?: return@withLock
         if (files.isEmpty()) {
             return@withLock
         }
@@ -42,12 +54,13 @@ object LockedInbox {
             } catch (e: Exception) {
                 null
             }
-            f.delete()
             if (pt == null || pt.isEmpty()) {
+                // Sealed to an older key (rotated after a reboot wipe) or corrupt: it can never be opened.
+                f.delete()
                 continue
             }
             val body = pt.copyOfRange(1, pt.size)
-            try {
+            val ok = try {
                 when (pt[0]) {
                     KIND_PUSH -> Messenger.handle(s, body)
                     KIND_ENDPOINT -> Mailboxes.onNewEndpoint(
@@ -55,10 +68,35 @@ object LockedInbox {
                         app.goldfishsend.proto.ProtoJson.decodeFromString(PushEndpointData.serializer(), body.toString(Charsets.UTF_8)),
                     )
                 }
+                true
             } catch (e: Exception) {
                 android.util.Log.w("LockedInbox", "item failed: ${e.javaClass.simpleName}")
+                false
+            }
+            if (ok) {
+                f.delete()
+            } else {
+                retryLater(f)
             }
         }
+    }
+
+    /** Keeps a failed item for a later drain, up to [MAX_RETRIES] times. */
+    private fun retryLater(f: File) {
+        val parts = f.name.split('.')
+        val tries = parts.getOrNull(1)?.toIntOrNull() ?: MAX_RETRIES
+        if (tries + 1 >= MAX_RETRIES) {
+            f.delete()
+        } else {
+            f.renameTo(File(f.parentFile, "${parts[0]}.${tries + 1}.bin"))
+        }
+    }
+
+    /** Creates a fresh key pair. The old private key is overwritten in the DB (secure_delete zeroes the freed page). */
+    fun rotateKeys(s: Session) {
+        val kp = ECKeyPair.generate()
+        s.repo.kvPut("inbox_priv", kp.privateKey.serialize())
+        Graph.prefs.inboxPublicKey = B64.enc(kp.publicKey.serialize())
     }
 
     fun clear() {
