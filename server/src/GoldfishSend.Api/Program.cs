@@ -16,6 +16,14 @@ if (args is ["keygen", ..]) {
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
+if (args is ["fingerprint", ..]) {
+    var configured = builder.Configuration["Goldfish:Keys:ServerKey"] ?? "";
+    var identity = ServerKey.FromBase64Url(configured);
+    Console.WriteLine(identity.FingerprintBase64Url);
+    Console.Error.WriteLine($"Server key fingerprint: {identity.FingerprintDisplay}");
+    return;
+}
+
 var options = builder.Configuration.GetSection(GoldfishOptions.Section).Get<GoldfishOptions>() ?? new GoldfishOptions();
 if (options.Push.DangerouslyAllowInsecureLoopback && !builder.Environment.IsDevelopment()) {
     throw new InvalidOperationException("Goldfish:Push:DangerouslyAllowInsecureLoopback is only allowed in the Development environment.");
@@ -28,7 +36,8 @@ var redis = builder.Configuration.GetConnectionString("Redis")
 
 builder.WebHost.ConfigureKestrel(kestrel => {
     kestrel.AddServerHeader = false;
-    kestrel.Limits.MaxRequestBodySize = 16 * 1024;
+    // The gateway's outer body: a 16 KiB inner body plus padding and ~1.2 KB of KEM ciphertext.
+    kestrel.Limits.MaxRequestBodySize = GatewayMiddleware.MaxOuterBody;
     kestrel.Limits.MaxRequestHeadersTotalSize = 16 * 1024;
     kestrel.Limits.MaxRequestHeaderCount = 50;
     kestrel.Limits.MaxRequestLineSize = 4 * 1024;
@@ -67,6 +76,14 @@ builder.Services.AddRequestTimeouts(timeouts => {
 
 builder.Services.AddGoldfish(options, mySql, redis, builder.Configuration.GetConnectionString("RedisEphemeral"));
 
+// The server's identity and gateway key. API nodes need it; worker-only nodes never touch client requests.
+ServerKey? serverKey = null;
+if (options.HasRole("api")) {
+    serverKey = ServerKey.FromBase64Url(options.Keys.ServerKey);
+    builder.Services.AddSingleton(serverKey);
+    builder.Services.AddSingleton<GatewayFloodGuard>();
+}
+
 var app = builder.Build();
 
 var startupLog = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("GoldfishSend.Startup");
@@ -75,6 +92,11 @@ if (options.HasRole("api") && trustedProxyNetworks.Length == 0 && !app.Environme
 }
 if (!app.Services.GetRequiredService<GoldfishSend.Infrastructure.Redis.EphemeralRedis>().IsSeparate && !app.Environment.IsDevelopment()) {
     startupLog.LogWarning("ConnectionStrings:RedisEphemeral is not set. Rate-limit state shares the persistent Redis, whose AOF then records client activity.");
+}
+
+if (serverKey is not null) {
+    // Public: operators publish it, and clients pin it.
+    startupLog.LogInformation("Server key fingerprint: {Fingerprint} ({FingerprintBase64Url})", serverKey.FingerprintDisplay, serverKey.FingerprintBase64Url);
 }
 
 await app.Services.GetRequiredService<Migrator>().MigrateAsync();
@@ -129,6 +151,12 @@ app.Use(async (context, next) => {
 app.UseRequestTimeouts();
 
 if (options.HasRole("api")) {
+    // The gateway rewrites each request into its decrypted inner request, so routing must come after it.
+    app.UseMiddleware<GatewayMiddleware>();
+}
+app.UseRouting();
+
+if (options.HasRole("api")) {
     app.MapGoldfishApi();
 } else {
     app.MapGoldfishHealth();
@@ -152,6 +180,8 @@ static void PrintKeys() {
     string Key() => Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(32));
     var vapid = VapidSigner.GeneratePrivateKey();
     using var signer = new VapidSigner(vapid, "mailto:admin@example.invalid");
+    var serverSecret = GatewayCrypto.GenerateSecret();
+    var identity = new ServerKey(serverSecret);
     Console.WriteLine($$"""
         {
           "Goldfish": {
@@ -160,12 +190,15 @@ static void PrintKeys() {
               "SealSalt": "{{Key()}}",
               "EpochKek": "{{Key()}}",
               "VapidPrivateKey": "{{Base64Url.EncodeToString(vapid)}}",
+              "ServerKey": "{{Base64Url.EncodeToString(serverSecret)}}",
               "VapidSubject": "mailto:you@your-domain"
             }
           }
         }
         """);
     Console.Error.WriteLine($"VAPID public key: {signer.PublicKeyBase64Url}");
+    Console.Error.WriteLine($"Server key fingerprint: {identity.FingerprintDisplay}");
+    Console.Error.WriteLine($"  for -Pgf.defaultServerKey: {identity.FingerprintBase64Url}");
     Console.Error.WriteLine("Store these as secrets (env vars Goldfish__Keys__Pepper etc. or a mounted file). Losing Pepper/SealSalt orphans all mailboxes.");
 }
 

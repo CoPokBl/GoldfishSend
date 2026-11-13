@@ -23,6 +23,11 @@ There are no accounts. A recipient creates **one mailbox per contact** and gives
 - **Push endpoint URLs at rest.** An endpoint is unsealed in memory only for the moment a valid `sendSecret`
   arrives with a message, and it is never returned by the API or logged.
 - **Your contact graph.** There's no contact discovery. It is impossible by design.
+- **Your API calls, even at the TLS terminator.** Every request is end-to-end encrypted to the server's own key
+  (a hybrid of ML-KEM-768 and P-256, so it holds against a future quantum computer too) and sent as
+  `POST /v1/gw`. Caddy, Traefik or a load balancer that terminates TLS sees only opaque bodies in a few fixed
+  sizes: not which endpoint was called, nor any secret, push endpoint or invite id. Clients pin that key, so a
+  forged or mis-issued TLS certificate gets an attacker nothing either. See [Server identity](#server-identity).
 - **Client IP addresses beyond the request.** IPs are used in memory for rate limiting, as
   `HMAC(daily random key, IPv4 address or IPv6 /64)`, with short TTLs. Raw IPs are never stored or logged, and
   there are no access logs anywhere in the stack.
@@ -48,6 +53,7 @@ trust, and don't put a logging CDN or WAF in front of it. The full picture, for 
 
 ```
  client ──TLS 1.3──▶ caddy ──▶ api ──▶ MySQL (mailboxes, held messages, epoch keys)
+   └──── gateway encryption (server key) ────┘
                                  │  └─▶ Redis (queue stream, rate limits, PoW, idempotency, invites)
                                  │                │
                                  │             worker ──Web Push + VAPID──▶ push server ──▶ device
@@ -58,7 +64,7 @@ One image, two roles, selected with `Goldfish:Roles` (`api`, `worker`, or the de
 
 | Role | What runs |
 |---|---|
-| `api` | Minimal-API endpoints under `/v1`, plus `/healthz` and `/readyz`. Accepts messages into the Redis stream and sends verification pushes itself. |
+| `api` | The encrypted gateway (`POST /v1/gw`, `GET /v1/key`) in front of the minimal-API endpoints under `/v1`, plus `/healthz` and `/readyz`. Accepts messages into the Redis stream and sends verification pushes itself. |
 | `worker` | `StreamDeliveryWorker` (consumes `gf:q`, delivers, moves failures to MySQL), `RetryWorker` (retries held messages with backoff under a lease), `MaintenanceWorker` (every minute: rotate and shred epoch keys, delete expired messages, purge expired or unverified mailboxes). Serves only `/healthz`. |
 
 Every process runs the embedded SQL migrations (serialised by a MySQL named lock) and creates today's and
@@ -68,9 +74,9 @@ Source layout:
 
 | Path | Contents |
 |---|---|
-| `src/GoldfishSend.Core` | Options, protocol types, crypto (RFC 8291 Web Push, VAPID, mailbox sealing, PoW, SecretBox), endpoint validation and IP range filtering. No I/O. |
+| `src/GoldfishSend.Core` | Options, protocol types, crypto (the gateway's hybrid ML-KEM-768 + P-256 encryption, RFC 8291 Web Push, VAPID, mailbox sealing, PoW, SecretBox), endpoint validation and IP range filtering. No I/O. |
 | `src/GoldfishSend.Infrastructure` | MySQL (Dapper + MySqlConnector, migrations, epoch keyring), Redis (queue, GCRA limiter in Lua, PoW and ephemeral stores), SSRF-safe push client, services and background workers. |
-| `src/GoldfishSend.Api` | `Program.cs` (Kestrel limits, forwarded headers, security headers, `keygen`) and endpoints. |
+| `src/GoldfishSend.Api` | `Program.cs` (Kestrel limits, forwarded headers, security headers, `keygen`, `fingerprint`), the gateway middleware and endpoints. |
 | `tests/GoldfishSend.Tests` | Unit tests and Testcontainers-based integration tests. |
 | `tools/HealthProbe` | A tiny HTTP probe used by container healthchecks (the runtime image has no shell or curl). |
 | `Dockerfile` | Multi-stage build to a distroless (`noble-chiseled`) non-root runtime image. |
@@ -94,7 +100,7 @@ podman run -d --name gf-redis -p 127.0.0.1:6379:6379 \
 
 cd server
 
-# Generate a development key set (JSON on stdout, VAPID public key on stderr)
+# Generate a development key set (JSON on stdout; the VAPID public key and server key fingerprint on stderr)
 dotnet run --project src/GoldfishSend.Api -- keygen > ../goldfish-dev-keys.json
 
 # Export the keys and connection strings (bash; needs jq)
@@ -105,8 +111,12 @@ export ConnectionStrings__Redis='127.0.0.1:6379,password=dev'
 # Run (the "http" launch profile listens on http://localhost:5234 in the Development environment)
 dotnet run --project src/GoldfishSend.Api
 
-curl -s http://localhost:5234/v1/info
+curl -s http://localhost:5234/v1/key | wc -c    # 1250: the server key blob
 ```
+
+Every other API call goes through the encrypted gateway, so plain `curl` gets a 404 for `/v1/info` and friends. The
+tests' `GatewayHandler` (in `tests/GoldfishSend.Tests/Integration`) is a client-side implementation to borrow when
+scripting against the API.
 
 Don't commit `goldfish-dev-keys.json`, and never reuse development keys in production.
 
@@ -143,7 +153,7 @@ environment variables, then command-line arguments. In environment variables `:`
 
 ### `Goldfish:Keys` (required, except `VapidSubject`)
 
-All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api keygen`. See
+All keys are base64url: 32 bytes each, except `ServerKey` (96). Generate a full set with `GoldfishSend.Api keygen`. See
 [Keys and what losing them means](#keys-and-what-losing-them-means).
 
 | Key | Default | Meaning |
@@ -152,6 +162,7 @@ All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api key
 | `SealSalt` | (none) | HKDF salt for the per-mailbox endpoint sealing keys. |
 | `EpochKek` | (none) | Key-encryption key that wraps the daily epoch keys stored in MySQL. |
 | `VapidPrivateKey` | (none) | P-256 private scalar used to sign VAPID (RFC 8292) JWTs. Its public key is published by `/v1/info`. |
+| `ServerKey` | (none) | The server's identity and gateway key: an ML-KEM-768 seed (64 bytes) followed by a P-256 scalar (32 bytes). Its public half is served by `GET /v1/key`, and clients pin its fingerprint. It never expires and needs no renewal. Required on `api` nodes; worker-only nodes ignore it. See [Server identity](#server-identity). |
 | `VapidSubject` | `mailto:admin@example.invalid` | The VAPID `sub` claim: a `mailto:` or `https:` contact for push providers. Set it to something you control. |
 
 ### `Goldfish:Messages`
@@ -220,6 +231,8 @@ All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api key
 
 | Key | Default | Meaning |
 |---|---|---|
+| `GatewayRequestsPerSecond` | `50` | Gateway requests per second per client (IPv4 address or IPv6 /64) on each api node, checked in memory **before** any decryption. Opening a request costs about 0.3 ms of CPU, and this keeps one client from making the server do that work unboundedly. Over the limit: a plaintext `429` with `Retry-After: 1`. `0` turns it off. Onion clients all share the tor container's address, so raise it for a large onion user base. |
+| `GatewayBurst` | `200` | Bucket size for `GatewayRequestsPerSecond`. |
 | `ForwardLimit` | `1` | How many proxy hops to unwrap from `X-Forwarded-For`. Use `2` when Traefik (or Caddy) sits behind a load balancer, and add the load balancer's addresses to `TrustedProxies`. Each hop is only believed if the hop in front of it is trusted. |
 | `TrustedProxies` | `[]` | IPs or CIDRs whose `X-Forwarded-For` is trusted. Blank entries are ignored and invalid ones stop startup. Empty means XFF is ignored and the TCP peer is the client. Behind Caddy in compose, this is set to the caddy/api network's IPv4 and IPv6 subnets. If a forwarded client address ever falls *inside* these networks, the API logs a warning (at most every 10 minutes): the container runtime is collapsing clients into one address. |
 
@@ -271,8 +284,10 @@ Example: `Goldfish__RateLimits__send-ip__Limit=120`, `…__PeriodSeconds=60`, `�
 
 ### Fixed limits (not configurable)
 
-Kestrel caps request bodies at 16 KiB, headers at 16 KiB / 50 headers and the request line at 4 KiB, with a
-30 s request timeout. Messages are capped at 3983 bytes and invites at 4096 bytes (see the protocol's size
+Kestrel caps request bodies at 20 KiB (the gateway's outer body), headers at 16 KiB / 50 headers and the request line
+at 4 KiB, with a 30 s request timeout. Inside the gateway, request bodies are capped at 16 KiB and the padded inner
+request at 17 KiB. Each request carries about 1.2 KB of overhead (1153 B of KEM ciphertexts, a 9 B header and a 16 B
+tag) and each response 48 B, and both are padded to 512 B, 1, 2, 4, 8 or 17 KiB. Messages are capped at 3983 bytes and invites at 4096 bytes (see the protocol's size
 budget).
 
 ## Deployment with Docker Compose
@@ -281,7 +296,7 @@ The stack in [`../deploy`](../deploy) runs five containers on three networks:
 
 | Service | Networks | Notes |
 |---|---|---|
-| `caddy` | `public` | The only published service (80/tcp, 443/tcp, 443/udp). Automatic Let's Encrypt, TLS 1.3, HSTS, 16 KiB body limit, no access logs. Only `/v1/*` is proxied; `/healthz`, `/readyz` and everything else get 404. |
+| `caddy` | `public` | The only published service (80/tcp, 443/tcp, 443/udp). Automatic Let's Encrypt, TLS 1.3, HSTS, 20 KiB body limit, no access logs. Only `/v1/gw` and `/v1/key` are proxied; `/healthz`, `/readyz` and everything else get 404. |
 | `api` | `public`, `internal` | `Goldfish__Roles=api`. Trusts `X-Forwarded-For` only from the `public` subnet. Uses `public` for outbound verification pushes. |
 | `worker` | `internal`, `egress` | `Goldfish__Roles=worker`. `egress` gives it outbound internet for push servers. |
 | `mysql` | `internal` | MySQL 8.4, no binlog, fsync on every commit, no query logs, performance_schema off. |
@@ -310,15 +325,19 @@ dumps disabled.
    docker compose build api
    docker run --rm localhost/goldfishsend:latest keygen
    ```
-   Copy the four keys into `goldfish.env` (`Goldfish__Keys__Pepper=…` and so on), set
-   `Goldfish__Keys__VapidSubject`, and **back them up offline now** (see below).
+   Copy the five keys into `goldfish.env` (`Goldfish__Keys__Pepper=…` and so on), set
+   `Goldfish__Keys__VapidSubject`, and **back them up offline now** (see below). Note the server key fingerprint
+   printed on stderr: that's your server's identity (see [Server identity](#server-identity)).
 4. **Start.**
    ```bash
    docker compose up -d
    docker compose ps                  # api, worker, mysql and redis should become "healthy"
-   curl -s https://push.example.com/v1/info
+   curl -s https://push.example.com/v1/key | wc -c    # 1250
+   docker compose logs api | grep "Server key fingerprint"
    ```
-5. **Point clients** at `https://<your domain>`. They fetch the VAPID public key from `/v1/info`.
+5. **Point clients** at `https://<your domain>`. They pin the server key's fingerprint on first contact (or use the one
+   built into the app, or the one in an invite), then fetch everything else, including the VAPID key, through the
+   encrypted gateway.
 
 Podman works too: `podman compose` (backed by docker-compose or podman-compose) and `podman build`.
 
@@ -362,9 +381,9 @@ docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
 ```
 
 The overlay leaves Caddy out, attaches the api to your Traefik network, and publishes it with labels. The labels:
-- route only `Host(GOLDFISH_DOMAIN) && PathPrefix(/v1/)` on the TLS entrypoint, so `/healthz`, `/readyz` and every
-  other path return Traefik's 404, and plain HTTP has no API route;
-- cap request bodies at 16 KiB (the `buffering` middleware);
+- route only `Host(GOLDFISH_DOMAIN)` with the paths `/v1/gw` and `/v1/key` on the TLS entrypoint, so `/healthz`,
+  `/readyz` and every other path return Traefik's 404, and plain HTTP has no API route;
+- cap request bodies at 20 KiB (the `buffering` middleware);
 - add HSTS (2 years, includeSubDomains, preload), `nosniff` and `no-referrer`, and strip `Server`;
 - load-balance every `--scale api=N` replica, with health checks on `/healthz`.
 
@@ -387,10 +406,15 @@ The api trusts `X-Forwarded-For` only from `GOLDFISH_TRAEFIK_SUBNET` (plus optio
 `Ignoring X-Forwarded-For from untrusted proxy <traefik's address>` (at most every 10 minutes). Until that's fixed,
 every client shares one rate limit.
 
-**Key pinning.** Clients with "Pin server keys" turned on pin your certificate's public key. Traefik's ACME resolver has
-no setting to keep the key, so it may generate a new one on renewal and warn pinned users every couple of months. To
-check, compare the fingerprint (see below) before and after a renewal. If it changes, let certbot manage this one
-certificate with a fixed key and have Traefik serve it from its file provider:
+**Server identity doesn't depend on the certificate.** The app verifies your server by its server key (see
+[Server identity](#server-identity)), never by the TLS certificate, so Traefik's ACME resolver can change the
+certificate's key at every renewal without affecting anyone. Traefik also only ever sees encrypted request bodies.
+
+**Optional TLS key pinning.** Clients who also turn on the extra "Pin server keys" layer pin your certificate's public
+key. Traefik's ACME resolver has no setting to keep the key, so it may generate a new one on renewal and warn those
+users every couple of months. To check, compare the TLS fingerprint (see below) before and after a renewal. If it
+changes, either tell users the extra layer isn't useful on your server, or let certbot manage this one certificate with
+a fixed key and have Traefik serve it from its file provider:
 
 1. Get the certificate with certbot and `--reuse-key`. The flag is saved in the renewal config, so every
    `certbot renew` keeps the key. A DNS-01 plugin is simplest, because Traefik already owns port 80:
@@ -444,7 +468,7 @@ server URL, so contacts on an onion server work too, and the app asks their cont
 How it's wired:
 - The `tor` container (profile `onion`, read-only, all capabilities dropped, non-root) publishes the onion and
   forwards its port 80 to Caddy's onion-only listener (`:8081`, bound to Caddy's fixed address on the dedicated
-  `onion` network). The same routes, 16 KiB body limit and health-endpoint blocking apply as on the public site.
+  `onion` network). The same routes, 20 KiB body limit and health-endpoint blocking apply as on the public site.
 - The `onion` network is **not** a trusted proxy network. Tor never talks to the api directly, so it can't inject
   `X-Forwarded-For`.
 - Tor's built-in introduction-point DoS defence and onion-service proof-of-work defence are on.
@@ -469,9 +493,37 @@ What this means in practice:
 Push delivery is unaffected: notifications still reach phones through each user's UnifiedPush distributor,
 which Tor doesn't cover.
 
-### Publishing your TLS key fingerprint (for client key pinning)
+### Server identity
 
-Clients can turn on **Pin server keys**: the app remembers the SHA-256 of your certificate's public key (SPKI)
+Every server has one **server key** (`Goldfish:Keys:ServerKey`): a hybrid ML-KEM-768 + P-256 key pair whose public half
+is served by `GET /v1/key`. Its **fingerprint** (SHA-256 of that public key) is the server's identity:
+- Clients encrypt every API call to it, and only the holder of the private key can read the call or produce a valid
+  answer. A TLS interception proxy, a mis-issued certificate or a compromised reverse proxy learns nothing, and
+  can't impersonate the server.
+- It never expires, so there's nothing to renew or rotate, and no volume is needed: it lives in `goldfish.env` or
+  the secrets file with the other keys.
+- Clients pin the fingerprint per server: from the app build for its default server, from an invite (for a contact's
+  server), or on first contact for a server typed in by hand. If it ever changes, the app shows
+  "server identity changed" and stops using the server until the user decides.
+
+**Publish the fingerprint** wherever your users can check it (your website, an announcement channel). The server
+prints it at startup (`Server key fingerprint: ABCD EFGH …`), and you can print it at any time:
+
+```bash
+docker compose run --rm --no-deps api fingerprint      # b64u on stdout, the grouped form on stderr
+```
+
+**Build it into the app** for a server you ship as the default, so users don't depend on first contact:
+`./gradlew assembleRelease -Pgf.defaultServer=https://push.example.com -Pgf.defaultServerKey=<b64u fingerprint>`.
+
+**Changing it** (only if the private key leaked or was lost): run `keygen`, replace `Goldfish__Keys__ServerKey`,
+restart, and announce the new fingerprint *before* users see the warning. Every user then has to accept the new
+identity, so treat the key as permanent and back it up with the others.
+
+### Publishing your TLS key fingerprint (optional extra pinning)
+
+The app already verifies the server by its server key, whatever the TLS certificate is. On top of that, users can turn
+on **Pin server keys**, an optional extra layer: the app remembers the SHA-256 of your certificate's public key (SPKI)
 on first connection and refuses to connect if it changes. The Caddyfile sets `reuse_private_keys`, so renewals keep
 the same key and pinned clients aren't disturbed. Publish the fingerprint somewhere users can check it (your
 website, an announcement channel):
@@ -500,6 +552,7 @@ backup is useless without them (by design).
 | `Pepper` | **Every mailbox is orphaned.** Ids no longer match, so sends return 404 and owners can't manage mailboxes. Every user has to re-pair with every contact. | Together with a DB dump, someone who also holds a `sendSecret` can find its row. On its own it reveals nothing. |
 | `SealSalt` | **Every mailbox is orphaned.** Endpoints can't be unsealed, so nothing can be delivered. Every user has to re-pair. | On its own, nothing: unsealing an endpoint needs that mailbox's `sendSecret`, **or** a held-message row (which carries the mailbox's seal key) plus `EpochKek`. See "Data on disk". |
 | `EpochKek` | **All queued and held messages are lost.** The stored epoch keys can't be unwrapped. The current code also fails at startup when the `epoch_keys` rows don't match the KEK. To recover, run `DELETE FROM epoch_keys; DELETE FROM pending_messages;` and restart. Mailboxes are unaffected. | Together with a DB dump that still holds the epoch keys, held messages can be unwrapped to their E2E ciphertext (still end-to-end encrypted). |
+| `ServerKey` | Every client shows **"server identity changed"** and stops using the server until each user accepts the new key. Contacts on other servers that deliver to yours do the same. | Someone who can also intercept TLS to your server (or controls your reverse proxy) can read API calls and impersonate the server, for as long as the leaked key is in use, since it never expires. Replace it (above) and announce the new fingerprint. |
 | `VapidPrivateKey` | Distributors that pin the server's VAPID key (the client registers it with them) **reject every push** until each client re-registers its endpoint with the new key. Distributors without VAPID pinning keep working. | Anyone who also has an endpoint URL can push to it as this server. Endpoints are sealed, so this needs a second leak. |
 
 None of these keys can be rotated in place today, so treat them as permanent.
@@ -531,7 +584,9 @@ There are no request logs anywhere in the stack:
   `http.handlers.reverse_proxy`, `http.stdlib`), which would otherwise include client IPs and URIs. Don't add a
   `log` directive.
 - **The app** never logs IPs, URLs, endpoints or secrets, only an opaque push-host fingerprint on failures.
-  Framework request logging (`Microsoft.AspNetCore`, `System.Net.Http`) is pinned to Warning in compose. The push
+  Framework request logging (`Microsoft.AspNetCore`, `System.Net.Http`) is pinned to Warning in `appsettings.json`
+  and in compose. Keep it there: at Information, ASP.NET Core's routing logs the inner route of every decrypted
+  gateway request (for example `GET /v1/invites/{id}`), though never ids or bodies. The push
   client bypasses `IHttpClientFactory`, so its URL logging is never in the pipeline.
 - **MySQL**: general log, slow log and binlog are off, the error log is at verbosity 2, and performance_schema
   (which keeps statement texts in memory) is off.
@@ -616,7 +671,18 @@ docker compose up -d --scale api=3 --scale worker=4
 ## API summary
 
 Full request and response formats, derivations and error codes are in [`docs/protocol.md`](../docs/protocol.md).
-Secrets are only ever sent in bodies or headers, never in URLs. The one exception is the one-time invite id.
+
+Only these exist in plaintext:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/key` | The server key blob (1250 B). Clients check it against their pinned fingerprint. |
+| POST | `/v1/gw` | The encrypted gateway: one sealed inner request in, one sealed inner response out (always `200`, except `400 bad_request`, `413 too_large`, `421 unknown_key` and the flood guard's `429`). |
+| GET | `/healthz`, `/readyz` | Liveness and readiness (internal only). |
+
+Everything else is an inner request through `/v1/gw` (a direct plaintext request gets 404). Secrets are only ever
+sent in inner bodies or headers, never in paths. The one exception is the one-time invite id, which is inside the
+encrypted request too.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|

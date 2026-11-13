@@ -6,8 +6,9 @@
 # What this overlay does:
 #   - Caddy is moved to an inactive profile, so it doesn't start. Traefik terminates TLS.
 #   - The api joins your Traefik's Docker network (GOLDFISH_TRAEFIK_NETWORK, external) and is published through labels:
-#     only `Host(GOLDFISH_DOMAIN) && PathPrefix(/v1)` is routed, on the TLS entrypoint only, with a 16 KiB body cap
-#     and HSTS. /healthz and /readyz are never routed.
+#     only `Host(GOLDFISH_DOMAIN)` with the paths /v1/gw (the encrypted gateway) and /v1/key is routed, on the TLS
+#     entrypoint only, with a 20 KiB body cap and HSTS. /healthz and /readyz are never routed. Traefik only ever sees
+#     encrypted API requests: TLS is terminated here, but every request body is end-to-end encrypted to the api.
 #   - The api trusts X-Forwarded-For only from the Traefik network's subnet (GOLDFISH_TRAEFIK_SUBNET). Without it, every
 #     client looks like Traefik and shares one rate limit, and the api logs a warning saying so.
 #   - The api keeps outbound internet (for verification pushes) through the egress network.
@@ -44,16 +45,17 @@ services:
       traefik.docker.network: "${GOLDFISH_TRAEFIK_NETWORK:-traefik}"
 
       # Only the API, only over TLS. Anything else on this host name is Traefik's 404.
-      traefik.http.routers.goldfish.rule: "Host(`${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}`) && PathPrefix(`/v1/`)"
+      traefik.http.routers.goldfish.rule: "Host(`${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}`) && (Path(`/v1/gw`) || Path(`/v1/key`))"
       traefik.http.routers.goldfish.entrypoints: "${GOLDFISH_TRAEFIK_ENTRYPOINT:-websecure}"
       traefik.http.routers.goldfish.tls: "true"
       traefik.http.routers.goldfish.tls.certresolver: "${GOLDFISH_TRAEFIK_CERTRESOLVER-letsencrypt}"
       traefik.http.routers.goldfish.middlewares: "goldfish-body,goldfish-headers"
       traefik.http.routers.goldfish.service: "goldfish"
 
-      # Requests are tiny. Reject anything over 16 KiB before it reaches Kestrel (which caps at 16 KiB too).
-      traefik.http.middlewares.goldfish-body.buffering.maxRequestBodyBytes: "16384"
-      traefik.http.middlewares.goldfish-body.buffering.memRequestBodyBytes: "16384"
+      # Requests are small: a 16 KiB inner body plus ~1.2 KB of KEM ciphertext and padding. Reject anything over 20 KiB
+      # before it reaches Kestrel (which caps at 20 KiB too).
+      traefik.http.middlewares.goldfish-body.buffering.maxRequestBodyBytes: "20480"
+      traefik.http.middlewares.goldfish-body.buffering.memRequestBodyBytes: "20480"
       traefik.http.middlewares.goldfish-body.buffering.maxResponseBodyBytes: "65536"
 
       traefik.http.middlewares.goldfish-headers.headers.stsSeconds: "63072000"

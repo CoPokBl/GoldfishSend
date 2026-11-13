@@ -19,7 +19,7 @@ public sealed class MultiNodeTests {
     [IntegrationFact]
     public async Task TwoNodes_ShareTheQueue_AndDeliverEachMessageExactlyOnce() {
         await using var second = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
-        using var secondClient = second.CreateClient();
+        using var secondClient = GatewayHandler.Client(second);
         Assert.Equal(HttpStatusCode.OK, (await secondClient.GetAsync("/readyz")).StatusCode);
 
         var mailbox = await _f.CreateActiveMailboxAsync();

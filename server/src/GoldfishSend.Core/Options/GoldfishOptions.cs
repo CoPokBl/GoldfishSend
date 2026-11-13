@@ -22,7 +22,7 @@ public sealed class GoldfishOptions {
     }
 }
 
-/// <summary>All values are base64url, 32 bytes. Generate them with <c>GoldfishSend.Api keygen</c>.</summary>
+/// <summary>All values are base64url, 32 bytes (<c>ServerKey</c>: 96). Generate them with <c>GoldfishSend.Api keygen</c>.</summary>
 public sealed class KeyOptions {
     /// <summary>The HMAC key for mailbox ids. Changing it orphans every mailbox.</summary>
     public string Pepper { get; set; } = "";
@@ -32,6 +32,11 @@ public sealed class KeyOptions {
     public string EpochKek { get; set; } = "";
     /// <summary>The P-256 private scalar for VAPID. Changing it breaks distributors that pinned the old key.</summary>
     public string VapidPrivateKey { get; set; } = "";
+    /// <summary>
+    /// The server's identity and gateway key: 96 bytes, an ML-KEM-768 seed then a P-256 scalar. It never expires. Changing
+    /// it makes every client report "server identity changed".
+    /// </summary>
+    public string ServerKey { get; set; } = "";
     public string VapidSubject { get; set; } = "mailto:admin@example.invalid";
 }
 
@@ -155,6 +160,13 @@ public sealed class NetworkOptions {
      * each hop is only believed if the hop in front of it is trusted.
      */
     public int ForwardLimit { get; set; } = 1;
+
+    /// <summary>
+    /// Gateway requests per second per client (IPv4 address or IPv6 /64) on each API node, before any decryption. 0 turns
+    /// it off. Onion clients all share the Tor container's address, so raise it if a large onion user base hits it.
+    /// </summary>
+    public double GatewayRequestsPerSecond { get; set; } = 50;
+    public int GatewayBurst { get; set; } = 200;
 }
 
 /// <summary>GCRA policy: <see cref="Limit"/> events per <see cref="PeriodSeconds"/>, with up to <see cref="Burst"/> at once.</summary>

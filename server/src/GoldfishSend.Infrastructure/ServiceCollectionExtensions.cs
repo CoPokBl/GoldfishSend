@@ -51,6 +51,7 @@ public static class ServiceCollectionExtensions {
         services.AddSingleton<HeldQuota>();
         services.AddSingleton<PowService>();
         services.AddSingleton<EphemeralStore>();
+        services.AddSingleton<GatewayReplayGuard>();
         services.AddSingleton<MessageQueue>();
         services.AddSingleton<DeliverySignal>();
         services.AddSingleton<DeliveryService>();

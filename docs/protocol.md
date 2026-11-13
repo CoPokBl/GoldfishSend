@@ -118,11 +118,16 @@ proves it came from the holder of the server key, because only it can derive `re
 ```
 u8   method          1 GET, 2 POST, 3 PUT, 4 DELETE
 u64  timestamp       client's unix seconds (corrected by any learned offset)
-u16  pathLen, path   UTF-8 path and query, starts with "/v1/", not "/v1/gw" or "/v1/key"
+u16  pathLen, path   path and query, starts with "/v1/", not "/v1/gw" or "/v1/key"
 u8   headerCount     then per header: u8 nameLen, name (lowercase ASCII), u16 valueLen, value (ASCII)
 u32  bodyLen, body
 ...  zero padding
 ```
+The path is printable ASCII (`!`..`~`) with no `#` or `\`, at most 2048 bytes. The route part (before `?`) has no
+`%`, no `//` and no `.`/`..` segments. Header names are 1–64 bytes of `a-z`, `0-9` and `-`, values printable ASCII
+(space allowed) up to 4096 bytes, at most 32 headers, no duplicates. The padding must be zeros and the total length
+exactly the bucket the content needs: anything else is rejected, so a client padding bug can't leak sizes.
+
 The server accepts only `content-type` and `gf-*` headers and ignores the rest. Endpoints see the inner method, path,
 headers and body exactly as if they had been sent in plaintext. Rate limiting still uses the outer connection's
 client IP.
@@ -153,6 +158,12 @@ response is padded to a multiple of 4096. An inner request larger than 17408 B i
 | `400` | `bad_request` | Malformed or undecryptable (also a wrong `Content-Type`) |
 | `413` | `too_large` | Over the size limits |
 | `421` | `unknown_key` | `keyId` isn't this server's |
+| `429` | `rate_limited` (`scope: ip`) | The per-node flood guard, checked before any decryption (default 50/s, burst 200 per IP). `Retry-After: 1`. |
+| `405` | `method_not_allowed` | Anything but `POST` on `/v1/gw` |
+
+Once a request decrypts, every answer is encrypted, including the gateway's own: `400 bad_request` (the inner request
+doesn't parse, or its body is over 16 KiB), `400 clock_skew`, `409 replay`, `500 internal` (an endpoint failed) and
+`503 unavailable` (the replay cache is unreachable). A request timeout can still surface as a plaintext `504`.
 
 Clients treat outer errors as untrusted. On `421` the client re-fetches `GET /v1/key`. If the fingerprint no longer
 matches the pin, it reports "server identity changed" and stops using that server until the user decides. It never

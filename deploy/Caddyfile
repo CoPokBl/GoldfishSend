@@ -38,9 +38,10 @@
 (goldfish_routes) {
 	header -Server
 
-	# Kestrel caps bodies at 16 KB too; this rejects oversize requests before they reach the app.
+	# Every API call is one encrypted POST /v1/gw (a 16 KiB inner body plus ~1.2 KB of KEM ciphertext and padding).
+	# Kestrel caps bodies at 20 KiB too; this rejects oversize requests before they reach the app.
 	request_body {
-		max_size 16KiB
+		max_size 20KiB
 	}
 
 	# Health endpoints are for the container healthchecks on the internal network only.
@@ -49,7 +50,9 @@
 		respond 404
 	}
 
-	handle /v1/* {
+	# Only the gateway and the public key exist in plaintext; the api answers 404 for any other /v1 path.
+	@api path /v1/gw /v1/key
+	handle @api {
 		# Caddy sets X-Forwarded-For from the TCP peer and discards any client-supplied value (no
 		# trusted_proxies is configured), so the api only ever sees the real client address.
 		# Upstreams come from DNS, so `docker compose up --scale api=N` load-balances across every replica.
@@ -102,8 +105,8 @@ http://:8081 {
 # rather than redirected: a client misconfigured with http:// would otherwise keep sending its secrets in cleartext
 # on every request before each redirect. Browsers asking for anything else get redirected to HTTPS.
 http://{$GOLDFISH_DOMAIN} {
-	@api path /v1/*
-	handle @api {
+	@plainapi path /v1/*
+	handle @plainapi {
 		respond "Use HTTPS" 400
 	}
 	handle {

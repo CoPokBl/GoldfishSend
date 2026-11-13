@@ -15,4 +15,5 @@ internal static class RedisKeys {
     public static string MailboxInFlight(string hmacHex) => $"gf:mbxlease:{hmacHex}";
     public static string HostSeen(string hmacHex) => $"gf:hostseen:{hmacHex}";
     public static string Invite(string idHex) => $"gf:inv:{idHex}";
+    public static string GatewayReplay(string hex) => $"gf:gwr:{hex}";
 }
