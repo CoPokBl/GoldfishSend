@@ -1,4 +1,4 @@
-# GoldfishSend Wire Protocol v1
+# GoldfishSend Wire Protocol v2
 
 This is the contract between the server (`server/`) and the Android client (`android/`). Change it here first.
 
@@ -61,10 +61,125 @@ doesn't reveal a message's exact age or the sender's chosen lifetime. A push nev
 **Size budget**: 4096 total, minus 86 B content-coding header, 16 B tag and 1 B delimiter, which leaves **3993 B of push plaintext**.
 Subtract the 10 B envelope header and the result is **`maxMessageBytes = 3983`**.
 
+## Encrypted transport and server identity (gateway v1)
+
+Every API call is end-to-end encrypted between the client and the GoldfishSend process, inside TLS. TLS terminators
+(Traefik, a load balancer, a CDN) see only ciphertext, and the server proves its identity with a key the operator
+controls, independent of the TLS certificate. Only four plaintext HTTP routes exist:
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/key` | The server key blob (`application/octet-stream`, 1250 B). Public. |
+| `POST /v1/gw` | The encrypted gateway. Carries every endpoint listed under "HTTP API". |
+| `GET /healthz`, `GET /readyz` | Health checks (not routed by the reverse proxy configs). |
+
+Every other path returns `404`. The endpoints under "HTTP API" are only reachable as inner requests.
+
+### Server key
+- **Secret:** `Goldfish:Keys:ServerKey`, b64u of 96 B = `mlkemSeed(64) ‖ p256Scalar(32)`. `mlkemSeed` is the FIPS 203
+  ML-KEM-768 seed `d ‖ z`; `p256Scalar` is a big-endian P-256 private scalar. Generated once by `keygen`. It never
+  expires and is never rotated automatically.
+- **Key blob** (served by `GET /v1/key`): `0x01 ‖ ekMLKEM768(1184) ‖ pkP256(65, uncompressed)` = 1250 B.
+- **Fingerprint:** `fp = SHA-256("gf/server-key/v1" ‖ blob)` (32 B). This is the server's identity. In links and
+  messages it is `b64u(fp)` (43 chars). For display it is `base32(fp)` (RFC 4648 alphabet, no padding, 52 chars) in
+  groups of 4.
+- **Key id:** `keyId = fp[0..8]`.
+
+Clients pin `fp` per server. They fetch the blob from `GET /v1/key` and use it only if
+`SHA-256("gf/server-key/v1" ‖ blob) == fp` and the blob parses (version 1, exact length, valid P-256 point). Where `fp`
+comes from, strongest first: built into the app for its default server; an invite link, invite bundle, `hello` or
+`mailbox` message for a contact's server; trust on first use for a server typed in by hand.
+
+### Request encapsulation
+The client, for each request:
+1. `(ssM, ctM) = ML-KEM-768.Encaps(ekMLKEM768)` (`ctM` 1088 B, `ssM` 32 B).
+2. A fresh P-256 key pair `e`. `ctX = e.public` (65 B uncompressed), `ssX = ECDH(e, pkP256)` x-coordinate (32 B).
+3. `enc = ctM ‖ ctX` (1153 B).
+4. `th = SHA-256("gf/gw/v1" ‖ fp ‖ enc)`; `prk = HKDF-Extract(salt = th, ikm = ssM ‖ ssX)` (HKDF-SHA-256).
+5. `reqKey = HKDF-Expand(prk, "gf/gw/v1 req", 32)`; `respSecret = HKDF-Expand(prk, "gf/gw/v1 resp", 32)`.
+6. `header = 0x01 ‖ keyId` (9 B). `ct = AES-256-GCM(reqKey, nonce = 12 zero bytes, aad = header, plaintext = innerRequest)`.
+   A zero nonce is safe because `reqKey` is fresh for every request.
+7. `POST /v1/gw`, `Content-Type: application/octet-stream`, body `header ‖ enc ‖ ct`.
+
+The hybrid is secure as long as either ML-KEM-768 or P-256 holds. `th` binds the server key (through `fp`) and both
+KEM ciphertexts.
+
+### Response encapsulation
+The server derives the same `respSecret`, then:
+1. `respNonce` = 32 random bytes.
+2. `rprk = HKDF-Extract(salt = respNonce, ikm = respSecret)`; `respKey = HKDF-Expand(rprk, "gf/gw/v1 resp key", 32)`.
+3. Body `respNonce ‖ AES-256-GCM(respKey, nonce = 12 zero bytes, aad = "gf/gw/v1 resp", plaintext = innerResponse)`,
+   with outer status `200` and `Content-Type: application/octet-stream`.
+
+The random `respNonce` keeps the response key unique even if the same request is replayed. A response that decrypts
+proves it came from the holder of the server key, because only it can derive `respSecret`.
+
+### Inner request (`innerRequest`), big-endian
+```
+u8   method          1 GET, 2 POST, 3 PUT, 4 DELETE
+u64  timestamp       client's unix seconds (corrected by any learned offset)
+u16  pathLen, path   UTF-8 path and query, starts with "/v1/", not "/v1/gw" or "/v1/key"
+u8   headerCount     then per header: u8 nameLen, name (lowercase ASCII), u16 valueLen, value (ASCII)
+u32  bodyLen, body
+...  zero padding
+```
+The server accepts only `content-type` and `gf-*` headers and ignores the rest. Endpoints see the inner method, path,
+headers and body exactly as if they had been sent in plaintext. Rate limiting still uses the outer connection's
+client IP.
+
+### Inner response (`innerResponse`)
+```
+u16  status
+u8   headerCount     same encoding. The server includes content-type, retry-after and gf-* only.
+u32  bodyLen, body
+...  zero padding
+```
+
+### Padding
+Both inner messages are zero-padded to the smallest bucket that fits: 512, 1024, 2048, 4096, 8192, 17408 B. A larger
+response is padded to a multiple of 4096. An inner request larger than 17408 B is rejected. Inner bodies keep the
+16 KiB endpoint limit, and the outer request body limit is 20 KiB.
+
+### Replay and clock skew
+- The server rejects a timestamp more than 600 s from its clock with an **encrypted** inner `400`
+  `{ "error": "clock_skew", "serverTime": unixSeconds }`. The client stores `offset = serverTime - now` and retries once.
+  The response is authenticated, so a network attacker can't fake it.
+- The server keeps `SHA-256(enc)[0..16]` in the ephemeral Redis for 1200 s (`SET NX`). A repeat gets the encrypted inner
+  `409 { "error": "replay" }`.
+
+### Outer errors (plaintext, unauthenticated)
+| Status | Body `error` | Meaning |
+|---|---|---|
+| `400` | `bad_request` | Malformed or undecryptable (also a wrong `Content-Type`) |
+| `413` | `too_large` | Over the size limits |
+| `421` | `unknown_key` | `keyId` isn't this server's |
+
+Clients treat outer errors as untrusted. On `421` the client re-fetches `GET /v1/key`. If the fingerprint no longer
+matches the pin, it reports "server identity changed" and stops using that server until the user decides. It never
+re-pins silently.
+
+### Interop vectors
+`docs/test-vectors/gateway-server.json` is written by the server's tests and `gateway-client.json` by the app's tests.
+Both use the test key `ServerKey = bytes 0x00..0x5f`:
+```json
+{ "serverKey": "b64u", "blob": "hex", "fp": "b64u",
+  "exchanges": [ { "innerRequest": "hex (padded)", "outerRequest": "hex", "innerResponse": "hex (padded)", "outerResponse": "hex" } ] }
+```
+Each side checks the other's file: the same `blob` and `fp` from `serverKey`, that `outerRequest` decrypts to
+`innerRequest`, and that `outerResponse` decrypts, under the `respSecret` of that request, to `innerResponse`. The app
+does this with a test-only decapsulator. The files are regenerated only when the format changes.
+
+### Operator notes
+- `keygen` prints `ServerKey` with the other keys, and the fingerprint on stderr. `fingerprint` prints the fingerprint
+  of the configured key. The server logs it at startup.
+- Losing or replacing `ServerKey` gives every client a "server identity changed" warning. Back it up with the other keys.
+
 ## HTTP API
 
+All of these are inner requests through `POST /v1/gw` (see above). Statuses and headers described here are the inner ones.
+
 ### `GET /v1/info`
-Response: `{ "protocol": 1, "vapidPublicKey": b64u(65 B uncompressed P-256), "maxMessageBytes": 3983, "maxInviteBytes": 4096,
+Response: `{ "protocol": 2, "vapidPublicKey": b64u(65 B uncompressed P-256), "maxMessageBytes": 3983, "maxInviteBytes": 4096,
 "defaultTtlSeconds": 259200, "maxTtlSeconds": 1209600, "powDifficulty": int }`
 
 ### `POST /v1/pow/challenge`
@@ -148,14 +263,16 @@ resumes on its own if one starts accepting again. Clients that call refresh peri
 ## Client-side formats (opaque to the server)
 
 ### Invite QR code / link
-`gfsend://invite#v=1&s=<percent-encoded server base URL>&i=<inviteId b64u>&k=<inviteKey b64u 32 B>`
+`gfsend://invite#v=2&s=<percent-encoded server base URL>&f=<server fp b64u>&i=<inviteId b64u>&k=<inviteKey b64u 32 B>`
+
+The app rejects `v=1` links. `f` pins the inviter's server before anything is fetched from it.
 
 Everything after `#` is the URI fragment, so it isn't sent anywhere if opened as a link. The invite blob is
 `nonce(12) ‖ AES-256-GCM(inviteKey, nonce, plaintext = JSON InviteBundle, aad = "gf/invite/v1")`.
 
 `InviteBundle` (JSON):
 ```json
-{ "v": 1, "server": "https://...", "sendSecret": "b64u",
+{ "v": 2, "server": "https://...", "serverKey": "b64u fp", "sendSecret": "b64u",
   "registrationId": 1234, "deviceId": 1,
   "identityKey": "b64u", "signedPreKeyId": 1, "signedPreKey": "b64u", "signedPreKeySig": "b64u",
   "kyberPreKeyId": 1, "kyberPreKey": "b64u", "kyberPreKeySig": "b64u",
@@ -174,9 +291,9 @@ next multiple of 256. The maximum padded plaintext is 2048 B for PreKey messages
 `Content` (JSON, `t` = type):
 | t | Fields | Meaning |
 |---|---|---|
-| `hello` | `server`, `sendSecret`, `name?` | The scanner's first message. Gives the inviter a return mailbox. |
+| `hello` | `server`, `serverKey`, `sendSecret`, `name?` | The scanner's first message. Gives the inviter a return mailbox. |
 | `text` | `id`, `body`, `ts`, `exp?` (disappearing seconds), `once?` (view-once), `part?`, `parts?` | A chat message, or one chunk of one |
 | `receipt` | `ids[]`, `kind` (`delivered` \| `read`) | E2E receipts |
 | `timer` | `secs` | Sets the conversation's disappearing timer (0 = off) |
 | `delete` | `ids[]` | Delete for everyone (best effort) |
-| `mailbox` | `server`, `sendSecret` | The sender moved its inbox for this contact |
+| `mailbox` | `server`, `serverKey`, `sendSecret` | The sender moved its inbox for this contact |
