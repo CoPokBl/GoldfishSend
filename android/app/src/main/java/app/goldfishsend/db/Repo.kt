@@ -312,6 +312,8 @@ class Repo(val db: Db, private val vault: MessageVault) {
             db.exec("DELETE FROM sig_session WHERE address = ?", "c$id.1")
             db.exec("DELETE FROM sig_identity WHERE address = ?", "c$id.1")
             db.exec("DELETE FROM mailboxes WHERE contact_id = ?", id)
+            // A group's remembered member names (Groups.nameKey / pendingNameKey).
+            db.exec("DELETE FROM kv WHERE k LIKE ? OR k LIKE ?", "gname/$id/%", "gjoin/$id/%")
             db.exec("DELETE FROM contacts WHERE id = ?", id)
         }
     }

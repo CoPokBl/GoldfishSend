@@ -471,7 +471,13 @@ object Groups {
     }
 
     /** How a member appears: your own name for them if they're your contact, otherwise their self-chosen name. */
-    data class MemberName(val name: String, val isContact: Boolean, val verified: Boolean)
+    data class MemberName(val name: String, val isContact: Boolean, val verified: Boolean, val known: Boolean = true)
+
+    /** Self-chosen names seen in a group's cards, kept after the card goes (removed members, old messages). */
+    private fun nameKey(cid: Long, member: String) = "gname/$cid/${GroupCrypto.tag(member)}"
+
+    /** Members whose join line was written before we knew their name: the line naming them follows their card. */
+    private fun pendingNameKey(cid: Long, member: String) = "gjoin/$cid/${GroupCrypto.tag(member)}"
 
     fun memberName(s: Session, m: GroupModel?, member: String): MemberName {
         if (member == me(s)) {
@@ -481,8 +487,9 @@ object Groups {
         if (contact != null) {
             return MemberName(contact.name, true, contact.verified)
         }
-        val own = m?.cards?.get(member)?.card?.name?.let { Sanitize.name(it) }
-        return MemberName(own ?: "Unknown member", false, false)
+        val own = (m?.cards?.get(member) ?: m?.departed?.get(member))?.card?.name?.let { Sanitize.name(it) }
+            ?: m?.let { g -> RepoGroupStore(s.repo).cidOf(g.gid) }?.let { cid -> s.repo.kvString(nameKey(cid, member)) }
+        return if (own != null) MemberName(own, false, false) else MemberName("Someone new", false, false, known = false)
     }
 
     private fun names(s: Session, m: GroupModel, ids: List<String>): String =
@@ -522,7 +529,17 @@ object Groups {
                 val text = when (e) {
                     GroupEvent.Created -> "You created the group. Messages are end-to-end encrypted."
                     is GroupEvent.Invited -> "${memberName(s, m, e.by).name} invited you to this group."
-                    is GroupEvent.Added -> "${memberName(s, m, e.by).name} added ${names(s, m, e.ids)}."
+                    is GroupEvent.Added -> {
+                        val unknown = e.ids.filter { !memberName(s, m, it).known }
+                        unknown.forEach { s.repo.kvPutString(pendingNameKey(cid, it), "1") }
+                        val known = names(s, m, e.ids - unknown.toSet())
+                        val by = memberName(s, m, e.by).name
+                        when {
+                            unknown.isEmpty() -> "$by added $known."
+                            known.isEmpty() -> "$by added ${if (unknown.size == 1) "someone new" else "${unknown.size} new people"}."
+                            else -> "$by added $known and ${if (unknown.size == 1) "someone new" else "${unknown.size} new people"}."
+                        }
+                    }
                     is GroupEvent.Removed -> {
                         for (id in e.ids) {
                             s.repo.outboxDropMember(cid, id).forEach { settleStatus(s, it) }
@@ -533,7 +550,14 @@ object Groups {
                         s.repo.outboxDropMember(cid, e.id).forEach { settleStatus(s, it) }
                         "${memberName(s, m, e.id).name} left."
                     }
-                    is GroupEvent.Joined -> if (e.id == me(s)) "You joined the group." else "${memberName(s, m, e.id).name} joined."
+                    is GroupEvent.Joined -> when {
+                        e.id == me(s) -> "You joined the group."
+                        memberName(s, m, e.id).known -> "${memberName(s, m, e.id).name} joined."
+                        else -> {
+                            s.repo.kvPutString(pendingNameKey(cid, e.id), "1")
+                            "Someone new joined."
+                        }
+                    }
                     is GroupEvent.RoleChanged -> {
                         val who = memberName(s, m, e.id).name
                         val by = memberName(s, m, e.by).name
@@ -568,6 +592,17 @@ object Groups {
                     is GroupEvent.YouWereRemoved -> s.repo.touchContact(cid, false)
                     else -> Unit
                 }
+            }
+        }
+
+        override fun onCard(m: GroupModel, id: String) {
+            val cid = cid(m.gid) ?: return
+            val name = m.cards[id]?.card?.name?.let { Sanitize.name(it) } ?: return
+            s.repo.kvPutString(nameKey(cid, id), name)
+            // A join line said "someone new": now we can say who it was (contacts show your own name for them).
+            if (s.repo.kvString(pendingNameKey(cid, id)) != null) {
+                s.repo.kvPutString(pendingNameKey(cid, id), null)
+                Messenger.systemMessage(s, cid, "${memberName(s, m, id).name} is in the group.")
             }
         }
 

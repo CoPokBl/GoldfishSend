@@ -41,6 +41,9 @@ class GroupModel(
     var pendingOp: RosterOp?,
     var pendingHash: String?,
 ) {
+    /** Cards of members the last accepted roster removed, in memory only, so the system line can still name them. */
+    val departed: MutableMap<String, SignedCard> = mutableMapOf()
+
     companion object {
         const val INVITED = 0
         const val JOINED = 1
@@ -100,6 +103,9 @@ interface GroupIo {
     fun sendDirect(gid: String, to: String, content: Content): Boolean
 
     fun onEvents(m: GroupModel, events: List<GroupEvent>)
+
+    /** A member's card was stored (their first, or a newer one): their self-chosen name may be new. */
+    fun onCard(m: GroupModel, id: String) {}
 
     fun onText(m: GroupModel, from: String, t: Content.GText)
 
@@ -483,6 +489,7 @@ class GroupEngine(
         }
         m.cards[id] = card
         store.save(m)
+        io.onCard(m, id)
         // A newcomer's first card only reaches the members they already knew: admins pass it on to everyone else.
         if (existing == null && m.state == GroupModel.JOINED && m.roster?.roster?.isAdmin(me) == true) {
             val content = cardContent(card)
@@ -577,6 +584,8 @@ class GroupEngine(
         val newIds = new.ids().toSet()
         val removed = oldIds - newIds
         val added = newIds - oldIds
+        m.departed.clear()
+        m.cards.filterKeys { it !in newIds }.let { m.departed.putAll(it) }
         m.cards.keys.retainAll(newIds)
         if (me in removed) {
             if (by == me) {

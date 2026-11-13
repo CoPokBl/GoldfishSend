@@ -101,6 +101,14 @@ import kotlinx.coroutines.withContext
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Unit) {
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    // Leaving for contact or group info: don't carry the composer's keyboard onto a screen with no text field.
+    val showInfo: () -> Unit = {
+        focus.clearFocus()
+        keyboard?.hide()
+        openInfo()
+    }
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val contact by rememberQuery(s, contactId) { it.repo.contact(contactId) }
@@ -153,7 +161,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
             TopAppBar(
                 navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
                 title = {
-                    Row(Modifier.clickable(onClick = openInfo), verticalAlignment = Alignment.CenterVertically) {
+                    Row(Modifier.clickable(onClick = showInfo), verticalAlignment = Alignment.CenterVertically) {
                         if (isGroup) {
                             app.goldfishsend.ui.components.GroupAvatar(contactId, 36.dp)
                         } else {
@@ -231,11 +239,11 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
             if (isGroup) {
                 // Groups: membership notices are system lines; delivery issues show per member in group info.
             } else if (c != null && c.pendingServerKey != null) {
-                Banner("Can't verify ${c.name}'s server. Messages will wait until it's sorted out. Tap to review.", onClick = openInfo)
+                Banner("Can't verify ${c.name}'s server. Messages will wait until it's sorted out. Tap to review.", onClick = showInfo)
             } else if (c != null && c.unreachable) {
                 Banner("This contact can't be reached right now. They may have removed you.")
             } else if (c != null && !c.verified) {
-                Banner("Not verified. Compare safety numbers in contact info.", onClick = openInfo)
+                Banner("Not verified. Compare safety numbers in contact info.", onClick = showInfo)
             }
             Box(Modifier.weight(1f)) {
                 LazyColumn(
@@ -368,10 +376,14 @@ private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val m = app.goldfishsend.core.Groups.model(s, cid) ?: return null
     val r = m.roster?.roster ?: return null
     val me = app.goldfishsend.core.Groups.me(s)
-    val names = r.members.associate { it.id to app.goldfishsend.core.Groups.memberName(s, m, it.id).name }
+    // Members now, plus anyone who sent a message here and has since left (their name is remembered from their card).
+    val senders = s.repo.db.query("SELECT DISTINCT sender_key FROM messages WHERE contact_id = ? AND sender_key IS NOT NULL", cid) { it.getString(0) }
+    val names = (r.members.map { it.id } + senders).toSet().associateWith { app.goldfishsend.core.Groups.memberName(s, m, it).name }
     val inviter = m.invitedBy?.let { app.goldfishsend.core.Groups.memberName(s, m, it).name } ?: "Someone"
     val active = r.members.count { it.role != app.goldfishsend.proto.Role.INVITED }
-    return ChatGroup(m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), "$active ${if (active == 1) "member" else "members"}")
+    val invited = r.members.size - active
+    val count = "$active ${if (active == 1) "member" else "members"}" + if (invited > 0) ", $invited invited" else ""
+    return ChatGroup(m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), count)
 }
 
 @OptIn(ExperimentalFoundationApi::class)

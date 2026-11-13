@@ -219,6 +219,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     var adding by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<MemberRow?>(null) }
     var safetyFor by remember { mutableStateOf<MemberRow?>(null) }
+    var confirmRemove by remember { mutableStateOf<MemberRow?>(null) }
     var confirmLeave by remember { mutableStateOf(false) }
     var promoteFirst by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -254,12 +255,13 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                 }
             }
             val active = r?.members?.count { it.role != Role.INVITED } ?: 0
+            val invited = (r?.members?.size ?: 0) - active
             Text(
                 when (m.state) {
                     GroupModel.INVITED -> "You're invited"
                     GroupModel.REMOVED -> "You were removed"
                     GroupModel.LEFT -> "You left this group"
-                    else -> "Group · $active ${if (active == 1) "member" else "members"}"
+                    else -> "Group · $active ${if (active == 1) "member" else "members"}" + if (invited > 0) ", $invited invited" else ""
                 },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -390,12 +392,35 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                         colors = colors,
                         modifier = Modifier.clickable {
                             selected = null
-                            act { Groups.removeMember(s, cid, row.id) }
+                            confirmRemove = row
                         },
                     )
                 }
             }
         }
+    }
+    confirmRemove?.let { row ->
+        val invite = row.role == Role.INVITED
+        AlertDialog(
+            onDismissRequest = { confirmRemove = null },
+            title = { Text(if (invite) "Cancel ${row.name}'s invitation?" else "Remove ${row.name}?") },
+            text = {
+                Text(
+                    if (invite) {
+                        "They won't be able to join with this invitation."
+                    } else {
+                        "${row.name} will stop getting messages from this group. Everyone moves to a new group inbox, which takes a moment."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRemove = null
+                    act { Groups.removeMember(s, cid, row.id) }
+                }) { Text(if (invite) "Cancel invitation" else "Remove", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmRemove = null }) { Text("Keep") } },
+        )
     }
     safetyFor?.let { row ->
         val number by rememberQuery(s, row.id) { q -> safetyNumber(q, B64.dec(row.id)) }
