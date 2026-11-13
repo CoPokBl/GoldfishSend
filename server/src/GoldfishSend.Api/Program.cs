@@ -41,17 +41,23 @@ builder.Services.ConfigureHttpJsonOptions(json => {
     json.SerializerOptions.TypeInfoResolverChain.Insert(0, ApiJsonContext.Default);
 });
 
+// Trusted reverse proxies (Caddy, Traefik, a cloud load balancer). Blank entries are ignored, so compose files can leave
+// optional slots empty. Anything else that doesn't parse is a hard startup error, never a silent "trust nobody".
+var trustedProxyNetworks = options.Network.TrustedProxies
+    .Where(p => !string.IsNullOrWhiteSpace(p))
+    .Select(p => p.Trim())
+    .Select(p => System.Net.IPNetwork.TryParse(p.Contains('/') ? p : p + (p.Contains(':') ? "/128" : "/32"), out var n)
+        ? n
+        : throw new InvalidOperationException($"Goldfish:Network:TrustedProxies contains an invalid IP or CIDR: '{p}'"))
+    .ToArray();
+
 builder.Services.Configure<ForwardedHeadersOptions>(forwarded => {
     forwarded.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-    forwarded.ForwardLimit = 1;
+    forwarded.ForwardLimit = Math.Clamp(options.Network.ForwardLimit, 1, 5);
     forwarded.KnownProxies.Clear();
     forwarded.KnownIPNetworks.Clear();
-    foreach (var proxy in options.Network.TrustedProxies) {
-        if (proxy.Contains('/')) {
-            forwarded.KnownIPNetworks.Add(System.Net.IPNetwork.Parse(proxy));
-        } else {
-            forwarded.KnownProxies.Add(IPAddress.Parse(proxy));
-        }
+    foreach (var network in trustedProxyNetworks) {
+        forwarded.KnownIPNetworks.Add(network);
     }
 });
 
@@ -64,7 +70,7 @@ builder.Services.AddGoldfish(options, mySql, redis, builder.Configuration.GetCon
 var app = builder.Build();
 
 var startupLog = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("GoldfishSend.Startup");
-if (options.HasRole("api") && options.Network.TrustedProxies.Length == 0 && !app.Environment.IsDevelopment()) {
+if (options.HasRole("api") && trustedProxyNetworks.Length == 0 && !app.Environment.IsDevelopment()) {
     startupLog.LogWarning("No Goldfish:Network:TrustedProxies configured. Behind a reverse proxy, every client will share one rate-limit bucket.");
 }
 if (!app.Services.GetRequiredService<GoldfishSend.Infrastructure.Redis.EphemeralRedis>().IsSeparate && !app.Environment.IsDevelopment()) {
@@ -79,12 +85,24 @@ app.UseForwardedHeaders();
 // If the reverse proxy ever reports a client address inside our own proxy network, the container runtime is collapsing
 // clients into one address (typically IPv6 traffic arriving through the bridge gateway). Then every client shares one
 // rate-limit bucket. It's logged at most every 10 minutes and never includes the address.
-var proxyNetworks = options.Network.TrustedProxies
-    .Select(p => System.Net.IPNetwork.Parse(p.Contains('/') ? p : p + (p.Contains(':') ? "/128" : "/32")))
-    .ToArray();
+var proxyNetworks = trustedProxyNetworks;
 var lastCollapseWarning = 0L;
+var lastUntrustedProxyWarning = 0L;
 app.Use(async (context, next) => {
     var remote = context.Connection.RemoteIpAddress;
+    // A proxy on a private network sent X-Forwarded-For, but it isn't trusted, so its header was ignored and every client
+    // looks like the proxy. This is the usual Traefik setup mistake (its network isn't in TrustedProxies, or it's behind
+    // a load balancer and ForwardLimit/TrustedProxies don't cover that hop). Only the proxy's own private address is logged.
+    if (remote is not null && context.Request.Headers.ContainsKey("X-Forwarded-For") && IsPrivate(remote)) {
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref lastUntrustedProxyWarning);
+        if (now - last > 600_000 && Interlocked.CompareExchange(ref lastUntrustedProxyWarning, now, last) == last) {
+            startupLog.LogWarning(
+                "Ignoring X-Forwarded-For from untrusted proxy {Proxy}. Add its network to Goldfish:Network:TrustedProxies " +
+                "(and raise Goldfish:Network:ForwardLimit if there is another proxy in front of it), or every client shares one rate limit.",
+                remote.IsIPv4MappedToIPv6 ? remote.MapToIPv4() : remote);
+        }
+    }
     if (remote is not null && proxyNetworks.Length > 0) {
         var ip = remote.IsIPv4MappedToIPv6 ? remote.MapToIPv4() : remote;
         if (proxyNetworks.Any(n => n.Contains(ip))) {
@@ -117,6 +135,18 @@ if (options.HasRole("api")) {
 }
 
 app.Run();
+
+static bool IsPrivate(IPAddress address) {
+    var ip = address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+    if (IPAddress.IsLoopback(ip)) {
+        return true;
+    }
+    if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) {
+        var b = ip.GetAddressBytes();
+        return b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 100 && b[1] >= 64 && b[1] <= 127);
+    }
+    return ip.IsIPv6UniqueLocal || ip.IsIPv6LinkLocal;
+}
 
 static void PrintKeys() {
     string Key() => Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(32));

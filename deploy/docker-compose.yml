@@ -8,6 +8,14 @@
 #
 # See server/README.md for key generation, backups and operations.
 #
+# Already running Traefik? Use the overlay instead of the bundled Caddy:
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+# (server/README.md, "Running behind Traefik").
+#
+# Already running Traefik? Use the overlay instead of the bundled Caddy:
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+# (server/README.md, "Running behind Traefik").
+#
 # Scaling out: every process is stateless and coordinates through MySQL and Redis, so
 #   docker compose up -d --scale api=3 --scale worker=4
 # works as-is. Caddy discovers api replicas through DNS. Workers share one Redis consumer group, so each

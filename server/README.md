@@ -219,7 +219,8 @@ All keys are 32 bytes, base64url. Generate a full set with `GoldfishSend.Api key
 
 | Key | Default | Meaning |
 |---|---|---|
-| `TrustedProxies` | `[]` | IPs or CIDRs whose `X-Forwarded-For` is trusted (one hop). Empty means XFF is ignored and the TCP peer is the client. Behind Caddy in compose, this is set to the caddy/api network's IPv4 and IPv6 subnets. If a forwarded client address ever falls *inside* these networks, the API logs a warning (at most every 10 minutes): the container runtime is collapsing clients into one address. |
+| `ForwardLimit` | `1` | How many proxy hops to unwrap from `X-Forwarded-For`. Use `2` when Traefik (or Caddy) sits behind a load balancer, and add the load balancer's addresses to `TrustedProxies`. Each hop is only believed if the hop in front of it is trusted. |
+| `TrustedProxies` | `[]` | IPs or CIDRs whose `X-Forwarded-For` is trusted. Blank entries are ignored and invalid ones stop startup. Empty means XFF is ignored and the TCP peer is the client. Behind Caddy in compose, this is set to the caddy/api network's IPv4 and IPv6 subnets. If a forwarded client address ever falls *inside* these networks, the API logs a warning (at most every 10 minutes): the container runtime is collapsing clients into one address. |
 
 ### `Goldfish` (other)
 
@@ -344,6 +345,122 @@ Rate limiting needs the real client address at Caddy:
   sees that). If your Docker can't do IPv6, set `GOLDFISH_ENABLE_IPV6=false` and publish only an A record.
 - **Rootless Podman:** use the `pasta` network backend (the default since Podman 5), which preserves source
   addresses. `slirp4netns` with the default port handler does not.
+
+### Running behind Traefik
+
+If you already run Traefik (v3), use the overlay instead of the bundled Caddy:
+
+```bash
+cd deploy
+# in deploy/.env:
+#   GOLDFISH_TRAEFIK_NETWORK=traefik            # the external Docker network your Traefik watches
+#   GOLDFISH_TRAEFIK_SUBNET=172.18.0.0/16       # that network's subnet: docker network inspect traefik
+#   GOLDFISH_TRAEFIK_ENTRYPOINT=websecure        # your TLS entrypoint
+#   GOLDFISH_TRAEFIK_CERTRESOLVER=letsencrypt    # your ACME resolver
+docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+```
+
+The overlay leaves Caddy out, attaches the api to your Traefik network, and publishes it with labels. The labels:
+- route only `Host(GOLDFISH_DOMAIN) && PathPrefix(/v1/)` on the TLS entrypoint, so `/healthz`, `/readyz` and every
+  other path return Traefik's 404, and plain HTTP has no API route;
+- cap request bodies at 16 KiB (the `buffering` middleware);
+- add HSTS (2 years, includeSubDomains, preload), `nosniff` and `no-referrer`, and strip `Server`;
+- load-balance every `--scale api=N` replica, with health checks on `/healthz`.
+
+The api trusts `X-Forwarded-For` only from `GOLDFISH_TRAEFIK_SUBNET` (plus optional `GOLDFISH_TRAEFIK_SUBNET6`).
+
+**What your Traefik must do (static configuration):**
+- **Don't trust client-supplied forwarded headers.** Leave `entryPoints.<tls>.forwardedHeaders.insecure` unset. Traefik
+  then replaces any `X-Forwarded-For` sent by a client with the real peer address, so clients can't pick their own
+  rate-limit bucket.
+- **Behind a load balancer** (cloud LB, HAProxy, a second Traefik): set `forwardedHeaders.trustedIPs` to the load
+  balancer's addresses on Traefik, and in `deploy/.env` set `GOLDFISH_FORWARD_LIMIT=2` and
+  `GOLDFISH_UPSTREAM_PROXIES=<the load balancer's CIDR>`.
+- **No access logs** for this router. Traefik writes none unless `accessLog` is configured. If it is, it records
+  client IPs and URLs for every request, so turn it off, or set `accessLog.fields.defaultMode: drop` and
+  `accessLog.fields.headers.defaultMode: drop`.
+- Sensible entrypoint timeouts (`transport.respondingTimeouts`, for example `readTimeout: 30s`), so slow clients can't hold connections.
+- The Docker provider with `exposedByDefault: false` is recommended, so only labelled containers are published.
+
+**Misconfiguration is visible.** If Traefik's network isn't in `GOLDFISH_TRAEFIK_SUBNET`, the api logs
+`Ignoring X-Forwarded-For from untrusted proxy <traefik's address>` (at most every 10 minutes). Until that's fixed,
+every client shares one rate limit.
+
+**Key pinning.** Clients with "Pin server keys" turned on pin your certificate's public key. Traefik's ACME resolver may
+generate a new key on renewal, which would warn pinned users every couple of months. To check, compare the fingerprint
+(see below) before and after a renewal. If it changes, either tell users not to enable pinning, or give Traefik a
+certificate with a stable key through its file provider (for example certbot with `--reuse-key`).
+
+**Onion service with Traefik.** `--profile onion` still works. Tor forwards straight to the api, which gets a fixed
+address on the onion network (`GOLDFISH_ONION_API_IP`), because Tor can't target a hostname. On that path only Kestrel's
+own limits apply, and `/healthz` and `/readyz` are reachable from the onion (they only answer "ok"/"ready").
+
+This setup was tested against a real Traefik 3.5:
+- Each client got its own rate-limit bucket.
+- A client-supplied `X-Forwarded-For` was ignored.
+- The load-balancer setup (`ForwardLimit=2` plus a trusted upstream) resolved the real client, and a non-LB peer couldn't spoof it.
+- A 20 KiB body got 413.
+- `/healthz` and `/readyz` returned 404.
+- Plain HTTP had no route.
+- The untrusted-proxy warning appeared.
+
+### Running behind Traefik
+
+If you already run Traefik (v3), use the overlay instead of the bundled Caddy:
+
+```bash
+cd deploy
+# in deploy/.env:
+#   GOLDFISH_TRAEFIK_NETWORK=traefik            # the external Docker network your Traefik watches
+#   GOLDFISH_TRAEFIK_SUBNET=172.18.0.0/16       # that network's subnet: docker network inspect traefik
+#   GOLDFISH_TRAEFIK_ENTRYPOINT=websecure        # your TLS entrypoint
+#   GOLDFISH_TRAEFIK_CERTRESOLVER=letsencrypt    # your ACME resolver
+docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+```
+
+The overlay leaves Caddy out, attaches the api to your Traefik network, and publishes it with labels. The labels:
+- route only `Host(GOLDFISH_DOMAIN) && PathPrefix(/v1/)` on the TLS entrypoint, so `/healthz`, `/readyz` and every
+  other path return Traefik's 404, and plain HTTP has no API route;
+- cap request bodies at 16 KiB (the `buffering` middleware);
+- add HSTS (2 years, includeSubDomains, preload), `nosniff` and `no-referrer`, and strip `Server`;
+- load-balance every `--scale api=N` replica, with health checks on `/healthz`.
+
+The api trusts `X-Forwarded-For` only from `GOLDFISH_TRAEFIK_SUBNET` (plus optional `GOLDFISH_TRAEFIK_SUBNET6`).
+
+**What your Traefik must do (static configuration):**
+- **Don't trust client-supplied forwarded headers.** Leave `entryPoints.<tls>.forwardedHeaders.insecure` unset. Traefik
+  then replaces any `X-Forwarded-For` sent by a client with the real peer address, so clients can't pick their own
+  rate-limit bucket.
+- **Behind a load balancer** (cloud LB, HAProxy, a second Traefik): set `forwardedHeaders.trustedIPs` to the load
+  balancer's addresses on Traefik, and in `deploy/.env` set `GOLDFISH_FORWARD_LIMIT=2` and
+  `GOLDFISH_UPSTREAM_PROXIES=<the load balancer's CIDR>`.
+- **No access logs** for this router. Traefik writes none unless `accessLog` is configured. If it is, it records
+  client IPs and URLs for every request, so turn it off, or set `accessLog.fields.defaultMode: drop` and
+  `accessLog.fields.headers.defaultMode: drop`.
+- Sensible entrypoint timeouts (`transport.respondingTimeouts`, for example `readTimeout: 30s`), so slow clients can't hold connections.
+- The Docker provider with `exposedByDefault: false` is recommended, so only labelled containers are published.
+
+**Misconfiguration is visible.** If Traefik's network isn't in `GOLDFISH_TRAEFIK_SUBNET`, the api logs
+`Ignoring X-Forwarded-For from untrusted proxy <traefik's address>` (at most every 10 minutes). Until that's fixed,
+every client shares one rate limit.
+
+**Key pinning.** Clients with "Pin server keys" turned on pin your certificate's public key. Traefik's ACME resolver may
+generate a new key on renewal, which would warn pinned users every couple of months. To check, compare the fingerprint
+(see below) before and after a renewal. If it changes, either tell users not to enable pinning, or give Traefik a
+certificate with a stable key through its file provider (for example certbot with `--reuse-key`).
+
+**Onion service with Traefik.** `--profile onion` still works. Tor forwards straight to the api, which gets a fixed
+address on the onion network (`GOLDFISH_ONION_API_IP`), because Tor can't target a hostname. On that path only Kestrel's
+own limits apply, and `/healthz` and `/readyz` are reachable from the onion (they only answer "ok"/"ready").
+
+This setup was tested against a real Traefik 3.5:
+- Each client got its own rate-limit bucket.
+- A client-supplied `X-Forwarded-For` was ignored.
+- The load-balancer setup (`ForwardLimit=2` plus a trusted upstream) resolved the real client, and a non-LB peer couldn't spoof it.
+- A 20 KiB body got 413.
+- `/healthz` and `/readyz` returned 404.
+- Plain HTTP had no route.
+- The untrusted-proxy warning appeared.
 
 ### Onion service (optional)
 

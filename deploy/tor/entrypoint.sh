@@ -6,6 +6,9 @@
 set -eu
 
 : "${GOLDFISH_ONION_CADDY_IP:=172.30.251.2}"
+# Where onion traffic goes: Caddy's onion-only listener by default. The Traefik overlay points it straight at the api
+# instead (Tor needs an IP address here, not a hostname).
+: "${GOLDFISH_ONION_TARGET:=${GOLDFISH_ONION_CADDY_IP}:8081}"
 
 umask 077
 cat > /tmp/torrc <<EOF
@@ -14,7 +17,7 @@ DataDirectory /var/lib/tor
 SocksPort 0
 ClientOnly 1
 HiddenServiceDir /var/lib/tor/goldfish
-HiddenServicePort 80 ${GOLDFISH_ONION_CADDY_IP}:8081
+HiddenServicePort 80 ${GOLDFISH_ONION_TARGET}
 # Built-in defences against introduction-point flooding.
 HiddenServiceEnableIntroDoSDefense 1
 HiddenServicePoWDefensesEnabled 1

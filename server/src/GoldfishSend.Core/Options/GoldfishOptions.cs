@@ -148,6 +148,13 @@ public enum EpochKeyStore {
 public sealed class NetworkOptions {
     /// <summary>Reverse proxies whose X-Forwarded-For header is trusted (IPs or CIDRs).</summary>
     public string[] TrustedProxies { get; set; } = [];
+
+    /**
+     * How many proxy hops to unwrap from X-Forwarded-For. 1 for a single reverse proxy (Caddy, Traefik). Use 2 when
+     * Traefik itself sits behind a load balancer, and add that load balancer's addresses to <see cref="TrustedProxies"/> too:
+     * each hop is only believed if the hop in front of it is trusted.
+     */
+    public int ForwardLimit { get; set; } = 1;
 }
 
 /// <summary>GCRA policy: <see cref="Limit"/> events per <see cref="PeriodSeconds"/>, with up to <see cref="Burst"/> at once.</summary>

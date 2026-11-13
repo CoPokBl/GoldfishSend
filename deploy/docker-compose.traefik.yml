@@ -1,0 +1,84 @@
+# GoldfishSend behind an existing Traefik (v3) instead of the bundled Caddy.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+#   # add `--profile onion` for the optional onion service
+#
+# What this overlay does:
+#   - Caddy is moved to an inactive profile, so it doesn't start. Traefik terminates TLS.
+#   - The api joins your Traefik's Docker network (GOLDFISH_TRAEFIK_NETWORK, external) and is published through labels:
+#     only `Host(GOLDFISH_DOMAIN) && PathPrefix(/v1)` is routed, on the TLS entrypoint only, with a 16 KiB body cap
+#     and HSTS. /healthz and /readyz are never routed.
+#   - The api trusts X-Forwarded-For only from the Traefik network's subnet (GOLDFISH_TRAEFIK_SUBNET). Without it, every
+#     client looks like Traefik and shares one rate limit, and the api logs a warning saying so.
+#   - The api keeps outbound internet (for verification pushes) through the egress network.
+#
+# Requirements on YOUR Traefik (static configuration). See server/README.md, "Running behind Traefik":
+#   - The TLS entrypoint (GOLDFISH_TRAEFIK_ENTRYPOINT, default "websecure") must NOT set forwardedHeaders.insecure.
+#     Only set forwardedHeaders.trustedIPs for a load balancer in front of Traefik (and then GOLDFISH_FORWARD_LIMIT=2).
+#   - No accessLog for this router. If access logs are on globally, they record client IPs and URLs. Turn them off,
+#     or at least drop ClientHost/ClientAddr/RequestPath (fields.defaultMode drop).
+#   - A certificate resolver (GOLDFISH_TRAEFIK_CERTRESOLVER), or certificates supplied another way.
+#   - The Docker provider with exposedByDefault=false is recommended.
+
+services:
+  caddy:
+    # Not started with this overlay. `--profile caddy` would bring it back.
+    profiles: ["caddy"]
+
+  api:
+    networks: !override
+      internal: {}
+      egress: {}
+      traefik: {}
+      # Only used by the optional onion service: Tor needs a fixed IP to forward to.
+      onion:
+        ipv4_address: "${GOLDFISH_ONION_API_IP:-172.30.251.3}"
+    environment:
+      # Overrides the Caddy defaults from docker-compose.yml.
+      Goldfish__Network__TrustedProxies__0: "${GOLDFISH_TRAEFIK_SUBNET:?set GOLDFISH_TRAEFIK_SUBNET to your Traefik network's subnet (docker network inspect <network>)}"
+      Goldfish__Network__TrustedProxies__1: "${GOLDFISH_TRAEFIK_SUBNET6:-}"
+      Goldfish__Network__TrustedProxies__2: "${GOLDFISH_UPSTREAM_PROXIES:-}"
+      Goldfish__Network__ForwardLimit: "${GOLDFISH_FORWARD_LIMIT:-1}"
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "${GOLDFISH_TRAEFIK_NETWORK:-traefik}"
+
+      # Only the API, only over TLS. Anything else on this host name is Traefik's 404.
+      traefik.http.routers.goldfish.rule: "Host(`${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}`) && PathPrefix(`/v1/`)"
+      traefik.http.routers.goldfish.entrypoints: "${GOLDFISH_TRAEFIK_ENTRYPOINT:-websecure}"
+      traefik.http.routers.goldfish.tls: "true"
+      traefik.http.routers.goldfish.tls.certresolver: "${GOLDFISH_TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      traefik.http.routers.goldfish.middlewares: "goldfish-body,goldfish-headers"
+      traefik.http.routers.goldfish.service: "goldfish"
+
+      # Requests are tiny. Reject anything over 16 KiB before it reaches Kestrel (which caps at 16 KiB too).
+      traefik.http.middlewares.goldfish-body.buffering.maxRequestBodyBytes: "16384"
+      traefik.http.middlewares.goldfish-body.buffering.memRequestBodyBytes: "16384"
+      traefik.http.middlewares.goldfish-body.buffering.maxResponseBodyBytes: "65536"
+
+      traefik.http.middlewares.goldfish-headers.headers.stsSeconds: "63072000"
+      traefik.http.middlewares.goldfish-headers.headers.stsIncludeSubdomains: "true"
+      traefik.http.middlewares.goldfish-headers.headers.stsPreload: "true"
+      traefik.http.middlewares.goldfish-headers.headers.contentTypeNosniff: "true"
+      traefik.http.middlewares.goldfish-headers.headers.referrerPolicy: "no-referrer"
+      traefik.http.middlewares.goldfish-headers.headers.customResponseHeaders.Server: ""
+
+      # Every api replica (`--scale api=N`) joins this service. Traefik health-checks them internally.
+      traefik.http.services.goldfish.loadbalancer.server.port: "8080"
+      traefik.http.services.goldfish.loadbalancer.healthcheck.path: "/healthz"
+      traefik.http.services.goldfish.loadbalancer.healthcheck.interval: "10s"
+      traefik.http.services.goldfish.loadbalancer.healthcheck.timeout: "3s"
+
+  # The optional onion service (profile "onion") can't go through Caddy here, so it forwards straight to the api, which
+  # gets a fixed address on the onion network. The api treats Tor's address as the client (it isn't a trusted proxy), so
+  # onion clients share one rate-limit address, as before. Kestrel's own limits apply on this path, and /healthz and
+  # /readyz are reachable from the onion (they reveal only "ok"/"ready").
+  tor:
+    depends_on: !reset []
+    environment:
+      GOLDFISH_ONION_TARGET: "${GOLDFISH_ONION_API_IP:-172.30.251.3}:8080"
+
+networks:
+  traefik:
+    external: true
+    name: "${GOLDFISH_TRAEFIK_NETWORK:-traefik}"
