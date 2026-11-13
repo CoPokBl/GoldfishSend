@@ -2,8 +2,10 @@ using System.Diagnostics.Metrics;
 using System.Security.Cryptography;
 using GoldfishSend.Core;
 using GoldfishSend.Core.Crypto;
+using GoldfishSend.Core.Options;
 using GoldfishSend.Infrastructure.MySql;
 using GoldfishSend.Infrastructure.Push;
+using GoldfishSend.Infrastructure.Redis;
 using Microsoft.Extensions.Logging;
 
 namespace GoldfishSend.Infrastructure.Delivery;
@@ -13,31 +15,43 @@ public enum DeliveryOutcomeKind {
     Delivered,
     /// <summary>It can never be delivered (expired, mailbox deleted, rejected, or the key was shredded). Forget the message.</summary>
     Dropped,
-    /// <summary>Temporary failure. Try again at <see cref="DeliveryOutcome.NextAttemptAt"/>.</summary>
+    /// <summary>Try again at <see cref="DeliveryOutcome.NextAttemptAt"/>.</summary>
     Retry,
-    /// <summary>The mailbox can't receive right now (endpoint gone or awaiting verification). Hold until the owner fixes it or the TTL ends.</summary>
+    /// <summary>
+    /// The mailbox can't receive right now (endpoint gone or awaiting verification). Park until its expiry. Verification,
+    /// endpoint rotation or a re-probe wakes it earlier.
+    /// </summary>
     Hold,
 }
 
-public readonly record struct DeliveryOutcome(DeliveryOutcomeKind Kind, DateTime NextAttemptAt = default);
+/// <param name="CountsAsAttempt">
+/// False for local deferrals (pacing, caps, circuit open, mailbox busy). Those mustn't escalate the message's backoff.
+/// </param>
+public readonly record struct DeliveryOutcome(DeliveryOutcomeKind Kind, DateTime NextAttemptAt = default, bool CountsAsAttempt = true);
 
 /// <summary>One delivery attempt. It's shared by the hot-queue worker and the retry worker.</summary>
 public sealed class DeliveryService {
-    /// <summary>How often a held message re-checks its mailbox even without a wake-up.</summary>
-    private static readonly TimeSpan HoldRecheck = TimeSpan.FromHours(1);
-
     private readonly MailboxRepository _mailboxes;
+    private readonly PendingMessageRepository _pending;
     private readonly EpochKeyring _keyring;
     private readonly PushClient _push;
+    private readonly MailboxLeases _leases;
+    private readonly DeliverySignal _signal;
+    private readonly TimeSpan _leaseTtl;
     private readonly ILogger<DeliveryService> _logger;
     private readonly Counter<long> _outcomes;
 
     public DeliveryService(
-        MailboxRepository mailboxes, EpochKeyring keyring, PushClient push, Meter meter, ILogger<DeliveryService> logger) {
+        MailboxRepository mailboxes, PendingMessageRepository pending, EpochKeyring keyring, PushClient push, MailboxLeases leases,
+        DeliverySignal signal, GoldfishOptions options, Meter meter, ILogger<DeliveryService> logger) {
         _mailboxes = mailboxes;
+        _pending = pending;
         _keyring = keyring;
         _push = push;
+        _leases = leases;
+        _signal = signal;
         _logger = logger;
+        _leaseTtl = TimeSpan.FromSeconds(options.Push.RequestTimeoutSeconds + 20);
         _outcomes = meter.CreateCounter<long>("goldfish.delivery.outcomes");
     }
 
@@ -57,8 +71,8 @@ public sealed class DeliveryService {
         if (mailbox is null) {
             return new DeliveryOutcome(DeliveryOutcomeKind.Dropped);
         }
-        if (mailbox.State != MailboxState.Active) {
-            return Hold(job, now);
+        if (mailbox.State == MailboxState.PendingVerification) {
+            return Park(job);
         }
 
         var epochKey = await _keyring.GetAsync(job.KeyEpoch, ct);
@@ -70,7 +84,7 @@ public sealed class DeliveryService {
         byte[] sealKey;
         byte[] envelope;
         try {
-            (sealKey, envelope) = JobCodec.Open(epochKey, job.Id, job.Blob);
+            (sealKey, envelope) = JobCodec.Open(epochKey, job.Id, job.MailboxId, job.ExpiresAt, job.Blob);
         } catch (CryptographicException) {
             _logger.LogWarning("Dropping a message that failed authentication");
             return new DeliveryOutcome(DeliveryOutcomeKind.Dropped);
@@ -85,16 +99,37 @@ public sealed class DeliveryService {
                 return new DeliveryOutcome(DeliveryOutcomeKind.Dropped);
             }
 
-            var ttl = (int)Math.Max(0, (job.ExpiresAt - now).TotalSeconds);
-            var result = await _push.SendAsync(endpoint, envelope, ttl, ct);
+            // A few deliveries per mailbox at a time, cluster-wide.
+            var lease = await _leases.TryAcquireAsync(job.MailboxId, _leaseTtl);
+            if (lease is null) {
+                // This mailbox already has its share of pushes in flight (usually a burst). Come back shortly.
+                return Defer(job, now, TimeSpan.FromMilliseconds(250));
+            }
+            PushResult result;
+            try {
+                var ttl = (int)Math.Max(0, (job.ExpiresAt - now).TotalSeconds);
+                result = await _push.SendAsync(endpoint, envelope, ttl, ct, job.MailboxId);
+            } finally {
+                await lease.ReleaseAsync();
+            }
+
             switch (result.Status) {
                 case PushStatus.Delivered:
+                    if (mailbox.State == MailboxState.EndpointGone) {
+                        // The "dead" endpoint works again (a re-probe, or a new message got through): wake everything held.
+                        if (await _mailboxes.MarkRecoveredAsync(mailbox.Id, mailbox.SealedEndpoint, ct)) {
+                            await _pending.WakeMailboxAsync(mailbox.Id, ct);
+                            await _signal.NotifyRetryAsync();
+                        }
+                    }
                     return new DeliveryOutcome(DeliveryOutcomeKind.Delivered);
                 case PushStatus.Gone:
                     await _mailboxes.MarkEndpointGoneAsync(mailbox.Id, mailbox.SealedEndpoint, ct);
-                    return Hold(job, now);
+                    return Park(job);
                 case PushStatus.Rejected:
                     return new DeliveryOutcome(DeliveryOutcomeKind.Dropped);
+                case PushStatus.Deferred:
+                    return Defer(job, now, result.RetryAfter ?? TimeSpan.FromSeconds(1));
                 default:
                     var next = now + Backoff.Next(job.Attempts + 1, result.RetryAfter);
                     // If the message would expire before the next try, it's undeliverable within its TTL.
@@ -108,8 +143,15 @@ public sealed class DeliveryService {
         }
     }
 
-    private static DeliveryOutcome Hold(DeliveryJob job, DateTime now) {
-        var next = now + HoldRecheck;
-        return new DeliveryOutcome(DeliveryOutcomeKind.Hold, next < job.ExpiresAt ? next : job.ExpiresAt);
+    /// <summary>Parked until expiry. Something else (verification, rotation, re-probe) wakes it if the mailbox recovers.</summary>
+    private static DeliveryOutcome Park(DeliveryJob job) => new(DeliveryOutcomeKind.Hold, job.ExpiresAt);
+
+    /// <summary>A local deferral: it retries soon, without counting as an attempt.</summary>
+    private static DeliveryOutcome Defer(DeliveryJob job, DateTime now, TimeSpan delay) {
+        var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(0, (int)Math.Min(1000, Math.Max(100, delay.TotalMilliseconds))));
+        var next = now + delay + jitter;
+        return next >= job.ExpiresAt
+            ? new DeliveryOutcome(DeliveryOutcomeKind.Dropped)
+            : new DeliveryOutcome(DeliveryOutcomeKind.Retry, next, CountsAsAttempt: false);
     }
 }

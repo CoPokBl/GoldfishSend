@@ -19,20 +19,14 @@ public sealed class MessageQueue {
     private const string FieldBlob = "blob";
     private const string FieldExpires = "exp";
 
-    // KEYS[1] = idempotency key ("" if none), KEYS[2] = stream.
-    // ARGV = message id, idempotency window (s), mailbox id, epoch, blob, expiry (unix s).
-    // Reserving the key and appending to the stream happen atomically, so a crash can't leave a reservation
-    // pointing at a message that was never queued. Returns the earlier message id for a duplicate, else nil.
-    private const string EnqueueScript = """
-        if KEYS[1] ~= '' then
-            local existing = redis.call('GET', KEYS[1])
-            if existing then return existing end
+    // KEYS[1] = stream. ARGV = max length, then the fields. Refuses (returns 0) once the stream is at its bound, so a
+    // backlog spills to MySQL instead of filling Redis memory.
+    private const string BoundedAddScript = """
+        if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+            return 0
         end
-        redis.call('XADD', KEYS[2], '*', 'id', ARGV[1], 'mbx', ARGV[3], 'ep', ARGV[4], 'blob', ARGV[5], 'exp', ARGV[6])
-        if KEYS[1] ~= '' then
-            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-        end
-        return false
+        redis.call('XADD', KEYS[1], '*', 'id', ARGV[2], 'mbx', ARGV[3], 'ep', ARGV[4], 'blob', ARGV[5], 'exp', ARGV[6])
+        return 1
         """;
 
     private readonly IConnectionMultiplexer _redis;
@@ -51,25 +45,30 @@ public sealed class MessageQueue {
         }
     }
 
-    /// <returns>The id of an earlier message with the same idempotency key, or <c>null</c> if this one was queued.</returns>
-    public async Task<byte[]?> EnqueueAsync(DeliveryJob job, byte[]? idempotencyKey, TimeSpan idempotencyWindow) {
-        var db = _redis.GetDatabase();
-        RedisKey idemKey = idempotencyKey is null
-            ? ""
-            : RedisKeys.Idempotency(Convert.ToHexString(job.MailboxId, 0, 16), Convert.ToHexString(idempotencyKey));
-        var result = await db.ScriptEvaluateAsync(EnqueueScript, [idemKey, RedisKeys.Queue], [
-            job.Id,
-            (long)idempotencyWindow.TotalSeconds,
-            job.MailboxId,
-            job.KeyEpoch,
-            job.Blob,
-            new DateTimeOffset(job.ExpiresAt, TimeSpan.Zero).ToUnixTimeSeconds(),
-        ]);
-        if (!result.IsNull && result.Resp2Type == ResultType.BulkString) {
-            return (byte[]?)result;
+    /// <summary>Appends to the hot queue.</summary>
+    /// <returns>
+    /// <c>false</c> if the stream is at <paramref name="maxLength"/> or Redis refused the write (out of memory). The caller
+    /// must then store the job durably elsewhere.
+    /// </returns>
+    public async Task<bool> TryEnqueueAsync(DeliveryJob job, int maxLength) {
+        try {
+            var added = (long)await _redis.GetDatabase().ScriptEvaluateAsync(BoundedAddScript, [RedisKeys.Queue], [
+                maxLength,
+                job.Id,
+                job.MailboxId,
+                job.KeyEpoch,
+                job.Blob,
+                new DateTimeOffset(job.ExpiresAt, TimeSpan.Zero).ToUnixTimeSeconds(),
+            ]);
+            if (added != 1) {
+                return false;
+            }
+        } catch (RedisServerException ex) when (ex.Message.Contains("OOM", StringComparison.Ordinal)) {
+            _logger.LogWarning("Queue Redis is out of memory; spilling to MySQL");
+            return false;
         }
         await _redis.GetSubscriber().PublishAsync(RedisChannel.Literal(RedisKeys.WakeQueue), 1, CommandFlags.FireAndForget);
-        return null;
+        return true;
     }
 
     public async Task<IReadOnlyList<QueueEntry>> ReadNewAsync(string consumer, int count) {

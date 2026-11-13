@@ -44,7 +44,11 @@ public static class ServiceCollectionExtensions {
         services.AddSingleton<HostGuards>();
         services.AddSingleton<PushClient>();
 
+        services.AddSingleton<ClusterSecret>();
         services.AddSingleton<RateLimiter>();
+        services.AddSingleton<IdempotencyStore>();
+        services.AddSingleton<MailboxLeases>();
+        services.AddSingleton<HeldQuota>();
         services.AddSingleton<PowService>();
         services.AddSingleton<EphemeralStore>();
         services.AddSingleton<MessageQueue>();
@@ -55,6 +59,8 @@ public static class ServiceCollectionExtensions {
         services.AddSingleton<MessageService>();
         services.AddSingleton<InviteService>();
 
+        // Every role prunes its own caches (host guards, epoch keys).
+        services.AddHostedService<CachePruner>();
         if (options.HasRole("worker")) {
             services.AddHostedService<StreamDeliveryWorker>();
             services.AddHostedService<RetryWorker>();
@@ -67,6 +73,9 @@ public static class ServiceCollectionExtensions {
         var config = ConfigurationOptions.Parse(configuration);
         config.AbortOnConnectFail = false;
         config.ClientName = "goldfish";
+        // Keep keys (which can carry mailbox-derived names) and server details out of exception messages and logs.
+        config.IncludeDetailInExceptions = false;
+        config.IncludePerformanceCountersInExceptions = false;
         return ConnectionMultiplexer.Connect(config);
     }
 

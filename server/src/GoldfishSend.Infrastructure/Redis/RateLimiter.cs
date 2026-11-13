@@ -16,12 +16,19 @@ public readonly record struct RateLimitDecision(bool Allowed, TimeSpan RetryAfte
 }
 
 /// <summary>
-/// A distributed GCRA (generic cell rate algorithm) limiter in Redis. Every subject (IP prefix, mailbox id)
-/// is HMACed with a random key that rotates daily, so Redis never holds raw identifiers and yesterday's
-/// keys can't be reversed later.
+/// A distributed GCRA (generic cell rate algorithm) limiter in the ephemeral Redis. Every subject (IP prefix,
+/// mailbox id) is HMACed before it reaches Redis:
+/// <list type="bullet">
+/// <item>Short-period buckets use a random key that rotates daily, so yesterday's buckets can't be linked to addresses.</item>
+/// <item>Long-period buckets (an hour or more) use the stable <see cref="ClusterSecret"/>, so the midnight key rotation
+/// can't reset them and double the budget.</item>
+/// </list>
+/// Stored theoretical-arrival times are stochastically rounded to whole seconds (unbiased, so budgets don't shrink), so buckets
+/// written by the same request can't be matched by their exact millisecond timestamps.
 /// </summary>
 public sealed class RateLimiter {
-    // KEYS[1] = bucket. ARGV = emission interval (ms), burst, cost.
+    // KEYS[1] = bucket. ARGV = emission interval (ms), burst, cost, jitter (ms).
+    // cost 0 is a "peek": it reports whether one more event would fit, without charging.
     // Uses the Redis server clock so nodes with clock skew agree.
     private const string GcraScript = """
         local t = redis.call('TIME')
@@ -29,14 +36,23 @@ public sealed class RateLimiter {
         local ei = tonumber(ARGV[1])
         local burst = tonumber(ARGV[2])
         local cost = tonumber(ARGV[3])
+        local jitter = tonumber(ARGV[4])
         local tat = tonumber(redis.call('GET', KEYS[1]) or now)
         if tat < now then tat = now end
-        local new_tat = tat + ei * cost
+        local c = cost
+        if c < 1 then c = 1 end
+        local new_tat = tat + ei * c
         local allow_at = new_tat - ei * burst
         if allow_at > now then
             return {0, math.ceil(allow_at - now)}
         end
-        redis.call('SET', KEYS[1], tostring(new_tat), 'PX', math.max(1, math.ceil(new_tat - now)))
+        if cost > 0 then
+            new_tat = tat + ei * cost
+            if ei >= 1000 then
+                new_tat = math.floor((new_tat + jitter) / 1000) * 1000
+            end
+            redis.call('SET', KEYS[1], tostring(new_tat), 'PX', math.max(1, math.ceil(new_tat - now)))
+        end
         return {1, 0}
         """;
 
@@ -46,8 +62,11 @@ public sealed class RateLimiter {
     private readonly InMemoryGcra _fallback = new();
     private readonly ConcurrentDictionary<string, byte[]> _dailyKeys = new();
 
-    public RateLimiter(EphemeralRedis redis, GoldfishOptions options, ILogger<RateLimiter> logger) {
+    private readonly ClusterSecret _secret;
+
+    public RateLimiter(EphemeralRedis redis, ClusterSecret secret, GoldfishOptions options, ILogger<RateLimiter> logger) {
         _redis = redis;
+        _secret = secret;
         _options = options;
         _logger = logger;
     }
@@ -66,11 +85,13 @@ public sealed class RateLimiter {
         }
 
         try {
-            var hashed = await HashSubjectAsync(policyName, subject);
+            var hashed = RatePolicies.UsesStableKey(policy)
+                ? await _secret.HmacHexAsync("rl/" + policyName, subject)
+                : await HashSubjectAsync(policyName, subject);
             var result = (RedisResult[])(await _redis.Db.ScriptEvaluateAsync(
                 GcraScript,
                 [RedisKeys.RateLimit(policyName, hashed)],
-                [policy.EmissionIntervalMs, Math.Max(1, policy.Burst), cost]))!;
+                [policy.EmissionIntervalMs, Math.Max(1, policy.Burst), cost, RandomNumberGenerator.GetInt32(0, 1000)]))!;
             var allowed = (long)result[0] == 1;
             return new RateLimitDecision(allowed, TimeSpan.FromMilliseconds((long)result[1]));
         } catch (Exception ex) when (ex is RedisException or TimeoutException) {
@@ -127,10 +148,13 @@ public sealed class InMemoryGcra {
         while (true) {
             var exists = _tat.TryGetValue(key, out var tat);
             var start = exists && tat > now ? tat : now;
-            var newTat = start + ei * cost;
+            var newTat = start + ei * Math.Max(1, cost);
             var allowAt = newTat - tolerance;
             if (allowAt > now) {
                 return new RateLimitDecision(false, TimeSpan.FromMilliseconds(Math.Ceiling(allowAt - now)));
+            }
+            if (cost <= 0) {
+                return RateLimitDecision.Allow;
             }
             if (exists ? _tat.TryUpdate(key, newTat, tat) : _tat.TryAdd(key, newTat)) {
                 return RateLimitDecision.Allow;

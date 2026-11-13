@@ -27,6 +27,9 @@ public sealed class FakeDevice : IDisposable {
     /// <summary>The HTTP status the push server answers with. 201 means accepted.</summary>
     public volatile int Status = 201;
 
+    /// <summary>A delay before answering, to simulate a tarpit. 0 answers immediately.</summary>
+    public volatile int DelayMs;
+
     public int Attempts;
 
     public async Task<(PushType Type, byte[] Tag, byte[] Body)> NextAsync(TimeSpan? timeout = null) {
@@ -57,6 +60,9 @@ public sealed class FakePushServer : IAsyncDisposable {
                 return Results.StatusCode(404);
             }
             Interlocked.Increment(ref device.Attempts);
+            if (device.DelayMs > 0) {
+                await Task.Delay(device.DelayMs);
+            }
             if (device.Status is < 200 or >= 300) {
                 return Results.StatusCode(device.Status);
             }
@@ -81,9 +87,11 @@ public sealed class FakePushServer : IAsyncDisposable {
         BaseUrl = _app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
     }
 
-    public FakeDevice NewDevice() {
+    /// <param name="alternateHost">Use "localhost" instead of 127.0.0.1, so the device counts as a different push host.</param>
+    public FakeDevice NewDevice(bool alternateHost = false) {
         var device = new FakeDevice();
-        device.Url = $"{BaseUrl}/push/{device.Name}";
+        var baseUrl = alternateHost ? BaseUrl.Replace("127.0.0.1", "localhost", StringComparison.Ordinal) : BaseUrl;
+        device.Url = $"{baseUrl}/push/{device.Name}";
         _devices[device.Name] = device;
         return device;
     }

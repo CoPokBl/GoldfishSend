@@ -151,7 +151,7 @@ public sealed class MailboxRepository {
                 UPDATE mailboxes
                 SET sealed_endpoint = COALESCE(pending_endpoint, sealed_endpoint),
                     pending_endpoint = NULL, verify_hash = NULL, verify_attempts = 0, verify_expires_at = NULL,
-                    state = @active, expires_at = GREATEST(expires_at, @expiresAt)
+                    state = @active, expires_at = GREATEST(expires_at, @expiresAt), reprobe_at = NULL, reprobe_count = 0
                 WHERE id = @id AND verify_hash = @verifyHash AND verify_expires_at >= UTC_TIMESTAMP() AND verify_attempts <= @maxAttempts
                 """,
                 new { id, verifyHash, maxAttempts, active = (byte)MailboxState.Active, expiresAt = expiresAt.ToDateTime(TimeOnly.MinValue) },
@@ -175,9 +175,47 @@ public sealed class MailboxRepository {
     /// </summary>
     public async Task MarkEndpointGoneAsync(byte[] id, byte[] failedEndpoint, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
-        await conn.ExecuteAsync(new CommandDefinition(
-            "UPDATE mailboxes SET state = @gone WHERE id = @id AND state = @active AND sealed_endpoint = @failedEndpoint",
+        // The first re-probe is an hour later (see DueReprobesAsync for the backoff).
+        await conn.ExecuteAsync(new CommandDefinition("""
+            UPDATE mailboxes SET state = @gone, reprobe_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 1 HOUR), reprobe_count = 0
+            WHERE id = @id AND state = @active AND sealed_endpoint = @failedEndpoint
+            """,
             new { id, failedEndpoint, gone = (byte)MailboxState.EndpointGone, active = (byte)MailboxState.Active }, cancellationToken: ct));
+    }
+
+    /// <summary>A "gone" endpoint accepted a push again, so the mailbox is active again (if the endpoint hasn't changed meanwhile).</summary>
+    /// <returns><c>true</c> if this call changed the state.</returns>
+    public async Task<bool> MarkRecoveredAsync(byte[] id, byte[] workingEndpoint, CancellationToken ct = default) {
+        await using var conn = await _db.OpenAsync(ct);
+        var n = await conn.ExecuteAsync(new CommandDefinition("""
+            UPDATE mailboxes SET state = @active, reprobe_at = NULL, reprobe_count = 0
+            WHERE id = @id AND state = @gone AND sealed_endpoint = @workingEndpoint
+            """,
+            new { id, workingEndpoint, gone = (byte)MailboxState.EndpointGone, active = (byte)MailboxState.Active }, cancellationToken: ct));
+        return n == 1;
+    }
+
+    /// <summary>
+    /// Mailboxes whose "gone" endpoint is due a re-probe. Their next probe is pushed out with exponential backoff:
+    /// 1 h, 2 h, 4 h … capped at 24 h.
+    /// </summary>
+    public async Task<IReadOnlyList<byte[]>> ClaimDueReprobesAsync(int limit, CancellationToken ct = default) {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        var ids = (await conn.QueryAsync<byte[]>(new CommandDefinition("""
+            SELECT id FROM mailboxes WHERE state = @gone AND reprobe_at <= UTC_TIMESTAMP()
+            ORDER BY reprobe_at LIMIT @limit FOR UPDATE SKIP LOCKED
+            """, new { limit, gone = (byte)MailboxState.EndpointGone }, tx, cancellationToken: ct))).AsList();
+        if (ids.Count > 0) {
+            await conn.ExecuteAsync(new CommandDefinition("""
+                UPDATE mailboxes
+                SET reprobe_count = LEAST(reprobe_count + 1, 10),
+                    reprobe_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL CAST(LEAST(24, POW(2, LEAST(reprobe_count + 1, 10))) AS UNSIGNED) HOUR)
+                WHERE id IN @ids
+                """, new { ids }, tx, cancellationToken: ct));
+        }
+        await tx.CommitAsync(ct);
+        return ids;
     }
 
     /// <summary>The number of messages held for a mailbox, counting at most <paramref name="cap"/>.</summary>

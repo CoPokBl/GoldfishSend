@@ -97,8 +97,14 @@ public abstract class PumpWorker<T> : BackgroundService {
 /// acknowledged, so a crash at any point loses nothing. Entries held by a dead node are reclaimed after a minute.
 /// </summary>
 public sealed class StreamDeliveryWorker : PumpWorker<QueueEntry> {
-    private static readonly TimeSpan ReclaimIdle = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// How long an entry may sit unacknowledged before another node takes it over. It's well above the worst case for a
+    /// healthy node (one full channel ahead of it plus its own job), so a slow-but-alive node isn't duplicated. Delivery
+    /// is at-least-once regardless; clients drop duplicates.
+    /// </summary>
+    private TimeSpan ReclaimIdle => TimeSpan.FromTicks(Math.Max(TimeSpan.FromMinutes(1).Ticks, JobTimeout.Ticks * 4));
 
     private readonly MessageQueue _queue;
     private readonly DeliveryService _delivery;
@@ -167,7 +173,7 @@ public sealed class StreamDeliveryWorker : PumpWorker<QueueEntry> {
 
         var outcome = await _delivery.AttemptAsync(job, ct);
         if (outcome.Kind is DeliveryOutcomeKind.Retry or DeliveryOutcomeKind.Hold) {
-            var attempts = outcome.Kind == DeliveryOutcomeKind.Retry ? job.Attempts + 1 : job.Attempts;
+            var attempts = outcome.Kind == DeliveryOutcomeKind.Retry && outcome.CountsAsAttempt ? job.Attempts + 1 : job.Attempts;
             await _pending.UpsertAsync(job.Id, job.MailboxId, job.KeyEpoch, job.Blob, attempts, outcome.NextAttemptAt, job.ExpiresAt, ct);
         }
         await _queue.CompleteAsync(entry.EntryId);
@@ -179,7 +185,9 @@ public sealed class StreamDeliveryWorker : PumpWorker<QueueEntry> {
 /// lets any number of nodes run this at once without overlapping.
 /// </summary>
 public sealed class RetryWorker : PumpWorker<PendingMessageRow> {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
+    // Short, because local deferrals (a busy mailbox, pacing) come back in well under a second. The claim query only
+    // reads due rows through an index, so polling is cheap.
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly PendingMessageRepository _pending;
     private readonly DeliveryService _delivery;
@@ -192,8 +200,9 @@ public sealed class RetryWorker : PumpWorker<PendingMessageRow> {
         _pending = pending;
         _delivery = delivery;
         _signal = signal;
-        // Claimed rows wait at most one channel's worth of jobs before running, so the lease covers queueing time too.
-        _lease = JobTimeout * 3;
+        // Claimed rows wait at most one channel's worth of jobs (about one job timeout) before running. Five job timeouts
+        // covers that wait plus the job itself with a wide margin, so a live node's claim never lapses and gets duplicated.
+        _lease = JobTimeout * 5;
     }
 
     protected override Task InitializeAsync(CancellationToken ct) => _signal.SubscribeAsync();
@@ -220,7 +229,7 @@ public sealed class RetryWorker : PumpWorker<PendingMessageRow> {
                 await _pending.DeleteAsync(row.Id, ct);
                 break;
             case DeliveryOutcomeKind.Retry:
-                await _pending.RescheduleAsync(row.Id, row.Attempts + 1, outcome.NextAttemptAt, ct);
+                await _pending.RescheduleAsync(row.Id, outcome.CountsAsAttempt ? row.Attempts + 1 : row.Attempts, outcome.NextAttemptAt, ct);
                 break;
             case DeliveryOutcomeKind.Hold:
                 await _pending.RescheduleAsync(row.Id, row.Attempts, outcome.NextAttemptAt, ct);
@@ -242,19 +251,19 @@ public sealed class MaintenanceWorker : BackgroundService {
     private readonly MailboxRepository _mailboxes;
     private readonly PendingMessageRepository _pending;
     private readonly MessageQueue _queue;
-    private readonly HostGuards _guards;
+    private readonly DeliverySignal _signal;
     private readonly IConnectionMultiplexer _redis;
     private readonly ILogger<MaintenanceWorker> _logger;
     private readonly string _token = Guid.NewGuid().ToString("N");
 
     public MaintenanceWorker(
-        EpochKeyring keyring, MailboxRepository mailboxes, PendingMessageRepository pending, MessageQueue queue, HostGuards guards,
+        EpochKeyring keyring, MailboxRepository mailboxes, PendingMessageRepository pending, MessageQueue queue, DeliverySignal signal,
         IConnectionMultiplexer redis, ILogger<MaintenanceWorker> logger) {
         _keyring = keyring;
         _mailboxes = mailboxes;
         _pending = pending;
         _queue = queue;
-        _guards = guards;
+        _signal = signal;
         _redis = redis;
         _logger = logger;
     }
@@ -263,7 +272,6 @@ public sealed class MaintenanceWorker : BackgroundService {
         while (!ct.IsCancellationRequested) {
             try {
                 await _keyring.RotateAsync(ct);
-                _guards.Prune();
 
                 // The lease is shorter than the interval, so a crashed leader is replaced within a minute.
                 var db = _redis.GetDatabase();
@@ -271,6 +279,12 @@ public sealed class MaintenanceWorker : BackgroundService {
                     var expired = await _pending.DeleteExpiredAsync(ct);
                     var purged = await _mailboxes.PurgeAsync(ct);
                     var consumers = await _queue.RemoveIdleConsumersAsync(StreamDeliveryWorker.ConsumerName);
+                    // Endpoints that looked gone get probed again with backoff: their oldest held message is retried.
+                    var reprobes = await _mailboxes.ClaimDueReprobesAsync(200, ct);
+                    if (reprobes.Count > 0) {
+                        await _pending.PokeOldestAsync(reprobes, ct);
+                        await _signal.NotifyRetryAsync();
+                    }
                     if (expired > 0 || purged > 0 || consumers > 0) {
                         _logger.LogInformation("Maintenance: {Expired} expired message(s), {Purged} mailbox(es), {Consumers} idle consumer(s) removed",
                             expired, purged, consumers);
@@ -280,6 +294,41 @@ public sealed class MaintenanceWorker : BackgroundService {
                 break;
             } catch (Exception ex) {
                 _logger.LogError(ex, "Maintenance pass failed");
+            }
+            try {
+                await Task.Delay(Interval, ct);
+            } catch (OperationCanceledException) {
+                break;
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Runs on every role, the API included. It prunes process-local caches that would otherwise only grow: push-host guard
+/// state (every new host in a verification push adds an entry) and epoch keys past retention (so shredded keys don't
+/// linger in this process's memory).
+/// </summary>
+public sealed class CachePruner : BackgroundService {
+    private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
+
+    private readonly HostGuards _guards;
+    private readonly EpochKeyring _keyring;
+    private readonly ILogger<CachePruner> _logger;
+
+    public CachePruner(HostGuards guards, EpochKeyring keyring, ILogger<CachePruner> logger) {
+        _guards = guards;
+        _keyring = keyring;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken ct) {
+        while (!ct.IsCancellationRequested) {
+            try {
+                _guards.Prune();
+                _keyring.EvictExpired();
+            } catch (Exception ex) {
+                _logger.LogError(ex, "Cache pruning failed");
             }
             try {
                 await Task.Delay(Interval, ct);

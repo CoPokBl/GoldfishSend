@@ -75,6 +75,31 @@ await app.Services.GetRequiredService<Migrator>().MigrateAsync();
 await app.Services.GetRequiredService<EpochKeyring>().RotateAsync();
 
 app.UseForwardedHeaders();
+
+// If the reverse proxy ever reports a client address inside our own proxy network, the container runtime is collapsing
+// clients into one address (typically IPv6 traffic arriving through the bridge gateway). Then every client shares one
+// rate-limit bucket. It's logged at most every 10 minutes and never includes the address.
+var proxyNetworks = options.Network.TrustedProxies
+    .Select(p => System.Net.IPNetwork.Parse(p.Contains('/') ? p : p + (p.Contains(':') ? "/128" : "/32")))
+    .ToArray();
+var lastCollapseWarning = 0L;
+app.Use(async (context, next) => {
+    var remote = context.Connection.RemoteIpAddress;
+    if (remote is not null && proxyNetworks.Length > 0) {
+        var ip = remote.IsIPv4MappedToIPv6 ? remote.MapToIPv4() : remote;
+        if (proxyNetworks.Any(n => n.Contains(ip))) {
+            var now = Environment.TickCount64;
+            var last = Interlocked.Read(ref lastCollapseWarning);
+            if (now - last > 600_000 && Interlocked.CompareExchange(ref lastCollapseWarning, now, last) == last) {
+                startupLog.LogWarning(
+                    "A client address arrived from inside the trusted proxy network. The container runtime is probably " +
+                    "rewriting client addresses (for example IPv6 through the bridge gateway), so clients share rate limits. " +
+                    "Enable IPv6 on the public network or publish IPv4 only (see server/README.md).");
+            }
+        }
+    }
+    await next();
+});
 app.Use(async (context, next) => {
     var headers = context.Response.Headers;
     headers.CacheControl = "no-store";

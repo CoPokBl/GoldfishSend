@@ -22,6 +22,9 @@ public sealed class IpRangeFilter {
         IPNetwork.Parse("192.0.2.0/24"),       // TEST-NET-1
         IPNetwork.Parse("192.88.99.0/24"),     // 6to4 relay anycast
         IPNetwork.Parse("192.168.0.0/16"),     // RFC 1918
+        IPNetwork.Parse("192.31.196.0/24"),    // AS112 (RFC 7535)
+        IPNetwork.Parse("192.52.193.0/24"),    // AMT relays (RFC 7450)
+        IPNetwork.Parse("192.175.48.0/24"),    // AS112 (RFC 7534)
         IPNetwork.Parse("198.18.0.0/15"),      // benchmarking
         IPNetwork.Parse("198.51.100.0/24"),    // TEST-NET-2
         IPNetwork.Parse("203.0.113.0/24"),     // TEST-NET-3
@@ -34,6 +37,7 @@ public sealed class IpRangeFilter {
         IPNetwork.Parse("2001::/23"),          // IETF protocol assignments, incl. Teredo 2001::/32
         IPNetwork.Parse("2001:db8::/32"),      // documentation
         IPNetwork.Parse("2002::/16"),          // 6to4 (embeds arbitrary IPv4)
+        IPNetwork.Parse("2620:4f:8000::/48"),  // AS112 (RFC 7534)
         IPNetwork.Parse("3fff::/20"),          // documentation (RFC 9637)
     ];
 

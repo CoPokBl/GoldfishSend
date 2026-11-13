@@ -93,7 +93,7 @@ public static class ApiEndpoints {
             return Error(ServiceError.InvalidRequest);
         }
         var result = await mailboxes.VerifyAsync(items, code, Subject(context), ct);
-        return result.Ok ? Expires(result.Value) : Error(result.Error!);
+        return result.Ok ? Expires(result.Value!) : Error(result.Error!);
     }
 
     private static async Task<IResult> RotateEndpoint(
@@ -116,7 +116,7 @@ public static class ApiEndpoints {
             return Error(ServiceError.InvalidRequest);
         }
         var result = await mailboxes.RefreshAsync(items, Subject(context), ct);
-        return result.Ok ? Expires(result.Value) : Error(result.Error!);
+        return result.Ok ? Expires(result.Value!) : Error(result.Error!);
     }
 
     private static async Task<IResult> DeleteMailboxes(
@@ -195,9 +195,10 @@ public static class ApiEndpoints {
         }
     }
 
-    private static IResult Expires(DateOnly date) {
+    private static IResult Expires(MailboxStatus status) {
         return Results.Json(
-            new ExpiresResponse(date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)), ApiJsonContext.Default.ExpiresResponse);
+            new ExpiresResponse(status.ExpiresAt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), status.EndpointGone),
+            ApiJsonContext.Default.ExpiresResponse);
     }
 
     private static NewEndpoint? ParseEndpoint(string? url, string? p256dh, string? auth) {

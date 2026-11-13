@@ -70,6 +70,29 @@ public sealed class PendingMessageRepository {
             new { id, attempts, nextAttemptAt }, cancellationToken: ct));
     }
 
+    /// <summary>Makes every held message of a mailbox due now (after its endpoint recovered).</summary>
+    public async Task WakeMailboxAsync(byte[] mailboxId, CancellationToken ct = default) {
+        await using var conn = await _db.OpenAsync(ct);
+        await conn.ExecuteAsync(new CommandDefinition(
+            "UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id = @mailboxId",
+            new { mailboxId }, cancellationToken: ct));
+    }
+
+    /// <summary>Makes the oldest held message of each mailbox due now: one probe of its endpoint, not a burst.</summary>
+    public async Task PokeOldestAsync(IReadOnlyList<byte[]> mailboxIds, CancellationToken ct = default) {
+        if (mailboxIds.Count == 0) {
+            return;
+        }
+        await using var conn = await _db.OpenAsync(ct);
+        foreach (var mailboxId in mailboxIds) {
+            await conn.ExecuteAsync(new CommandDefinition("""
+                UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP()
+                WHERE mailbox_id = @mailboxId AND expires_at > UTC_TIMESTAMP()
+                ORDER BY expires_at LIMIT 1
+                """, new { mailboxId }, cancellationToken: ct));
+        }
+    }
+
     public async Task<int> DeleteExpiredAsync(CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         var total = 0;

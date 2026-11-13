@@ -69,6 +69,19 @@ public sealed class GoldfishFixture : IAsyncLifetime {
             ["Goldfish__Push__DangerouslyAllowInsecureLoopback"] = "true",
             ["Goldfish__Pow__BaseDifficulty"] = "8",
             ["Goldfish__Messages__MaxHeldPerMailbox"] = "3",
+            // Small enough that the tarpit test can prove one slow host can't take every slot.
+            ["Goldfish__Messages__DeliveryParallelism"] = "8",
+            ["Goldfish__Push__ResponseHeadersTimeoutSeconds"] = "2",
+            ["Goldfish__RateLimits__send-net__Limit"] = "100000",
+            ["Goldfish__RateLimits__send-net__Burst"] = "100000",
+            ["Goldfish__RateLimits__owner-net__Limit"] = "100000",
+            ["Goldfish__RateLimits__owner-net__Burst"] = "100000",
+            ["Goldfish__RateLimits__create-global__Limit"] = "100000",
+            ["Goldfish__RateLimits__create-global__Burst"] = "100000",
+            ["Goldfish__RateLimits__newhost-global__Limit"] = "100000",
+            ["Goldfish__RateLimits__newhost-global__Burst"] = "100000",
+            ["Goldfish__RateLimits__push-mailbox__Limit"] = "1000",
+            ["Goldfish__RateLimits__push-mailbox__Burst"] = "1000",
             ["Goldfish__RateLimits__create-net__Limit"] = "100000",
             ["Goldfish__RateLimits__pow-net__Limit"] = "100000",
             ["Goldfish__RateLimits__push-host__Limit"] = "100000",
@@ -148,7 +161,11 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         return mailbox;
     }
 
+    /// <summary>The verification code is the first 16 bytes of the (padded) verification push body.</summary>
     public Task<HttpResponseMessage> VerifyAsync(IEnumerable<Mailbox> mailboxes, byte[] code) {
+        if (code.Length > 16) {
+            code = code[..16];
+        }
         return Client.PostAsJsonAsync("/v1/mailboxes/verify", new {
             items = mailboxes.Select(m => m.Credential).ToArray(),
             code = B64(code),

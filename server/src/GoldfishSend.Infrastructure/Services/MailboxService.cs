@@ -14,6 +14,9 @@ public sealed record MailboxCredential(byte[] SendSecret, byte[] OwnerSecret) {
     public override string ToString() => "MailboxCredential { <redacted> }";
 }
 
+/// <param name="EndpointGone">The server can't currently reach the push endpoint of at least one of these mailboxes. Re-register push and rotate.</param>
+public sealed record MailboxStatus(DateOnly ExpiresAt, bool EndpointGone);
+
 public sealed record NewEndpoint(string Url, byte[] P256dh, byte[] Auth) {
     public override string ToString() => "NewEndpoint { <redacted> }";
 }
@@ -28,10 +31,19 @@ public sealed class MailboxService {
     private readonly DeliverySignal _signal;
     private readonly GoldfishOptions _options;
     private readonly ILogger<MailboxService> _logger;
+    private readonly EphemeralRedis _ephemeral;
+    private readonly ClusterSecret _secret;
+
+    /// <summary>
+    /// Verification pushes are padded to the size of a typical message so a push provider can't count mailbox creations
+    /// (a proxy for how many contacts a device has) by size. The code is the first 16 bytes of the body.
+    /// </summary>
+    public const int VerificationBodySize = 1024;
 
     public MailboxService(
         MailboxCrypto crypto, MailboxRepository mailboxes, EndpointValidator validator, PushClient push, PowService pow,
-        RateLimiter limiter, DeliverySignal signal, GoldfishOptions options, ILogger<MailboxService> logger) {
+        RateLimiter limiter, DeliverySignal signal, GoldfishOptions options, ILogger<MailboxService> logger,
+        EphemeralRedis ephemeral, ClusterSecret secret) {
         _crypto = crypto;
         _mailboxes = mailboxes;
         _validator = validator;
@@ -41,6 +53,8 @@ public sealed class MailboxService {
         _signal = signal;
         _options = options;
         _logger = logger;
+        _ephemeral = ephemeral;
+        _secret = secret;
     }
 
     private DateOnly NewExpiry() => DateOnly.FromDateTime(DateTime.UtcNow).AddDays(_options.Mailboxes.LifetimeDays);
@@ -68,14 +82,20 @@ public sealed class MailboxService {
             return endpointError;
         }
 
-        foreach (var (policy, subject) in new[] { (RatePolicies.CreatePerIp, client.Host), (RatePolicies.CreatePerNetwork, client.Network) }) {
+        // The proof of work is checked first: requests without one never touch the address budgets, so junk from a shared
+        // address (Tor exit, CGNAT) can't lock everyone behind it out of creating mailboxes.
+        if (!await _pow.RedeemAsync(powChallenge, powNonce)) {
+            return ServiceError.PowInvalid;
+        }
+        foreach (var (policy, subject) in new[] {
+                     (RatePolicies.CreateGlobal, "global"u8.ToArray()),
+                     (RatePolicies.CreatePerNetwork, client.Network),
+                     (RatePolicies.CreatePerIp, client.Host),
+                 }) {
             var limit = await _limiter.CheckAsync(policy, subject, failOpen: false);
             if (!limit.Allowed) {
                 return ServiceError.RateLimited(limit);
             }
-        }
-        if (!await _pow.RedeemAsync(powChallenge, powNonce)) {
-            return ServiceError.PowInvalid;
         }
 
         var id = _crypto.MailboxId(sendSecret);
@@ -90,9 +110,9 @@ public sealed class MailboxService {
                 return ServiceError.MailboxExists;
             }
 
-            if (!await SendVerificationAsync(record, MailboxCrypto.Tag(sendSecret), code, ct)) {
+            if (await SendVerificationAsync(record, MailboxCrypto.Tag(sendSecret), code, ct) is { } pushError) {
                 await _mailboxes.DeleteAsync(id, ct);
-                return ServiceError.EndpointUnreachable;
+                return pushError;
             }
             return true;
         } finally {
@@ -112,7 +132,7 @@ public sealed class MailboxService {
 
         var (rows, ids, ownerError) = await LoadOwnedAsync(items, ct);
         if (ownerError is not null) {
-            return ownerError;
+            return await OwnerFailureAsync(ownerError, client);
         }
         // Rotation is for live mailboxes. A brand-new one must finish (or redo) creation, which costs PoW.
         if (rows.Any(r => r.State == MailboxState.PendingVerification)) {
@@ -139,9 +159,9 @@ public sealed class MailboxService {
                 return ServiceError.NotFound;
             }
 
-            if (!await SendVerificationAsync(record, MailboxCrypto.Tag(items[0].SendSecret), code, ct)) {
+            if (await SendVerificationAsync(record, MailboxCrypto.Tag(items[0].SendSecret), code, ct) is { } pushError) {
                 await _mailboxes.CancelRotationAsync(ids, ct);
-                return ServiceError.EndpointUnreachable;
+                return pushError;
             }
             return true;
         } finally {
@@ -149,7 +169,7 @@ public sealed class MailboxService {
         }
     }
 
-    public async Task<ServiceResult<DateOnly>> VerifyAsync(
+    public async Task<ServiceResult<MailboxStatus>> VerifyAsync(
         IReadOnlyList<MailboxCredential> items, byte[] code, ClientSubject client, CancellationToken ct) {
         if (code.Length != PushEnvelope.VerificationCodeSize) {
             return ServiceError.InvalidRequest;
@@ -159,13 +179,13 @@ public sealed class MailboxService {
         }
         var (rows, ids, ownerError) = await LoadOwnedAsync(items, ct);
         if (ownerError is not null) {
-            return ownerError;
+            return await OwnerFailureAsync(ownerError, client);
         }
 
         var max = _options.Mailboxes.MaxVerifyAttempts;
         // Spend the attempt atomically first, so concurrent guesses can't go over the cap.
         if (await _mailboxes.ConsumeVerifyAttemptAsync(ids, max, ct) != ids.Count) {
-            return ServiceError.VerificationFailed;
+            return await OwnerFailureAsync(ServiceError.VerificationFailed, client);
         }
 
         var hashes = new List<(byte[] Id, byte[] VerifyHash)>(rows.Count);
@@ -176,29 +196,31 @@ public sealed class MailboxService {
             hashes.Add((row.Id, expected));
         }
         if (!allMatch) {
-            return ServiceError.VerificationFailed;
+            return await OwnerFailureAsync(ServiceError.VerificationFailed, client);
         }
 
         // The completion re-checks the hash inside the transaction, which closes the race with a concurrent rotation.
         var expiry = NewExpiry();
         if (!await _mailboxes.CompleteVerificationAsync(hashes, max, expiry, ct)) {
-            return ServiceError.VerificationFailed;
+            return await OwnerFailureAsync(ServiceError.VerificationFailed, client);
         }
         await _signal.NotifyRetryAsync();
-        return expiry;
+        // Verification makes every listed mailbox active again.
+        return new MailboxStatus(expiry, EndpointGone: false);
     }
 
-    public async Task<ServiceResult<DateOnly>> RefreshAsync(IReadOnlyList<MailboxCredential> items, ClientSubject client, CancellationToken ct) {
+    public async Task<ServiceResult<MailboxStatus>> RefreshAsync(IReadOnlyList<MailboxCredential> items, ClientSubject client, CancellationToken ct) {
         if (await CheckOwnerBatchAsync(items, client) is { } error) {
             return error;
         }
-        var (_, ids, ownerError) = await LoadOwnedAsync(items, ct);
+        var (rows, ids, ownerError) = await LoadOwnedAsync(items, ct);
         if (ownerError is not null) {
-            return ownerError;
+            return await OwnerFailureAsync(ownerError, client);
         }
         var expiry = NewExpiry();
         await _mailboxes.RefreshAsync(ids, expiry, ct);
-        return expiry;
+        // Tells the client its push endpoint is unreachable, so it can re-register and rotate instead of waiting forever.
+        return new MailboxStatus(expiry, rows.Any(r => r.State == MailboxState.EndpointGone));
     }
 
     public async Task<ServiceResult<bool>> DeleteAsync(IReadOnlyList<MailboxCredential> items, ClientSubject client, CancellationToken ct) {
@@ -207,7 +229,7 @@ public sealed class MailboxService {
         }
         var (_, ids, ownerError) = await LoadOwnedAsync(items, ct);
         if (ownerError is not null) {
-            return ownerError;
+            return await OwnerFailureAsync(ownerError, client);
         }
         await _mailboxes.DeleteManyAsync(ids, ct);
         return true;
@@ -229,8 +251,20 @@ public sealed class MailboxService {
                 return ServiceError.InvalidRequest;
             }
         }
-        var limit = await _limiter.CheckAsync(RatePolicies.OwnerPerIp, client.Host);
-        return limit.Allowed ? null : ServiceError.RateLimited(limit);
+        // The network budget is always charged. The per-address budget is only peeked here, and charged when the
+        // request fails ownership or verification (OwnerFailureAsync). Legitimate owners behind a shared address are
+        // therefore never locked out by someone else's junk, while guessing stays limited.
+        var net = await _limiter.CheckAsync(RatePolicies.OwnerPerNetwork, client.Network);
+        if (!net.Allowed) {
+            return ServiceError.RateLimited(net);
+        }
+        var ip = await _limiter.CheckAsync(RatePolicies.OwnerPerIp, client.Host, cost: 0);
+        return ip.Allowed ? null : ServiceError.RateLimited(ip);
+    }
+
+    private async Task<ServiceError> OwnerFailureAsync(ServiceError error, ClientSubject client) {
+        await _limiter.CheckAsync(RatePolicies.OwnerPerIp, client.Host);
+        return error;
     }
 
     /// <summary>
@@ -259,17 +293,52 @@ public sealed class MailboxService {
         return ok ? (ordered, ids, null) : ([], ids, ServiceError.NotFound);
     }
 
-    private async Task<bool> SendVerificationAsync(EndpointRecord record, byte[] tag, byte[] code, CancellationToken ct) {
-        var envelope = PushEnvelope.Build(PushType.Verification, tag, code);
+    /// <returns>Null when the push service accepted it, otherwise the error to return.</returns>
+    private async Task<ServiceError?> SendVerificationAsync(EndpointRecord record, byte[] tag, byte[] code, CancellationToken ct) {
+        // Every create or rotation makes us POST to a URL the client chose. Hosts no mailbox has used before get their own
+        // small server-wide budget, so this can't be turned into a bulk "send requests to arbitrary sites" service.
+        var host = Uri.TryCreate(record.Url, UriKind.Absolute, out var uri) ? uri.IdnHost.ToLowerInvariant() : "";
+        var seenKey = RedisKeys.HostSeen(await _secret.HmacHexAsync("host-seen", System.Text.Encoding.UTF8.GetBytes(host)));
+        var seen = false;
+        try {
+            seen = await _ephemeral.Db.KeyExistsAsync(seenKey);
+        } catch (Exception ex) when (ex is StackExchange.Redis.RedisException or TimeoutException) {
+            // Treat as unseen (charged below).
+        }
+        if (!seen) {
+            var budget = await _limiter.CheckAsync(RatePolicies.NewHostGlobal, "newhost"u8.ToArray());
+            if (!budget.Allowed) {
+                return ServiceError.RateLimited(budget);
+            }
+        }
+
+        var body = new byte[VerificationBodySize];
+        code.CopyTo(body, 0);
+        RandomNumberGenerator.Fill(body.AsSpan(code.Length));
+        var envelope = PushEnvelope.Build(PushType.Verification, tag, body);
         try {
             var ttl = _options.Mailboxes.VerificationMinutes * 60;
             var result = await _push.SendAsync(record, envelope, ttl, ct);
             if (result.Status != PushStatus.Delivered) {
                 _logger.LogInformation("Verification push not accepted: {Status}", result.Status);
             }
-            return result.Status == PushStatus.Delivered;
+            switch (result.Status) {
+                case PushStatus.Delivered:
+                    try {
+                        await _ephemeral.Db.StringSetAsync(seenKey, 1, TimeSpan.FromDays(30));
+                    } catch (Exception ex) when (ex is StackExchange.Redis.RedisException or TimeoutException) {
+                        // Only affects the new-host budget.
+                    }
+                    return null;
+                case PushStatus.Deferred:
+                    // We held it back ourselves (the push service is paused or paced), so it isn't the client's fault.
+                    return ServiceError.Unavailable with { RetryAfter = result.RetryAfter ?? TimeSpan.FromSeconds(30) };
+                default:
+                    return ServiceError.EndpointUnreachable;
+            }
         } finally {
             CryptographicOperations.ZeroMemory(envelope);
+            CryptographicOperations.ZeroMemory(body);
         }
     }
 }
