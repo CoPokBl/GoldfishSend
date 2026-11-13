@@ -16,6 +16,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -29,12 +30,17 @@ class LiveServerDeviceTest {
     private val server: String? = args.getString("gfLiveServer")
     private val key: String? = args.getString("gfLiveKey")
 
+    /** Outside runBlocking, so a missing server address is reported as skipped rather than failed. */
+    @Before
+    fun requireServer() {
+        assumeTrue(server != null && key != null)
+    }
+
     private fun api(pin: String? = key, clock: () -> Long = { System.currentTimeMillis() }) =
         ServerApi(server!!, Graph.httpClient(), ServerPin(pin), GatewayState.Memory(), clock)
 
     @Test
     fun gatewayWorksEndToEnd() = runBlocking {
-        assumeTrue(server != null && key != null)
         val api = api()
         assertEquals(key, api.identity())
         val info = api.info()
@@ -56,7 +62,6 @@ class LiveServerDeviceTest {
 
     @Test
     fun batchSendReportsEachItem() = runBlocking {
-        assumeTrue(server != null && key != null)
         val items = (1..3).map { app.goldfishsend.net.BatchItem(Rand.bytes(32), Rand.bytes(16), null, Rand.bytes(300)) }
         val results = api().sendBatch(items)
         assertEquals(3, results.size)
@@ -66,13 +71,11 @@ class LiveServerDeviceTest {
 
     @Test
     fun trustOnFirstUseLearnsTheRealKey() = runBlocking {
-        assumeTrue(server != null && key != null)
         assertEquals(key, api(pin = null).identity())
     }
 
     @Test
     fun wrongPinIsRefused() = runBlocking {
-        assumeTrue(server != null && key != null)
         try {
             api(pin = B64.enc(ByteArray(32) { 9 })).info()
             fail("a mismatched pin must be refused")
@@ -83,7 +86,6 @@ class LiveServerDeviceTest {
 
     @Test
     fun clockSkewIsCorrected() = runBlocking {
-        assumeTrue(server != null && key != null)
         val skewed = api(clock = { System.currentTimeMillis() + 3_600_000 })
         assertEquals(2, skewed.info().protocol)
     }
