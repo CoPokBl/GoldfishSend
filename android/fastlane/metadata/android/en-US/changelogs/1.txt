@@ -1,0 +1,1 @@
+First release: account-less end-to-end encrypted messaging over UnifiedPush, invites by QR code or one-time link, disappearing messages, app lock and wipe controls, and an on-device security audit.

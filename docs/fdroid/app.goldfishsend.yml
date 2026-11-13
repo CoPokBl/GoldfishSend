@@ -1,0 +1,64 @@
+# DRAFT F-Droid metadata (fdroiddata format) for GoldfishSend. See docs/fdroid/README.md before submitting.
+#
+# Placeholders to replace:
+#   https://example.org/goldfishsend    the public source repository
+#   https://relay.example.org           the relay server compiled in as the default (must match your release build)
+#   AllowedAPKSigningKeys               the SHA-256 of your release signing certificate (docs/RELEASING.md)
+#
+# Known blocker: libsignal's native library (libsignal_jni.so) comes PREBUILT from Signal's Maven repository
+# (build-artifacts.signal.org), and SQLCipher's (libsqlcipher.so) prebuilt from Maven Central. F-Droid's
+# inclusion policy requires native code to be built from source, and its scanner flags the non-allowlisted
+# Signal repository. The prebuild/srclibs sections below sketch building libsignal from source. They are
+# untested: see README.md for the options.
+
+Categories:
+  - Internet
+  - Security
+License: AGPL-3.0-or-later
+SourceCode: https://example.org/goldfishsend
+IssueTracker: https://example.org/goldfishsend/issues
+Changelog: https://example.org/goldfishsend/releases
+
+AutoName: GoldfishSend
+
+RepoType: git
+Repo: https://example.org/goldfishsend.git
+# Reproducible build: F-Droid rebuilds the app, compares it with the developer-signed APK published here, and,
+# if they match, ships the developer's signature, so F-Droid users get the same signing key as every other channel.
+Binaries: https://example.org/goldfishsend/releases/download/v%v/goldfishsend-%v.apk
+
+Builds:
+  - versionName: 0.1.0
+    versionCode: 1
+    commit: v0.1.0
+    subdir: android/app
+    sudo:
+      - apt-get update
+      # Gradle runs on JDK 21; Kotlin/Java compile with a JDK 17 toolchain (kotlin { jvmToolchain(17) }).
+      - apt-get install -y -t stable openjdk-17-jdk-headless openjdk-21-jdk-headless
+      - update-java-alternatives -a java-1.21.0-openjdk-amd64
+    gradle:
+      - yes
+    # Must equal the NDK pinned in android/app/build.gradle.kts (27.1.12297006 is r27b). The NDK strips
+    # the native libraries, so a different version produces different bytes and breaks reproducibility.
+    ndk: r27b
+    gradleprops:
+      - gf.defaultServer=https://relay.example.org
+    # Option A (untested sketch): build libsignal's JNI library from source instead of using the prebuilt AAR.
+    # srclibs:
+    #   - libsignal@v0.107.0
+    # prebuild:
+    #   - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+    #   - source $HOME/.cargo/env
+    #   - pushd $$libsignal$$ && rustup show && cargo install --locked cargo-ndk && popd
+    #   - pushd $$libsignal$$/java && ./build_jni.sh android && popd
+    #   - <publish the resulting libsignal-android AAR to a local Maven repo and point settings.gradle.kts at it>
+    # scanignore:
+    #   - android/app/build.gradle.kts
+
+AllowedAPKSigningKeys: 0000000000000000000000000000000000000000000000000000000000000000
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: 0.1.0
+CurrentVersionCode: 1

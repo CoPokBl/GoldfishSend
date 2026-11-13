@@ -22,7 +22,37 @@ export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
 The default server URL is a build property: `./gradlew assembleRelease -Pgf.defaultServer=https://your.server`.
 Users can also change it under *Settings → Network → Server* (or "Advanced" during onboarding).
 
-Release builds need your own signing config. `assembleRelease` produces `app-release-unsigned.apk`.
+Release signing is optional and local: `android/keystore.properties` or `GF_KEYSTORE_*` environment variables
+(see [`../docs/RELEASING.md`](../docs/RELEASING.md)). Without either, `assembleRelease` produces `app-release-unsigned.apk`.
+
+### Reproducible builds
+
+The release APK is bit-for-bit reproducible. Two clean builds, one of them from a copy of the tree at a different
+absolute path, produce identical unsigned APKs. To make that hold:
+
+- The toolchain is pinned: Gradle 9.7.1 (wrapper with `distributionSha256Sum`), AGP 9.4.1, Kotlin 2.4.20,
+  build-tools 37.0.0, and NDK 27.1.12297006 (it strips the prebuilt native libraries, so its version affects the bytes).
+  Gradle runs on JDK 21, and sources compile with a JDK 17 toolchain.
+- No timestamps, git state (`vcsInfo.include = false`), dependency-metadata blob (`dependenciesInfo`) or random
+  values go into the APK. `BuildConfig.DEFAULT_SERVER_URL` depends only on `-Pgf.defaultServer`, so verifiers
+  must pass the same value as the release (stated in its notes), or none for the default.
+- Every downloaded artifact is checked against `gradle/verification-metadata.xml` (SHA-256). See
+  [`../docs/RELEASING.md`](../docs/RELEASING.md#7-updating-dependencies) for updating it when dependencies change.
+
+To verify a published release yourself, see [`../docs/RELEASING.md`](../docs/RELEASING.md#6-verifying-a-release-is-reproducible).
+In short: build `assembleRelease` from the tag, then `apksigcopier compare published.apk --unsigned app-release-unsigned.apk`.
+
+### Verifying your download
+
+Official releases are signed with a single key whose certificate SHA-256 fingerprint is:
+
+```
+TBD: published with the first release (see docs/RELEASING.md §4)
+```
+
+Check an APK before installing it with [AppVerifier](https://github.com/soupslurpr/AppVerifier), or run
+`apksigner verify --print-certs goldfishsend.apk` and compare the `SHA-256 digest`. F-Droid and Obtainium refuse
+updates signed with a different key. F-Droid packaging notes are in [`../docs/fdroid/`](../docs/fdroid/README.md).
 
 ## Architecture
 

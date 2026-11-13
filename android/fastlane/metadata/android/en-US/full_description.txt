@@ -1,0 +1,25 @@
+GoldfishSend is an end-to-end encrypted messenger with no accounts: no phone number, no email, no username. You add contacts by scanning a QR code or sharing a one-time link.
+
+<b>What the server knows</b>
+The relay server is blind. It never sees message contents or who a message is for, and it can't link the mailboxes it holds to a person or a device. It keeps a message only until a push service accepts it, then forgets it. If delivery fails, the message is held encrypted and retried until it expires.
+
+<b>Encryption</b>
+<ul>
+<li>Messages use the Signal Protocol (libsignal) with post-quantum key agreement (PQXDH) and the Double Ratchet.</li>
+<li>On the phone, messages sit in an encrypted database protected by the hardware keystore and an optional passphrase. Each message has its own key, so deleting it really deletes it.</li>
+</ul>
+
+<b>No Google services needed</b>
+Notifications arrive through UnifiedPush, using a distributor you choose, such as ntfy or Sunup. The app has no Google Play Services, Firebase or trackers.
+
+<b>Security controls</b>
+<ul>
+<li>Disappearing and view-once messages</li>
+<li>App lock, wipe after failed attempts, duress PIN, panic wipe</li>
+<li>Optional wipe on restart or after inactivity</li>
+<li>Screenshot blocking and an incognito keyboard</li>
+<li>Notifications with no content</li>
+<li>A Security tab that checks your phone's settings (patch level, keyboard, push service and more) on the device and suggests fixes</li>
+</ul>
+
+Anyone can run their own relay server, and contacts on different servers can talk to each other.
