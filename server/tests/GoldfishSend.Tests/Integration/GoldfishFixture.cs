@@ -33,7 +33,13 @@ public sealed class GoldfishFixture : IAsyncLifetime {
     private WebApplicationFactory<Program>? _factory;
 
     public FakePushServer Push { get; } = new();
+    /// <summary>Talks to the API through the encrypted gateway, like the app.</summary>
     public HttpClient Client { get; private set; } = null!;
+    /// <summary>Plain HTTP, no gateway: for the outer protocol itself.</summary>
+    public HttpClient RawClient { get; private set; } = null!;
+    public GatewayHandler Gateway { get; private set; } = null!;
+    public WebApplicationFactory<Program> Factory => _factory!;
+    public byte[] ServerSecret { get; } = GatewayCrypto.GenerateSecret();
     public string MySql { get; } = Environment.GetEnvironmentVariable("GF_TEST_MYSQL") ?? "";
     public string Redis { get; } = Environment.GetEnvironmentVariable("GF_TEST_REDIS") ?? "";
     public IServiceProvider Services => _factory!.Services;
@@ -66,6 +72,10 @@ public sealed class GoldfishFixture : IAsyncLifetime {
             ["Goldfish__Keys__EpochKek"] = Key(),
             ["Goldfish__Keys__VapidPrivateKey"] = Base64Url.EncodeToString(VapidSigner.GeneratePrivateKey()),
             ["Goldfish__Keys__VapidSubject"] = "mailto:test@example.com",
+            ["Goldfish__Keys__ServerKey"] = Base64Url.EncodeToString(ServerSecret),
+            // TestServer connections have no address, so every test shares one gateway flood bucket.
+            ["Goldfish__Network__GatewayRequestsPerSecond"] = "100000",
+            ["Goldfish__Network__GatewayBurst"] = "100000",
             ["Goldfish__Push__DangerouslyAllowInsecureLoopback"] = "true",
             ["Goldfish__Pow__BaseDifficulty"] = "8",
             ["Goldfish__Messages__MaxHeldPerMailbox"] = "3",
@@ -106,11 +116,14 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         }
 
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
-        Client = _factory.CreateClient();
+        Client = GatewayHandler.Client(_factory, out var gateway);
+        Gateway = gateway;
+        RawClient = _factory.CreateClient();
     }
 
     public async Task DisposeAsync() {
         Client?.Dispose();
+        RawClient?.Dispose();
         if (_factory is not null) {
             await _factory.DisposeAsync();
         }

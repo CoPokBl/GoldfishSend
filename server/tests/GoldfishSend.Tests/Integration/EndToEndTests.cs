@@ -18,7 +18,7 @@ public sealed class EndToEndTests {
     [IntegrationFact]
     public async Task Info_PublishesVapidKeyAndLimits() {
         var json = await _f.Client.GetFromJsonAsync<JsonElement>("/v1/info");
-        Assert.Equal(1, json.GetProperty("protocol").GetInt32());
+        Assert.Equal(2, json.GetProperty("protocol").GetInt32());
         Assert.Equal(3983, json.GetProperty("maxMessageBytes").GetInt32());
         Assert.Equal(87, json.GetProperty("vapidPublicKey").GetString()!.Length); // 65 bytes, base64url
     }
@@ -292,8 +292,18 @@ public sealed class EndToEndTests {
 
     [IntegrationFact]
     public async Task Responses_CarryPrivacyHeaders() {
-        var response = await _f.Client.GetAsync("/v1/info");
-        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
-        Assert.False(response.Headers.Contains("Server"));
+        // The outer responses are what proxies and caches see: the key, a gateway answer and a gateway error.
+        var key = await _f.RawClient.GetAsync("/v1/key");
+        var (outer, _) = (await _f.Gateway.KeyAsync(_f.RawClient.BaseAddress!, default))
+            .Seal(GatewayCodec.EncodeRequest(new InnerRequest("GET", DateTimeOffset.UtcNow.ToUnixTimeSeconds(), "/v1/info", [], [])));
+        var sealedInfo = await _f.RawClient.PostAsync("/v1/gw", Octets(outer));
+        var error = await _f.RawClient.PostAsync("/v1/gw", Octets(new byte[2000]));
+        foreach (var response in new[] { key, sealedInfo, error }) {
+            Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+            Assert.False(response.Headers.Contains("Server"));
+            Assert.Equal("nosniff", response.Headers.GetValues("X-Content-Type-Options").Single());
+        }
+        Assert.Equal(HttpStatusCode.OK, sealedInfo.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, error.StatusCode);
     }
 }

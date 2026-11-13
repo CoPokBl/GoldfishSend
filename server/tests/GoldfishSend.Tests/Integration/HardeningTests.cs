@@ -29,7 +29,7 @@ public sealed class HardeningTests {
         }
         try {
             var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
-            var client = factory.CreateClient();
+            var client = GatewayHandler.Client(factory);
             return (factory, client);
         } finally {
             foreach (var (k, v) in previous) {
