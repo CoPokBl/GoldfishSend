@@ -45,6 +45,61 @@ sealed class Content {
     @SerialName("mailbox")
     data class Mailbox(val server: String, val sendSecret: String, val serverKey: String? = null) : Content()
 
+    /** Any content too large for one message, split into parts (docs/groups.md, "Chunking"). Never nested. */
+    @Serializable
+    @SerialName("chunk")
+    data class Chunk(val id: String, val part: Int, val parts: Int, val data: String) : Content()
+
+    // --- groups (docs/groups.md). `g` is the group id. ---
+
+    @Serializable
+    @SerialName("gtext")
+    data class GText(
+        val g: String,
+        val id: String,
+        val body: String,
+        val ts: Long,
+        val exp: Long? = null,
+        val once: Boolean? = null,
+    ) : Content()
+
+    @Serializable
+    @SerialName("greceipt")
+    data class GReceipt(val g: String, val ids: List<String>, val kind: String) : Content()
+
+    @Serializable
+    @SerialName("gdelete")
+    data class GDelete(val g: String, val ids: List<String>) : Content()
+
+    @Serializable
+    @SerialName("groster")
+    data class GRoster(val g: String, val roster: String, val sig: String) : Content()
+
+    @Serializable
+    @SerialName("gcard")
+    data class GCard(val g: String, val card: String, val sig: String) : Content()
+
+    @Serializable
+    @SerialName("gsync")
+    data class GSync(val g: String, val have: Long) : Content()
+
+    @Serializable
+    @SerialName("gleave")
+    data class GLeave(val g: String) : Content()
+
+    /** The group this content belongs to, or null for 1:1 content. */
+    val groupId: String?
+        get() = when (this) {
+            is GText -> g
+            is GReceipt -> g
+            is GDelete -> g
+            is GRoster -> g
+            is GCard -> g
+            is GSync -> g
+            is GLeave -> g
+            else -> null
+        }
+
     fun encode(): ByteArray = ProtoJson.encodeToString(serializer(), this).utf8()
 
     companion object {
@@ -96,6 +151,28 @@ object Chunker {
             i = end
         }
         return pieces.mapIndexed { idx, p -> Content.Text(id, p, ts, exp, once, idx, pieces.size) }
+    }
+
+    /** At most this many parts per chunked content. */
+    const val MAX_PARTS = 64
+
+    /**
+     * Splits any content into `chunk` parts whose padded encodings fit [maxPadded], or returns it unchanged if it already
+     * fits. The parts carry slices of the content's JSON bytes (b64u).
+     */
+    fun splitContent(content: Content, maxPadded: Int): List<Content> {
+        val bytes = content.encode()
+        if (Padding.paddedSize(bytes.size) <= maxPadded) {
+            return listOf(content)
+        }
+        val id = Content.newId()
+        val overhead = Content.Chunk(id, 9999, 9999, "").encode().size
+        // b64u turns 3 bytes into 4 characters; keep a margin for the padding marker.
+        val budget = ((maxPadded - 1 - overhead - 8) / 4) * 3
+        require(budget > 0) { "chunk budget too small" }
+        val slices = bytes.toList().chunked(budget).map { it.toByteArray() }
+        require(slices.size <= MAX_PARTS) { "content too large" }
+        return slices.mapIndexed { i, b -> Content.Chunk(id, i, slices.size, B64.enc(b)) }
     }
 
     /** UTF-8 size of [s] once JSON-escaped, without the surrounding quotes. */

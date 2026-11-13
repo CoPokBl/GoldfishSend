@@ -136,10 +136,21 @@ class SignalStore(private val db: Db) : SignalProtocolStore {
         db.exec("DELETE FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId)
     }
 
-    /** One-time Kyber prekeys are deleted on use (forward secrecy). The signed prekey goes with it. */
+    /**
+     * One-time Kyber prekeys are deleted on use (forward secrecy). The signed prekey goes with it. A group's last-resort
+     * prekeys (published in its card, used by every member who starts a session) stay until we leave or replace the card.
+     */
     override fun markKyberPreKeyUsed(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) {
+        if (db.long("SELECT COUNT(*) FROM sig_kyber_prekey WHERE id = ? AND last_resort = 1", kyberPreKeyId) > 0) {
+            return
+        }
         db.exec("DELETE FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId)
         db.exec("DELETE FROM sig_signed_prekey WHERE id = ?", signedPreKeyId)
+    }
+
+    /** Marks a Kyber prekey as last-resort (a group card's), so using it doesn't delete it. */
+    fun markLastResort(kyberPreKeyId: Int) {
+        db.exec("UPDATE sig_kyber_prekey SET last_resort = 1 WHERE id = ?", kyberPreKeyId)
     }
 
     // --- SessionStore ---

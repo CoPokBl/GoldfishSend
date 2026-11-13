@@ -35,7 +35,7 @@ object Invites {
 
     data class Created(val link: InviteLink, val mailboxId: Long, val expiresAt: Long)
 
-    private fun nextKeyId(s: Session): Int {
+    internal fun nextKeyId(s: Session): Int {
         val cur = s.repo.kvString("next_key_id")?.toInt() ?: (1 + Rand.int(1 shl 20))
         val next = if (cur >= 0xFFFFFF) 1 else cur + 1
         s.repo.kvPutString("next_key_id", next.toString())

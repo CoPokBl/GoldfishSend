@@ -2,6 +2,7 @@ package app.goldfishsend.core
 
 import android.util.Log
 import app.goldfishsend.db.Mailbox
+import app.goldfishsend.db.setRotateNeeded
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.CreateMailboxRequest
 import app.goldfishsend.net.MailboxItem
@@ -236,6 +237,12 @@ object Mailboxes {
     private suspend fun replaceGone(s: Session, m: Mailbox) {
         s.repo.deleteMailboxRow(m.id)
         val cid = m.contactId ?: return
+        if (m.purpose == Mailbox.PURPOSE_GROUP) {
+            // A group inbox: a new one goes out to the members in a new card.
+            s.repo.setRotateNeeded(cid, true)
+            Graph.scope.launchSafe { Groups.rotatePending(s) }
+            return
+        }
         val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
         s.repo.bindMailbox(fresh.id, cid)
         Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
@@ -284,10 +291,12 @@ object Mailboxes {
         if (s.decoy) {
             return
         }
-        for (c in s.repo.contacts()) {
+        for (c in s.repo.people()) {
             val mb = s.repo.mailboxForContact(c.id) ?: continue
             Messenger.sendControl(s, c.id, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), serverKey))
         }
+        // Groups learn it from a new card.
+        Graph.scope.launchSafe { Groups.announceServerKey(s) }
     }
 
     /**
