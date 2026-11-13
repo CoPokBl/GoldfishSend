@@ -5,4 +5,12 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
+    <!--
+      Tor onion services: the .onion address authenticates the server and Tor encrypts the connection end to end,
+      so plain http is correct here. These hosts are only reachable through Tor or Orbot. The app refuses to
+      connect to them otherwise (net/NetStack.kt).
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">onion</domain>
+    </domain-config>
 </network-security-config>

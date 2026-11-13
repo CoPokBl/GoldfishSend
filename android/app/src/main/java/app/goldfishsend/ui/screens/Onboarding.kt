@@ -181,6 +181,7 @@ private fun PushStep(next: () -> Unit) {
     var advanced by remember { mutableStateOf(false) }
     var server by remember { mutableStateOf(Graph.prefs.serverUrl) }
     var serverError by remember { mutableStateOf<String?>(null) }
+    var networkSettings by remember { mutableStateOf(false) }
     LifecycleResumeEffect(Unit) {
         dists = PushHub.distributors(ctx)
         if (dists.size == 1) {
@@ -234,7 +235,13 @@ private fun PushStep(next: () -> Unit) {
                     Spacer(Modifier.height(6.dp))
                     SecureTextField(server, { server = it; serverError = null }, Modifier.fillMaxWidth(), hint = "https://", kind = FieldKind.URI)
                     serverError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                    Spacer(Modifier.height(8.dp))
+                    // Tor (built-in or Orbot) and key pinning, needed before setup for an .onion server.
+                    TextButton(onClick = { networkSettings = true }) { Text("Connection: ${connectionSummary()}") }
                 }
+            }
+            if (networkSettings) {
+                NetworkSettingsDialog { networkSettings = false }
             }
         },
         bottom = {
@@ -248,7 +255,7 @@ private fun PushStep(next: () -> Unit) {
                     onClick = {
                         if (!ServerApi.isValidServer(server)) {
                             advanced = true
-                            serverError = "That doesn't look like a secure (https) address."
+                            serverError = "That doesn't look like a secure server address (https://… or a Tor .onion address)."
                             return@Button
                         }
                         Graph.prefs.serverUrl = server.trim().trimEnd('/')

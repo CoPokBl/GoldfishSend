@@ -3,8 +3,6 @@ package app.goldfishsend.net
 import app.goldfishsend.BuildConfig
 import app.goldfishsend.proto.B64
 import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -101,6 +99,9 @@ class ApiException(
             "invalid_endpoint", "endpoint_unreachable" -> "Your push service couldn't be reached. Check that it's running."
             "pow_invalid", "verification_failed" -> "Setup hiccup. Retrying automatically."
             "insecure_server" -> "That server isn't using a secure connection."
+            "tor_required" -> "This contact's server is a Tor (.onion) address. Turn on Tor in Settings › Connection to reach it."
+            "tor_connecting" -> "Connecting to Tor…"
+            "server_key_changed" -> "This server's identity changed. Check Settings › Connection before continuing."
             else -> "Something went wrong. We'll try again."
         }
     }
@@ -194,6 +195,9 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
     private fun <T> execute(req: Request, onOk: (Response) -> T): T {
         val resp = try {
             http.newCall(req).execute()
+        } catch (e: BlockedRequestException) {
+            // Refused by our own network policy (Tor required or starting, server key changed). Nothing was sent.
+            throw ApiException(e.reason, 0, cause = e)
         } catch (e: IOException) {
             throw ApiException("network", 0, cause = e)
         }
@@ -218,11 +222,18 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
         val OCTET = "application/octet-stream".toMediaType()
         private val lenient = Json { ignoreUnknownKeys = true }
 
-        /** Normalizes a base URL and enforces https (unless this is a debug build). */
+        /**
+         * Normalizes a base URL. It must be https, or plain http to a valid v3 onion service (the onion address
+         * authenticates and encrypts the connection). Debug builds also allow any http. Whether Tor is on is checked
+         * per request (see [NetStack]), so a contact's onion server is still accepted and the user is asked to turn Tor on.
+         */
         fun parseBase(raw: String): HttpUrl {
             val trimmed = raw.trim().trimEnd('/')
             val u = "$trimmed/".toHttpUrlOrNull() ?: throw ApiException("invalid_server", 0)
-            if (u.scheme != "https" && !BuildConfig.ALLOW_HTTP) {
+            if (NetRules.isOnionHost(u.host) && !NetRules.isValidV3Onion(u.host)) {
+                throw ApiException("invalid_server", 0)
+            }
+            if (!NetRules.isAcceptableServerScheme(u.scheme, u.host, BuildConfig.ALLOW_HTTP)) {
                 throw ApiException("insecure_server", 0)
             }
             if (u.query != null || u.fragment != null || u.username.isNotEmpty()) {
@@ -238,26 +249,30 @@ class ServerApi(baseUrl: String, private val http: OkHttpClient) {
             false
         }
 
-        fun buildClient(socksProxy: Boolean): OkHttpClient {
+        /**
+         * Routing (Direct, Orbot or built-in Tor) and server-key pinning are applied per request by [NetStack]. Cleartext
+         * is enabled at the OkHttp level only so http onion services work. [NetStack.RouteInterceptor] and the network
+         * security config both refuse plain http to anything else (outside debug builds).
+         */
+        fun buildClient(): OkHttpClient {
             val modern = ConnectionSpec.Builder(ConnectionSpec.RESTRICTED_TLS)
                 .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
                 .build()
-            val specs = if (BuildConfig.ALLOW_HTTP) listOf(modern, ConnectionSpec.CLEARTEXT) else listOf(modern)
-            val b = OkHttpClient.Builder()
-                .connectionSpecs(specs)
-                .connectTimeout(15, TimeUnit.SECONDS)
+            return OkHttpClient.Builder()
+                .connectionSpecs(listOf(modern, ConnectionSpec.CLEARTEXT))
+                // Generous enough for Tor: the route interceptor may wait for Tor to bootstrap.
+                .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(30, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
-                .callTimeout(60, TimeUnit.SECONDS)
+                .callTimeout(120, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
                 .followRedirects(false)
                 .followSslRedirects(false)
                 .cache(null)
-            if (socksProxy) {
-                // Orbot's default SOCKS port.
-                b.proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved("127.0.0.1", 9050)))
-            }
-            return b.build()
+                .proxySelector(NetStack.TorProxySelector)
+                .addInterceptor(NetStack.RouteInterceptor)
+                .addNetworkInterceptor(NetStack.PinInterceptor)
+                .build()
         }
     }
 }

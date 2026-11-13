@@ -320,7 +320,11 @@ object SecurityAudit {
                 Fix.OPEN_CHATS, "Review",
             )
         }
-        if (!prefs.serverUrl.startsWith("https://")) {
+        // An onion service authenticates and encrypts the connection itself, so plain http to a valid onion is fine.
+        val onionServer = runCatching {
+            app.goldfishsend.net.NetRules.isValidV3Onion(java.net.URI(prefs.serverUrl).host ?: "")
+        }.getOrDefault(false)
+        if (!prefs.serverUrl.startsWith("https://") && !onionServer) {
             out += Finding(
                 "tls", Severity.CRITICAL, "Server connection isn't encrypted",
                 "Your server address doesn't use HTTPS. Message contents stay end-to-end encrypted, but metadata is exposed.",

@@ -23,7 +23,12 @@ val releaseStoreFile = signingValue("storeFile", "GF_KEYSTORE_FILE")
 
 android {
     namespace = "app.goldfishsend"
-    compileSdk = 37
+    // 37.1 is required by tor-android. targetSdk (runtime behaviour) stays at 36.
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 1
+        }
+    }
     // Pinned for reproducible builds: the build tools (aapt2, zipalign, d8) and the NDK (it strips the
     // prebuilt libsignal/sqlcipher .so files, so its version changes the packaged bytes).
     buildToolsVersion = "37.0.0"
@@ -153,6 +158,9 @@ dependencies {
     implementation("net.zetetic:sqlcipher-android:4.20.0@aar")
     implementation("androidx.sqlite:sqlite:2.7.1")
     implementation("org.bouncycastle:bcprov-jdk18on:1.87")
+    // Built-in Tor (optional, off by default). In-process TorService. It requests only INTERNET.
+    implementation("info.guardianproject:tor-android:0.4.9.14")
+    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
 
     implementation("com.squareup.okhttp3:okhttp:5.5.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.13.0")

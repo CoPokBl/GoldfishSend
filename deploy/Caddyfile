@@ -26,17 +26,9 @@
 	# email you@example.com
 }
 
-{$GOLDFISH_DOMAIN} {
-	tls {
-		# The Android client requires API 29+, which supports TLS 1.3 natively. Use
-		# `protocols tls1.2 tls1.3` instead if you need to serve older clients.
-		protocols tls1.3
-	}
-
-	header {
-		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
-		-Server
-	}
+# Routing shared by the public HTTPS site and the optional onion service.
+(goldfish_routes) {
+	header -Server
 
 	# Kestrel caps bodies at 16 KB too; this rejects oversize requests before they reach the app.
 	request_body {
@@ -69,4 +61,31 @@
 	handle {
 		respond 404
 	}
+}
+
+{$GOLDFISH_DOMAIN} {
+	tls {
+		# The Android client requires API 29+, which supports TLS 1.3 natively. Use
+		# `protocols tls1.2 tls1.3` instead if you need to serve older clients.
+		protocols tls1.3
+		# Keep the same key pair across certificate renewals, so the certificate's public key (SPKI) stays
+		# stable. Clients with "Pin server keys" turned on pin that key, and only a real key change warns them.
+		# Rotate deliberately: remove this line once, let a renewal create a new key, announce the new
+		# fingerprint (see server/README.md), then put it back.
+		reuse_private_keys
+	}
+
+	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+
+	import goldfish_routes
+}
+
+# Optional Tor onion service (compose profile "onion"). The tor container forwards the onion's port 80 here
+# over the dedicated `onion` network. Plain HTTP is correct: the onion address authenticates the server and
+# Tor encrypts the connection end to end. The listener binds only to Caddy's address on that network, so
+# nothing else can reach it. Every onion client arrives from the tor container's address, so the api sees
+# them all as one client IP (see server/README.md, "Onion service").
+http://:8081 {
+	bind {$GOLDFISH_ONION_CADDY_IP:172.30.251.2}
+	import goldfish_routes
 }
