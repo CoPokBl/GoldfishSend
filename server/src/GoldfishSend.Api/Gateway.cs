@@ -128,7 +128,12 @@ public sealed class GatewayMiddleware {
         try {
             await _next(context);
             status = context.Response.StatusCode;
-        } catch (Exception e) when (!context.RequestAborted.IsCancellationRequested) {
+        } catch (Exception) when (context.RequestAborted.IsCancellationRequested) {
+            // Aborted or timed out: the request-timeout middleware may answer with a plaintext 504. Make sure nothing the
+            // endpoint set on the inner response goes out with it.
+            StripToOuterHeaders(context.Response);
+            throw;
+        } catch (Exception e) {
             // Never let an exception's plaintext page through. The type is enough to debug, and carries no request data.
             _log.LogError("Unhandled {ExceptionType} in a gateway request.", e.GetType().FullName);
             status = 500;
@@ -192,15 +197,20 @@ public sealed class GatewayMiddleware {
     private static async Task SealedAsync(HttpContext context, byte[] respSecret, InnerResponse inner) {
         var sealedBody = GatewayCrypto.SealResponse(respSecret, GatewayCodec.EncodeResponse(inner));
         var response = context.Response;
+        StripToOuterHeaders(response);
+        response.StatusCode = 200;
+        response.ContentType = "application/octet-stream";
+        response.ContentLength = sealedBody.Length;
+        await response.Body.WriteAsync(sealedBody, context.RequestAborted);
+    }
+
+    /// <summary>Removes every response header except the fixed security headers set before the gateway.</summary>
+    private static void StripToOuterHeaders(HttpResponse response) {
         foreach (var name in response.Headers.Keys.ToArray()) {
             if (!OuterHeadersToKeep.Contains(name)) {
                 response.Headers.Remove(name);
             }
         }
-        response.StatusCode = 200;
-        response.ContentType = "application/octet-stream";
-        response.ContentLength = sealedBody.Length;
-        await response.Body.WriteAsync(sealedBody, context.RequestAborted);
     }
 
     private static async Task PlainErrorAsync(HttpContext context, int status, string code) {

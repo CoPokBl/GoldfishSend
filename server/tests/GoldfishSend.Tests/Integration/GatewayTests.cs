@@ -385,6 +385,32 @@ public sealed class GatewayTests {
     }
 
     [IntegrationFact]
+    public async Task Timeout_LeavesNoInnerHeadersOnThePlaintextAnswer() {
+        var serverKey = new ServerKey(_f.ServerSecret);
+        using var cts = new CancellationTokenSource();
+        var middleware = new GatewayMiddleware(async ctx => {
+            ctx.Response.Headers["GF-Extra"] = "inner";
+            ctx.Response.Headers.RetryAfter = "30";
+            await cts.CancelAsync();
+            ctx.RequestAborted.ThrowIfCancellationRequested();
+        }, serverKey, _f.Services.GetRequiredService<GatewayReplayGuard>(), new GatewayFloodGuard(new GoldfishOptions()),
+            NullLogger<GatewayMiddleware>.Instance);
+        var (outer, _) = ServerPublicKey.TryParse(serverKey.Blob)!.Seal(GatewayCodec.EncodeRequest(Get("/v1/info")));
+        var context = new DefaultHttpContext { RequestAborted = cts.Token };
+        context.Request.Method = "POST";
+        context.Request.Path = "/v1/gw";
+        context.Request.ContentType = "application/octet-stream";
+        context.Request.Body = new MemoryStream(outer);
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.Body = new MemoryStream();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => middleware.InvokeAsync(context));
+        Assert.False(context.Response.Headers.ContainsKey("GF-Extra"));
+        Assert.False(context.Response.Headers.ContainsKey("Retry-After"));
+        Assert.Equal("no-store", context.Response.Headers.CacheControl.ToString());
+    }
+
+    [IntegrationFact]
     public async Task ReplayGuard_IsInTheEphemeralRedis() {
         await PostRawAsync(Get("/v1/info"));
         await using var mux = await ConnectionMultiplexer.ConnectAsync(_f.Redis);
