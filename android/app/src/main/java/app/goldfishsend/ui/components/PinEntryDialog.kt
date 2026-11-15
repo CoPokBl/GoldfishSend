@@ -17,10 +17,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import app.goldfishsend.core.Graph
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * A PIN dialog on GoldfishSend's own keypad. With [confirm], the PIN must be entered twice. [validate] may reject a PIN
- * by returning a message (for example "Can't be the same as your app PIN"). [onDone] receives a CharArray it must wipe.
+ * by returning a message (for example "Can't be the same as your app PIN"); it runs off the main thread, since checks
+ * against other PINs run Argon2, and the pad shows "Checking…" meanwhile. While [busy] (the caller is working with the
+ * PIN), the pad shows [busyText] and takes no input. [onDone] receives a CharArray it must wipe.
  */
 @Composable
 fun PinEntryDialog(
@@ -31,35 +37,49 @@ fun PinEntryDialog(
     confirm: Boolean = true,
     removeLabel: String? = null,
     onRemove: (() -> Unit)? = null,
-    validate: (CharArray) -> String? = { null },
+    validate: (suspend (CharArray) -> String?)? = null,
+    busy: Boolean = false,
+    busyText: String = "Checking…",
     onDone: (CharArray) -> Unit,
 ) {
     val pin = remember { PinBuffer() }
+    val scope = rememberCoroutineScope()
     var first by remember { mutableStateOf<CharArray?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var checking by remember { mutableStateOf(false) }
+    val working = busy || checking
 
-    fun submit() {
-        val entered = pin.take()
-        if (!confirm) {
-            val problem = validate(entered)
+    /** Runs [validate] on [entered], then [then] if it passed. A rejected PIN is wiped. */
+    fun validated(entered: CharArray, then: () -> Unit) {
+        val v = validate ?: return then()
+        checking = true
+        scope.launch {
+            val problem = withContext(Dispatchers.Default) { v(entered) }
+            checking = false
             if (problem != null) {
                 entered.fill('\u0000')
                 error = problem
             } else {
-                onDone(entered)
+                then()
             }
+        }
+    }
+
+    fun submit() {
+        if (working) {
+            return
+        }
+        val entered = pin.take()
+        if (!confirm) {
+            validated(entered) { onDone(entered) }
             return
         }
         val f = first
         if (f == null) {
-            val problem = validate(entered)
-            if (problem != null) {
-                entered.fill('\u0000')
-                error = problem
-                return
+            validated(entered) {
+                first = entered
+                error = null
             }
-            first = entered
-            error = null
         } else if (f.contentEquals(entered)) {
             f.fill('\u0000')
             first = null
@@ -74,8 +94,10 @@ fun PinEntryDialog(
 
     AlertDialog(
         onDismissRequest = {
-            first?.fill('\u0000')
-            onDismiss()
+            if (!working) {
+                first?.fill('\u0000')
+                onDismiss()
+            }
         },
         title = { Text(title) },
         text = {
@@ -86,18 +108,21 @@ fun PinEntryDialog(
                     textAlign = TextAlign.Center,
                 )
                 Spacer(Modifier.height(16.dp))
-                PinPad(pin, onSubmit = ::submit, scrambled = Graph.prefs.scramblePinPad, minLength = minLength)
+                PinPad(
+                    pin, onSubmit = ::submit, scrambled = Graph.prefs.scramblePinPad, minLength = minLength,
+                    busyText = if (working) (if (checking) "Checking…" else busyText) else null,
+                )
             }
         },
         confirmButton = {},
         dismissButton = {
             if (onRemove != null && removeLabel != null) {
-                TextButton(onClick = onRemove) { Text(removeLabel, color = MaterialTheme.colorScheme.error) }
+                TextButton(onClick = onRemove, enabled = !working) { Text(removeLabel, color = MaterialTheme.colorScheme.error) }
             }
             TextButton(onClick = {
                 first?.fill('\u0000')
                 onDismiss()
-            }) { Text("Cancel") }
+            }, enabled = !working) { Text("Cancel") }
         },
     )
 }

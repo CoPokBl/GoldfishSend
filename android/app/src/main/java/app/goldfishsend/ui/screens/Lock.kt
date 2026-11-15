@@ -53,6 +53,10 @@ import android.view.inputmethod.EditorInfo
 import kotlinx.coroutines.launch
 import androidx.activity.compose.LocalActivity
 import app.goldfishsend.ui.ContentReady
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.rememberShowProgress
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 
 @Composable
 fun LockScreen() {
@@ -68,6 +72,7 @@ fun LockScreen() {
     var keyLost by remember { mutableStateOf(false) }
     var confirmReset by remember { mutableStateOf(false) }
     val bioEnabled = !screenLock && Graph.prefs.biometricUnlock && vault.hasBiometric && biometricAvailable(activity)
+    val haptics = LocalHapticFeedback.current
 
     fun tryScreenLock() {
         val cipher = try {
@@ -116,6 +121,7 @@ fun LockScreen() {
             when (val r = AppLock.unlock(chars)) {
                 UnlockResult.Ok, UnlockResult.Wiped -> Unit
                 is UnlockResult.Wrong -> {
+                    haptics.performHapticFeedback(HapticFeedbackType.Reject)
                     val what = if (pinMode) "PIN" else "passphrase"
                     error = if (r.attemptsLeft != null && r.attemptsLeft <= 3) {
                         "Wrong $what. ${r.attemptsLeft} attempt${if (r.attemptsLeft == 1) "" else "s"} left before everything is erased."
@@ -175,19 +181,19 @@ fun LockScreen() {
                 if (keyLost) {
                     Button(onClick = { confirmReset = true }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Start over") }
                 } else {
-                    Button(onClick = ::tryScreenLock, enabled = !busy, modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                        if (busy) {
-                            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
-                        } else {
-                            Text("Unlock")
-                        }
+                    ProgressButton(onClick = ::tryScreenLock, busy = busy, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        Text("Unlock")
                     }
+                    UnlockingHint(busy)
                 }
             } else if (pinMode) {
                 Text(error ?: "Enter your PIN", color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(16.dp))
                 // The duress PIN may be shorter than the real PIN, so the pad accepts anything 4 digits or longer.
-                PinPad(pin, onSubmit = ::submit, scrambled = Graph.prefs.scramblePinPad, minLength = 4, enabled = !busy)
+                PinPad(
+                    pin, onSubmit = ::submit, scrambled = Graph.prefs.scramblePinPad, minLength = 4,
+                    busyText = if (busy) "Unlocking…" else null,
+                )
             } else {
             SecureTextField(
                 pass, { pass = it; error = null },
@@ -206,17 +212,14 @@ fun LockScreen() {
                 textAlign = TextAlign.Center,
                 modifier = Modifier.height(40.dp),
             )
-            Button(onClick = ::submit, enabled = !busy && pass.isNotEmpty(), modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                if (busy) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
-                } else {
-                    Text("Unlock")
-                }
+            ProgressButton(onClick = ::submit, busy = busy, enabled = pass.isNotEmpty(), modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                Text("Unlock")
             }
+            UnlockingHint(busy)
             }
             if (bioEnabled) {
                 Spacer(Modifier.height(16.dp))
-                FilledTonalIconButton(onClick = ::tryBiometric, modifier = Modifier.size(56.dp)) {
+                FilledTonalIconButton(onClick = ::tryBiometric, enabled = !busy, modifier = Modifier.size(56.dp)) {
                     Icon(Icons.Rounded.Fingerprint, "Unlock with fingerprint")
                 }
             }
@@ -229,6 +232,19 @@ fun LockScreen() {
             "Erase and start over", true, { confirmReset = false },
         ) { app.goldfishsend.security.Wiper.wipeEverything(Graph.app) }
     }
+}
+
+/** "Unlocking…" under the unlock button while the key is derived and the database opens. */
+@Composable
+private fun UnlockingHint(busy: Boolean) {
+    val show = rememberShowProgress(busy)
+    Text(
+        if (show) "Unlocking…" else "",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.padding(top = 12.dp),
+    )
 }
 
 /** Shown briefly while a passphrase-less install unlocks itself with the device key. */
@@ -251,7 +267,11 @@ fun UnlockingSplash() {
             if (failed) {
                 Text("Unlock your phone to continue", style = MaterialTheme.typography.titleMedium)
             } else {
-                CircularProgressIndicator()
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(16.dp))
+                    Text("Unlocking…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }

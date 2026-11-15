@@ -29,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
@@ -77,6 +78,8 @@ class PinBuffer(private val maxLength: Int = 32) {
  * @param scrambled shuffles the digit positions each time the pad appears (against shoulder-surfing and smudge
  *   attacks). Off by default, because it slows down entry.
  * @param minLength the shortest PIN the confirm key accepts.
+ * @param busyText shown with a spinner in place of the dots while the entered PIN is being checked (Argon2 takes a
+ *   second or more); the keys ignore input meanwhile.
  */
 @Composable
 fun PinPad(
@@ -86,8 +89,12 @@ fun PinPad(
     scrambled: Boolean = false,
     minLength: Int = 6,
     enabled: Boolean = true,
+    busyText: String? = null,
 ) {
     val haptics = LocalHapticFeedback.current
+    val keysOn = enabled && busyText == null
+    // Key clicks: the system's virtual-key haptic, which follows the user's touch-feedback setting.
+    val tap = { haptics.performHapticFeedback(HapticFeedbackType.VirtualKey) }
     val order = remember(scrambled) {
         val d = ('0'..'9').toMutableList()
         if (scrambled) {
@@ -102,48 +109,66 @@ fun PinPad(
     }
 
     Column(modifier.widthIn(max = 340.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        // Dots only, never the digits themselves.
-        Row(
-            Modifier.height(24.dp).semantics { contentDescription = "${buffer.length} digits entered" },
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            repeat(maxOf(buffer.length, minLength)) { i ->
-                val filled = i < buffer.length
-                Box(
-                    Modifier.size(if (filled) 14.dp else 10.dp).background(
-                        if (filled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                        CircleShape,
-                    ),
-                )
+        if (busyText != null) {
+            Row(
+                Modifier.height(24.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Spinner(Modifier.size(18.dp))
+                Text(busyText, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+            }
+        } else {
+            // Dots only, never the digits themselves.
+            Row(
+                Modifier.height(24.dp).semantics { contentDescription = "${buffer.length} digits entered" },
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                repeat(maxOf(buffer.length, minLength)) { i ->
+                    val filled = i < buffer.length
+                    Box(
+                        Modifier.size(if (filled) 14.dp else 10.dp).background(
+                            if (filled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                            CircleShape,
+                        ),
+                    )
+                }
             }
         }
         Spacer(Modifier.height(20.dp))
+        val keys = Modifier.alpha(if (keysOn) 1f else 0.5f)
         val rows = listOf(order.subList(0, 3), order.subList(3, 6), order.subList(6, 9))
         for (row in rows) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            Row(keys.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 for (d in row) {
-                    Key(d.toString(), enabled) {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    Key(d.toString(), keysOn) {
+                        tap()
                         buffer.push(d)
                     }
                 }
             }
             Spacer(Modifier.height(12.dp))
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+        Row(keys.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
             FilledTonalIconButton(
-                onClick = { buffer.pop() },
-                enabled = enabled && buffer.length > 0,
+                onClick = {
+                    tap()
+                    buffer.pop()
+                },
+                enabled = keysOn && buffer.length > 0,
                 modifier = Modifier.size(72.dp),
             ) { Icon(Icons.AutoMirrored.Rounded.Backspace, "Delete") }
-            Key(order[9].toString(), enabled) {
-                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            Key(order[9].toString(), keysOn) {
+                tap()
                 buffer.push(order[9])
             }
             FilledTonalIconButton(
-                onClick = onSubmit,
-                enabled = enabled && buffer.length >= minLength,
+                onClick = {
+                    tap()
+                    onSubmit()
+                },
+                enabled = keysOn && buffer.length >= minLength,
                 modifier = Modifier.size(72.dp),
                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
