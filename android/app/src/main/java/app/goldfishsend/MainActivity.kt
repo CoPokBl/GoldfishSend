@@ -2,6 +2,9 @@ package app.goldfishsend
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.View
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,6 +15,8 @@ import androidx.lifecycle.lifecycleScope
 import app.goldfishsend.core.Graph
 import app.goldfishsend.proto.InviteLink
 import app.goldfishsend.ui.AppRoot
+import app.goldfishsend.ui.FirstFrame
+import app.goldfishsend.ui.screens.ChatListPreload
 import app.goldfishsend.ui.theme.GoldfishTheme
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -27,6 +32,17 @@ class MainActivity : FragmentActivity() {
             Graph.prefs.version.collect { applySecureFlag() }
         }
         handleIntent(intent)
+        if (savedInstanceState == null) {
+            holdFirstFrame()
+            // Without app lock, the database is opening in the background already (GoldfishApp): load the chat list
+            // while the activity and its first composition are being set up.
+            if (Graph.prefs.onboarded && !Graph.vault.requiresUserUnlock) {
+                lifecycleScope.launch { Graph.tryAutoUnlock()?.let { ChatListPreload.start(it) } }
+            }
+        } else {
+            FirstFrame.ready = true
+            FirstFrame.drawn = true
+        }
         setContent {
             val v by Graph.prefs.version.collectAsState()
             val p = Graph.prefs
@@ -56,6 +72,24 @@ class MainActivity : FragmentActivity() {
         if (intent != null && (intent.data != null || intent.extras != null)) {
             setIntent(Intent(this, MainActivity::class.java))
         }
+    }
+
+    /** Keeps the splash on screen until the first screen has its content (see [FirstFrame]). */
+    private fun holdFirstFrame() {
+        FirstFrame.ready = false
+        FirstFrame.drawn = false
+        val content = findViewById<View>(android.R.id.content)
+        val deadline = SystemClock.uptimeMillis() + FirstFrame.MAX_HOLD_MS
+        content.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (!FirstFrame.ready && SystemClock.uptimeMillis() < deadline) {
+                    return false
+                }
+                content.viewTreeObserver.removeOnPreDrawListener(this)
+                FirstFrame.drawn = true
+                return true
+            }
+        })
     }
 
     /** FLAG_SECURE blocks screenshots and screen recording, and blanks the recent-apps preview. It's on by default. */

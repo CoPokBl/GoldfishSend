@@ -81,6 +81,7 @@ object AppLock {
 
     suspend fun unlock(passphrase: CharArray): UnlockResult = withContext(Dispatchers.Default) {
         val vault = Graph.vault
+        android.os.Trace.beginAsyncSection("gf.unlock", 0)
         try {
             attemptMutex.withLock {
                 val prefs = Graph.prefs
@@ -119,6 +120,7 @@ object AppLock {
             }
         } finally {
             passphrase.fill('\u0000')
+            android.os.Trace.endAsyncSection("gf.unlock", 0)
         }
     }
 
@@ -135,7 +137,8 @@ object AppLock {
         return UnlockResult.Ok
     }
 
-    suspend fun unlockWithMasterKey(mk: ByteArray) {
+    /** After the biometric or screen-lock prompt, which calls back on the UI thread. */
+    suspend fun unlockWithMasterKey(mk: ByteArray) = withContext(Dispatchers.IO) {
         Graph.prefs.failedAttempts = 0
         afterUnlock(Graph.openSession(mk))
         Wiper.recordPresence()

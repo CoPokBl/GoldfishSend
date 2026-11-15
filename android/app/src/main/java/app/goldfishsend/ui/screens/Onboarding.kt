@@ -1,5 +1,6 @@
 package app.goldfishsend.ui.screens
 
+import app.goldfishsend.ui.ContentReady
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
@@ -84,6 +85,7 @@ fun OnboardingFlow() {
     var step by remember { mutableIntStateOf(0) }
     var name by remember { mutableStateOf("") }
     var passphrase by remember { mutableStateOf("") }
+    ContentReady()
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         AnimatedContent(
             targetState = step,

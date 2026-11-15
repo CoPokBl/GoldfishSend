@@ -55,6 +55,8 @@ import app.goldfishsend.db.MsgStatus
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -133,17 +135,61 @@ fun StatusTicks(status: Int, tint: Color, modifier: Modifier = Modifier) {
     Icon(icon, desc, modifier.size(15.dp), tint = color)
 }
 
-fun shortTime(ts: Long): String {
-    val now = Calendar.getInstance()
-    val then = Calendar.getInstance().apply { timeInMillis = ts }
-    return if (now.get(Calendar.YEAR) == then.get(Calendar.YEAR) && now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)) {
-        DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(ts))
-    } else {
-        DateFormat.getDateInstance(DateFormat.SHORT).format(Date(ts))
+/** Today's time ("14:05") or the date. Formatted for every visible chat row and bubble, so the formatters are reused. */
+fun shortTime(ts: Long): String = TimeFormats.short(ts)
+
+fun fullTime(ts: Long): String = TimeFormats.full(ts)
+
+/**
+ * Creating a DateFormat and two Calendars per call cost more than the rest of a chat row; this keeps them until the
+ * locale, time zone or day changes.
+ */
+private object TimeFormats {
+    private var locale: Locale? = null
+    private var zone: String? = null
+    private lateinit var time: DateFormat
+    private lateinit var date: DateFormat
+    private lateinit var dateTime: DateFormat
+    private var todayStart = 0L
+    private var todayEnd = 0L
+
+    @Synchronized
+    fun short(ts: Long): String {
+        refresh(System.currentTimeMillis())
+        return (if (ts in todayStart until todayEnd) time else date).format(Date(ts))
+    }
+
+    @Synchronized
+    fun full(ts: Long): String {
+        refresh(System.currentTimeMillis())
+        return dateTime.format(Date(ts))
+    }
+
+    private fun refresh(now: Long) {
+        val l = Locale.getDefault()
+        val tz = TimeZone.getDefault()
+        if (l != locale || tz.id != zone) {
+            locale = l
+            zone = tz.id
+            time = DateFormat.getTimeInstance(DateFormat.SHORT)
+            date = DateFormat.getDateInstance(DateFormat.SHORT)
+            dateTime = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+            todayEnd = 0L
+        }
+        if (now !in todayStart until todayEnd) {
+            val c = Calendar.getInstance(tz, l).apply {
+                timeInMillis = now
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            todayStart = c.timeInMillis
+            c.add(Calendar.DAY_OF_YEAR, 1)
+            todayEnd = c.timeInMillis
+        }
     }
 }
-
-fun fullTime(ts: Long): String = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(ts))
 
 fun countdown(msLeft: Long): String {
     val s = (msLeft / 1000).coerceAtLeast(0)

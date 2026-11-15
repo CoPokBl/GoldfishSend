@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "GoldfishSend"
 include(":app")
+include(":baselineprofile")

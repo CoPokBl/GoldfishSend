@@ -80,6 +80,7 @@ import app.goldfishsend.core.Session
 import app.goldfishsend.core.TIMER_CHOICES
 import app.goldfishsend.core.formatTimer
 import app.goldfishsend.core.timerLabel
+import app.goldfishsend.core.traced
 import app.goldfishsend.db.Message
 import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
@@ -117,19 +118,30 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
     var hasTimers by remember { mutableStateOf(false) }
     val now by rememberTicker(hasTimers)
     var expiredEpoch by remember { mutableStateOf(0) }
-    val loaded by rememberQuery(s, contactId, expiredEpoch) { it.repo.messages(contactId, System.currentTimeMillis()) }
-    val messages = loaded?.filter { it.expiresAt == null || it.expiresAt > now }
+    // Bodies already decrypted for this chat: a status change or a new message then costs one decryption, not 500.
+    val bodies = remember(contactId) { java.util.concurrent.atomic.AtomicReference<Map<String, String>>(emptyMap()) }
+    val loaded by rememberQuery(s, contactId, expiredEpoch) { q ->
+        traced("gf.messages") {
+            q.repo.messages(contactId, System.currentTimeMillis(), known = bodies.get()).also { list ->
+                bodies.set(list.associate { it.id to it.body })
+            }
+        }
+    }
+    val messages = remember(loaded, now) { loaded?.filter { it.expiresAt == null || it.expiresAt > now } }
     LaunchedEffect(loaded) {
         hasTimers = loaded?.any { it.expiresAt != null } == true
     }
-    val expiredNow = loaded?.count { it.expiresAt != null && it.expiresAt <= now } ?: 0
+    val expiredNow = remember(loaded, now) { loaded?.count { it.expiresAt != null && it.expiresAt <= now } ?: 0 }
     LaunchedEffect(expiredNow) {
         if (expiredNow > 0) {
             withContext(Dispatchers.IO) { runCatching { app.goldfishsend.core.Sweeper.sweep(s) } }
             expiredEpoch++
         }
     }
-    var draft by remember { mutableStateOf("") }
+    // Read only inside the composer, so typing doesn't recompose the whole chat.
+    val draft = remember { mutableStateOf("") }
+    // Set when we send, so the list follows our new message even if we were scrolled up.
+    var followSent by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Message?>(null) }
     var info by remember { mutableStateOf<Message?>(null) }
     // The text of a view-once message being shown. It exists only in memory: the message was deleted before display.
@@ -144,7 +156,8 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
     }
     LaunchedEffect(messages?.firstOrNull()?.id) {
         withContext(Dispatchers.IO) { runCatching { Messenger.markChatRead(s, contactId) } }
-        if (atBottom) {
+        if (atBottom || followSent) {
+            followSent = false
             listState.animateScrollToItem(0)
         }
     }
@@ -246,19 +259,21 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                 Banner("Not verified. Compare safety numbers in contact info.", onClick = showInfo)
             }
             Box(Modifier.weight(1f)) {
-                LazyColumn(
+                // Not composed before the messages are loaded: bubbles arriving in an empty list would all fade in.
+                if (messages != null) LazyColumn(
                     state = listState,
                     reverseLayout = true,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    items(messages.orEmpty(), key = { it.id }) { m ->
+                    items(messages, key = { it.id }, contentType = { it.kind }) { m ->
                         if (m.kind == MsgKind.SYSTEM) {
                             SystemChip(m.body, Modifier.animateItem())
                         } else {
                             Bubble(
-                                m, now,
+                                // Only counting-down bubbles take the ticking clock, so the others skip recomposition every second.
+                                m, if (m.expiresAt != null) now else 0L,
                                 Modifier.animateItem(),
                                 sender = if (g != null && !m.outgoing) m.senderKey?.let { k -> (g.names[k] ?: "Former member") to k } else null,
                                 onLongPress = { selected = m },
@@ -301,14 +316,14 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                         "You left this group, so you can't send messages here."
                     },
                 )
-                else -> Composer(draft, { draft = it }) {
-                    val text = draft.trim()
-                    if (text.isNotEmpty()) {
-                        draft = ""
-                        scope.launch {
-                            withContext(Dispatchers.IO) { Messenger.sendText(s, contactId, text) }
-                            listState.animateScrollToItem(0)
+                else -> Composer(draft) { text ->
+                    followSent = true
+                    scope.launch {
+                        // Far up in the history: jump down now, then the new message animates in once it's stored.
+                        if (listState.firstVisibleItemIndex > 20) {
+                            listState.scrollToItem(0)
                         }
+                        withContext(Dispatchers.IO) { Messenger.sendText(s, contactId, text) }
                     }
                 }
             }
@@ -449,7 +464,7 @@ private fun Bubble(
 }
 
 @Composable
-private fun Composer(draft: String, onDraft: (String) -> Unit, onSend: () -> Unit) {
+private fun Composer(draft: androidx.compose.runtime.MutableState<String>, onSend: (String) -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -458,7 +473,7 @@ private fun Composer(draft: String, onDraft: (String) -> Unit, onSend: () -> Uni
         verticalAlignment = Alignment.Bottom,
     ) {
         SecureTextField(
-            draft, onDraft,
+            draft.value, { draft.value = it },
             Modifier.weight(1f),
             hint = "Message",
             kind = FieldKind.MESSAGE,
@@ -467,7 +482,17 @@ private fun Composer(draft: String, onDraft: (String) -> Unit, onSend: () -> Uni
         )
         Spacer(Modifier.width(8.dp))
         AnimatedVisibility(true) {
-            FilledIconButton(onClick = onSend, enabled = draft.isNotBlank(), modifier = Modifier.size(52.dp)) {
+            FilledIconButton(
+                onClick = {
+                    val text = draft.value.trim()
+                    if (text.isNotEmpty()) {
+                        draft.value = ""
+                        onSend(text)
+                    }
+                },
+                enabled = draft.value.isNotBlank(),
+                modifier = Modifier.size(52.dp),
+            ) {
                 Icon(Icons.AutoMirrored.Rounded.Send, "Send")
             }
         }

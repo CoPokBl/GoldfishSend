@@ -350,39 +350,46 @@ class Repo(val db: Db, private val vault: MessageVault) {
         "m.id, m.contact_id, m.wire_id, m.outgoing, m.kind, m.ciphertext, mk.key, m.ts, m.received_at, m.read_at, m.exp_secs, m.view_once, m.expires_at, m.status, mk.bucket, " +
             "m.sender_key, m.recipients"
 
-    private fun message(c: Cursor) = Message(
-        id = c.getString(0),
-        contactId = c.getLong(1),
-        wireId = c.getString(2),
-        outgoing = c.getInt(3) != 0,
-        kind = c.getInt(4),
-        body = openBody(c.getString(0), c.getBlob(6), c.getBlob(5), if (c.isNull(14)) null else c.getLong(14)),
-        ts = c.getLong(7),
-        receivedAt = if (c.isNull(8)) null else c.getLong(8),
-        readAt = if (c.isNull(9)) null else c.getLong(9),
-        expSecs = c.getLong(10),
-        viewOnce = c.getInt(11) != 0,
-        expiresAt = if (c.isNull(12)) null else c.getLong(12),
-        status = c.getInt(13),
-        senderKey = if (c.isNull(15)) null else c.getString(15),
-        recipients = c.getInt(16),
-    )
+    private fun message(c: Cursor, known: Map<String, String>? = null): Message {
+        val id = c.getString(0)
+        return Message(
+            id = id,
+            contactId = c.getLong(1),
+            wireId = c.getString(2),
+            outgoing = c.getInt(3) != 0,
+            kind = c.getInt(4),
+            body = known?.get(id) ?: openBody(id, c.getBlob(6), c.getBlob(5), if (c.isNull(14)) null else c.getLong(14)),
+            ts = c.getLong(7),
+            receivedAt = if (c.isNull(8)) null else c.getLong(8),
+            readAt = if (c.isNull(9)) null else c.getLong(9),
+            expSecs = c.getLong(10),
+            viewOnce = c.getInt(11) != 0,
+            expiresAt = if (c.isNull(12)) null else c.getLong(12),
+            status = c.getInt(13),
+            senderKey = if (c.isNull(15)) null else c.getString(15),
+            recipients = c.getInt(16),
+        )
+    }
 
-    /** Expired messages are filtered at query time, so nothing expired is ever shown even if the sweeper is late. */
-    fun messages(contactId: Long, now: Long, limit: Int = 500): List<Message> = db.query(
+    /**
+     * Expired messages are filtered at query time, so nothing expired is ever shown even if the sweeper is late.
+     * [known] holds bodies the caller already decrypted (a message's body never changes), so re-querying an open chat
+     * after a status change only decrypts new messages.
+     */
+    fun messages(contactId: Long, now: Long, limit: Int = 500, known: Map<String, String>? = null): List<Message> = db.query(
         "SELECT $msgCols FROM messages m JOIN message_keys mk ON mk.message_id = m.id " +
             "WHERE m.contact_id = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY m.ts DESC, m.rowid DESC LIMIT ?",
-        contactId, now, limit, map = ::message,
-    )
+        contactId, now, limit,
+    ) { message(it, known) }
 
     fun message(id: String): Message? = db.queryOne(
-        "SELECT $msgCols FROM messages m JOIN message_keys mk ON mk.message_id = m.id WHERE m.id = ?", id, map = ::message,
-    )
+        "SELECT $msgCols FROM messages m JOIN message_keys mk ON mk.message_id = m.id WHERE m.id = ?", id,
+    ) { message(it) }
 
     fun messageByWire(contactId: Long, wireId: String, outgoing: Boolean): Message? = db.queryOne(
         "SELECT $msgCols FROM messages m JOIN message_keys mk ON mk.message_id = m.id WHERE m.contact_id = ? AND m.wire_id = ? AND m.outgoing = ?",
-        contactId, wireId, outgoing, map = ::message,
-    )
+        contactId, wireId, outgoing,
+    ) { message(it) }
 
     /** Returns the local id, or null if the message already exists (dedupe). */
     fun insertMessage(
@@ -542,8 +549,8 @@ class Repo(val db: Db, private val vault: MessageVault) {
         "SELECT $msgCols FROM messages m JOIN message_keys mk ON mk.message_id = m.id " +
             "WHERE m.outgoing = 1 AND m.kind = ? AND m.status = ? AND m.ts < ? AND m.resend_count < ? " +
             "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = m.id)",
-        MsgKind.TEXT, MsgStatus.SENT, olderThan, maxResends, map = ::message,
-    )
+        MsgKind.TEXT, MsgStatus.SENT, olderThan, maxResends,
+    ) { message(it) }
 
     fun incrementResend(id: String) = db.exec("UPDATE messages SET resend_count = resend_count + 1 WHERE id = ?", id)
 

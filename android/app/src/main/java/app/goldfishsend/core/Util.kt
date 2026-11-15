@@ -16,6 +16,16 @@ fun CoroutineScope.launchSafe(block: suspend CoroutineScope.() -> Unit): Job = l
     }
 }
 
+/** A named section in system traces (Perfetto), measured by the macrobenchmarks. Costs nothing when not tracing. */
+inline fun <T> traced(name: String, block: () -> T): T {
+    android.os.Trace.beginSection(name)
+    try {
+        return block()
+    } finally {
+        android.os.Trace.endSection()
+    }
+}
+
 fun formatTimer(secs: Long): String = when {
     secs <= 0 -> "Off"
     secs < 60 -> "${secs}s"

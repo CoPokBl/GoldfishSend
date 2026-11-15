@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.StrictMode
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
@@ -20,6 +21,10 @@ import app.goldfishsend.work.MaintenanceWorker
 class GoldfishApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        if (BuildConfig.DEBUG) {
+            // Logs (tag StrictMode) disk, network and slow calls on the main thread, which make the UI stutter.
+            StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder().detectAll().penaltyLog().build())
+        }
         Graph.init(this)
         Notifier.ensureChannel(this)
         // Order matters: the restart and inactivity wipes must run before anything can open the DB.

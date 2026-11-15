@@ -151,7 +151,9 @@ downloaded artifact doesn't match. After changing a dependency version:
 ```bash
 cd android
 ./gradlew --write-verification-metadata sha256 \
-  :app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebugAndroidTest
+  :app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebugAndroidTest \
+  :app:assembleBenchmarkRelease :app:assembleNonMinifiedRelease \
+  :baselineprofile:assembleBenchmarkRelease :baselineprofile:assembleNonMinifiedRelease
 git diff gradle/verification-metadata.xml   # review: only the artifacts you changed should appear
 ```
 

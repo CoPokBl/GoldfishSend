@@ -113,15 +113,26 @@ fun SecureTextField(
                     }
                 }
             },
+            // Runs on every keystroke (value changes). Setting an unchanged hint still re-lays out the EditText, so only
+            // what changed is applied.
             update = { et ->
-                et.setTextColor(textColor)
-                et.setHintTextColor(hintColor)
-                et.hint = hint
-                if (android.os.Build.VERSION.SDK_INT >= 29) {
-                    et.textCursorDrawable?.setTint(accent)
+                if (et.currentTextColor != textColor) {
+                    et.setTextColor(textColor)
                 }
-                et.highlightColor = (accent and 0x00FFFFFF) or 0x55000000
-                if (et.text.toString() != value) {
+                if (et.currentHintTextColor != hintColor) {
+                    et.setHintTextColor(hintColor)
+                }
+                if (et.hint?.toString() != hint) {
+                    et.hint = hint
+                }
+                val highlight = (accent and 0x00FFFFFF) or 0x55000000
+                if (et.highlightColor != highlight) {
+                    if (android.os.Build.VERSION.SDK_INT >= 29) {
+                        et.textCursorDrawable?.setTint(accent)
+                    }
+                    et.highlightColor = highlight
+                }
+                if (!et.text.contentEquals(value)) {
                     et.tag = value
                     et.setText(value)
                     et.setSelection(value.length)
