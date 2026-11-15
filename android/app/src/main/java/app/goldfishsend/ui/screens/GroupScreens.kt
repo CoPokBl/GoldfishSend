@@ -66,9 +66,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.goldfishsend.core.Graph
 import app.goldfishsend.core.GroupException
 import app.goldfishsend.core.Groups
 import app.goldfishsend.core.Messenger
+import app.goldfishsend.core.Notifier
 import app.goldfishsend.core.Session
 import app.goldfishsend.core.TIMER_CHOICES
 import app.goldfishsend.core.timerLabel
@@ -478,7 +480,11 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     }
     if (confirmClear) {
         ConfirmDialog("Clear chat?", "All messages in this group will be permanently erased from this phone.", "Clear", true, { confirmClear = false }) {
-            scope.launch(Dispatchers.IO) { s.repo.clearConversation(cid); s.db.notifyChanged() }
+            scope.launch(Dispatchers.IO) {
+                s.repo.clearConversation(cid)
+                s.db.notifyChanged()
+                Notifier.cancel(Graph.app)
+            }
         }
     }
     if (promoteFirst) {
