@@ -71,7 +71,9 @@ public sealed class AbuseTests {
             pow = new { challenge = B64(challenge), nonce = B64(nonce) },
             sendSecret = B64(RandomNumberGenerator.GetBytes(32)),
             ownerHash = B64(RandomNumberGenerator.GetBytes(32)),
-            endpoint = device.Url, p256dh = B64(device.P256dh), auth = B64(device.Auth),
+            endpoint = device.Url,
+            p256dh = B64(device.P256dh),
+            auth = B64(device.Auth),
         };
 
         // A wrong solution and an unknown challenge are refused, and neither touches the address budget.
@@ -176,7 +178,10 @@ public sealed class AbuseTests {
         await using var node = factory;
 
         Task<HttpResponseMessage> Rotate(Mailbox m, FakeDevice device) => client.PutAsJsonAsync("/v1/mailboxes/endpoint", new {
-            items = new[] { m.Credential }, endpoint = device.Url, p256dh = B64(device.P256dh), auth = B64(device.Auth),
+            items = new[] { m.Credential },
+            endpoint = device.Url,
+            p256dh = B64(device.P256dh),
+            auth = B64(device.Auth),
         });
 
         Assert.Equal(HttpStatusCode.Accepted, (await Rotate(mailbox, _f.Push.NewDevice())).StatusCode);
