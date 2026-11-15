@@ -51,6 +51,8 @@ import app.goldfishsend.net.ProxyMode
 import app.goldfishsend.net.TorManager
 import app.goldfishsend.ui.components.SectionHeader
 import app.goldfishsend.ui.components.SettingRow
+import androidx.compose.foundation.layout.size
+import app.goldfishsend.ui.components.Spinner
 import app.goldfishsend.ui.components.SwitchRow
 
 /** One-line summary for the Settings row. */
@@ -130,7 +132,8 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                         is TorManager.State.Failed -> "Tor couldn't connect. Nothing is sent until it does. Check your internet connection."
                         TorManager.State.Off -> "Starting Tor…"
                     }
-                    SettingRow("Tor status", status, Icons.Rounded.VpnLock)
+                    val connecting = tor == TorManager.State.Starting || tor == TorManager.State.Off
+                    SettingRow("Tor status", status, Icons.Rounded.VpnLock, trailing = if (connecting) ({ Spinner(Modifier.size(20.dp)) }) else null)
                 }
                 if (NetPrefs.proxyMode != ProxyMode.DIRECT) {
                     Text(

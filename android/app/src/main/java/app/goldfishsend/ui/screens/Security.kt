@@ -23,6 +23,7 @@ import androidx.compose.material.icons.rounded.Error
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.CircularProgressIndicator
+import app.goldfishsend.ui.components.rememberShowProgress
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -130,7 +131,11 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
     ) { pad ->
         val r = report
         if (r == null) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                if (rememberShowProgress(true)) {
+                    CircularProgressIndicator()
+                }
+            }
             return@Scaffold
         }
         val issues = r.active.filter { it.severity != Severity.OK }
