@@ -507,10 +507,15 @@ class Repo(val db: Db, private val vault: MessageVault) {
         if (it.isNull(0)) null else it.getLong(0)
     }
 
+    /** Deletes a chat's messages with their keys, and its message content that is still queued, partial or held. */
     fun clearConversation(contactId: Long) {
         db.tx {
             db.exec("DELETE FROM group_receipts WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
             db.exec("DELETE FROM message_keys WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
+            // Unsent copies hold the plaintext sealed only under the message root key, which outlives the clear.
+            db.exec("DELETE FROM outbox WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
+            db.exec("DELETE FROM chunks WHERE contact_id = ?", contactId)
+            db.exec("DELETE FROM group_held WHERE cid = ?", contactId)
             db.exec("DELETE FROM messages WHERE contact_id = ?", contactId)
         }
     }
