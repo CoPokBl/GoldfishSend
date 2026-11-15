@@ -239,7 +239,7 @@ resumes on its own if one starts accepting again. Clients that call refresh peri
 - Body: raw bytes, 1 to `maxMessageBytes` (the E2E blob). **`Content-Type: application/octet-stream` is required** (`415` otherwise).
 - Headers:
   - `GF-Send-Token: b64u(sendSecret)`, required.
-  - `GF-Idempotency-Key: b64u(16 B)`, optional but recommended. A duplicate within about 1 hour returns the original id.
+  - `GF-Idempotency-Key: b64u(16 B)`, optional but recommended. A duplicate within about 1 hour returns the original id with `202`, even if the mailbox has filled up or hit its rate limit since.
     Delivery is at-least-once: in rare crash windows the same message may be pushed twice, and clients must drop
     duplicates (a repeated Signal ciphertext is rejected anyway). Retry with the same key and body.
   - `GF-TTL: seconds`, optional. The default is `defaultTtlSeconds`, clamped to `[60, maxTtlSeconds]`.

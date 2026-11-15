@@ -417,8 +417,8 @@ The exact wire format lives in `docs/protocol.md`.
 | M0 | Repo skeleton, `.editorconfig`, CI, `docs/protocol.md` and `docs/threat-model.md` | Spec reviewed |
 | M1 | Core crypto: RFC 8291 encryptor, VAPID, mailbox sealing, IP filter | Unit tests pass, including the RFC vectors |
 | M2 | Mailboxes and messages API, Redis stream, delivery worker, SSRF-safe client | End-to-end push to a local ntfy |
-| M3 | Reliability: MySQL retry queue, backoff, `EndpointGone` hold and flush, idempotency, sweeper, epoch-key shredding | Chaos test (kill worker and push server) loses nothing within TTL |
-| M4 | Abuse: GCRA limits, PoW, verification push, per-host breakers | Load test (k6/NBomber) plus abuse test suite |
+| M3 | Reliability: MySQL retry queue, backoff, `EndpointGone` hold and flush, idempotency, sweeper, epoch-key shredding | Done: chaos tests (push server refusing, 5xx and timing out; worker killed mid-flight) lose nothing within TTL (`ChaosTests`), and messages past their TTL are never delivered |
+| M4 | Abuse: GCRA limits, PoW, verification push, per-host breakers | Done: load test (`server/tools/LoadTest`, through the encrypted gateway, which k6 can't speak) plus abuse test suite (`AbuseTests` and others) |
 | M5 | Android: UP registration, mailbox lifecycle, QR exchange, libsignal sessions, send/receive, SQLCipher key hierarchy, per-message keys, outbox and receipts | Two phones chat through a self-hosted ntfy |
 | M6 | Security controls: disappearing messages and view-once, app lock, wrong-PIN, duress and panic wipe, notification and screen hardening | Forensic test: no deleted plaintext or keys recoverable from a DB or file dump |
 | M7 | Hardening: padding, chunking, pinning, Baseline Profiles, external security review | Review findings closed |
