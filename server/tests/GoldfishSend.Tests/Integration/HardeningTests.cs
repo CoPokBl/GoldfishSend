@@ -5,8 +5,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using GoldfishSend.Infrastructure.Delivery;
 using GoldfishSend.Infrastructure.Redis;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 using StackExchange.Redis;
 using static GoldfishSend.Tests.Integration.GoldfishFixture;
 
@@ -19,23 +18,6 @@ public sealed class HardeningTests {
 
     public HardeningTests(GoldfishFixture fixture) {
         _f = fixture;
-    }
-
-    /// <summary>Starts another node with configuration overrides (environment variables are only read at host build).</summary>
-    private static (WebApplicationFactory<Program> Factory, HttpClient Client) Node(Dictionary<string, string> overrides) {
-        var previous = overrides.ToDictionary(kv => kv.Key, kv => Environment.GetEnvironmentVariable(kv.Key));
-        foreach (var (k, v) in overrides) {
-            Environment.SetEnvironmentVariable(k, v);
-        }
-        try {
-            var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
-            var client = GatewayHandler.Client(factory);
-            return (factory, client);
-        } finally {
-            foreach (var (k, v) in previous) {
-                Environment.SetEnvironmentVariable(k, v);
-            }
-        }
     }
 
     private static async Task<HttpResponseMessage> SendVia(HttpClient client, byte[] sendSecret, byte[] body) {
@@ -122,6 +104,28 @@ public sealed class HardeningTests {
         var server = mux.GetServers()[0];
         Assert.Empty(server.Keys(database: 0, pattern: "gf:idem:*"));   // the persistent (AOF) Redis
         Assert.NotEmpty(server.Keys(database: 1, pattern: "gf:idem:*")); // the ephemeral Redis
+    }
+
+    [IntegrationFact]
+    public async Task IdempotentRetry_OfAHeldMessage_GetsItsIdEvenWhenTheMailboxIsFull() {
+        var mailbox = await _f.CreateActiveMailboxAsync();
+        mailbox.Device.Status = 503;
+        var keys = Enumerable.Range(0, 3).Select(_ => RandomNumberGenerator.GetBytes(16)).ToList();
+        var ids = new List<string>();
+        foreach (var key in keys) {
+            var sent = await _f.SendAsync(mailbox.SendSecret, [1], key);
+            ids.Add((await sent.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetString()!);
+        }
+        var crypto = _f.Services.GetRequiredService<GoldfishSend.Core.Crypto.MailboxCrypto>();
+        await EventuallyAsync(async () => await _f.ScalarAsync("SELECT COUNT(*) FROM pending_messages WHERE mailbox_id = @id",
+            new { id = crypto.MailboxId(mailbox.SendSecret) }) == 3);
+
+        // The fixture holds 3 per mailbox, so this one is full. A sender retrying an accepted message must still hear "accepted".
+        Assert.Equal(507, (int)(await _f.SendAsync(mailbox.SendSecret, [2], RandomNumberGenerator.GetBytes(16))).StatusCode);
+        var retry = await _f.SendAsync(mailbox.SendSecret, [1], keys[0]);
+        Assert.Equal(HttpStatusCode.Accepted, retry.StatusCode);
+        Assert.Equal(ids[0], (await retry.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetString());
+        mailbox.Device.Status = 201;
     }
 
     [IntegrationFact]

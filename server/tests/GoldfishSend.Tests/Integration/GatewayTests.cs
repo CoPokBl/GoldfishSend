@@ -190,39 +190,9 @@ public sealed class GatewayTests {
         Assert.Contains(inner.Headers, h => h.Key == "retry-after");
     }
 
-    /// <summary>Starts a node that pretends every connection comes from a trusted proxy at 10.9.9.9.</summary>
-    private static WebApplicationFactory<Program> BehindProxy(Dictionary<string, string> overrides) {
-        var previous = overrides.ToDictionary(kv => kv.Key, kv => Environment.GetEnvironmentVariable(kv.Key));
-        foreach (var (k, v) in overrides) {
-            Environment.SetEnvironmentVariable(k, v);
-        }
-        try {
-            var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => {
-                b.UseEnvironment("Development");
-                b.ConfigureServices(s => s.AddSingleton<IStartupFilter, ProxyAddressFilter>());
-            });
-            _ = factory.Services; // Build now, while the overrides are set.
-            return factory;
-        } finally {
-            foreach (var (k, v) in previous) {
-                Environment.SetEnvironmentVariable(k, v);
-            }
-        }
-    }
-
-    private sealed class ProxyAddressFilter : IStartupFilter {
-        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app => {
-            app.Use((context, nextMiddleware) => {
-                context.Connection.RemoteIpAddress = IPAddress.Parse("10.9.9.9");
-                return nextMiddleware(context);
-            });
-            next(app);
-        };
-    }
-
     [IntegrationFact]
     public async Task RateLimits_StillUseTheOuterClientAddress() {
-        await using var factory = BehindProxy(new() {
+        await using var factory = NodeBehindProxy(new() {
             ["Goldfish__Network__TrustedProxies__0"] = "10.9.9.9",
             ["Goldfish__Roles"] = "api",
             ["Goldfish__RateLimits__pow-ip__Limit"] = "1",
@@ -253,7 +223,7 @@ public sealed class GatewayTests {
 
     [IntegrationFact]
     public async Task FloodGuard_LimitsDecryptionWorkPerClient() {
-        await using var factory = BehindProxy(new() {
+        await using var factory = NodeBehindProxy(new() {
             ["Goldfish__Network__TrustedProxies__0"] = "10.9.9.9",
             ["Goldfish__Roles"] = "api",
             ["Goldfish__Network__GatewayRequestsPerSecond"] = "0.01",

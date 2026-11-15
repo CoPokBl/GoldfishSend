@@ -6,8 +6,6 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using GoldfishSend.Core.Crypto;
 using GoldfishSend.Core.Protocol;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using static GoldfishSend.Tests.Integration.GoldfishFixture;
 
 namespace GoldfishSend.Tests.Integration;
@@ -38,21 +36,6 @@ public sealed class BatchSendTests {
         Assert.True(response.StatusCode == HttpStatusCode.OK, $"{(int)response.StatusCode} {await response.Content.ReadAsStringAsync()}");
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
         return json.GetProperty("results").EnumerateArray().ToArray();
-    }
-
-    private static (WebApplicationFactory<Program> Factory, HttpClient Client) Node(Dictionary<string, string> overrides) {
-        var previous = overrides.ToDictionary(kv => kv.Key, kv => Environment.GetEnvironmentVariable(kv.Key));
-        foreach (var (k, v) in overrides) {
-            Environment.SetEnvironmentVariable(k, v);
-        }
-        try {
-            var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
-            return (factory, GatewayHandler.Client(factory));
-        } finally {
-            foreach (var (k, v) in previous) {
-                Environment.SetEnvironmentVariable(k, v);
-            }
-        }
     }
 
     [IntegrationFact]

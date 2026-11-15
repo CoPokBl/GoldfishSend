@@ -17,6 +17,9 @@ public sealed class GatewayHandler : DelegatingHandler {
     /// <summary>Set on a request to send this outer <c>X-Forwarded-For</c> (as a reverse proxy would add it).</summary>
     public static readonly HttpRequestOptionsKey<string> OuterForwardedFor = new("gf-outer-xff");
 
+    /// <summary>The outer <c>X-Forwarded-For</c> for requests that don't set <see cref="OuterForwardedFor"/>.</summary>
+    public string? ForwardedFor { get; set; }
+
     /// <summary>Added to the clock when stamping inner requests.</summary>
     public long ClockOffsetSeconds { get; set; }
 
@@ -77,7 +80,7 @@ public sealed class GatewayHandler : DelegatingHandler {
         using var gw = new HttpRequestMessage(HttpMethod.Post, new Uri(baseUri, "/v1/gw")) {
             Content = GoldfishFixture.Octets(outer),
         };
-        if (request.Options.TryGetValue(OuterForwardedFor, out var forwardedFor)) {
+        if (request.Options.TryGetValue(OuterForwardedFor, out var forwardedFor) || (forwardedFor = ForwardedFor) is not null) {
             gw.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedFor);
         }
         var response = await base.SendAsync(gw, ct);

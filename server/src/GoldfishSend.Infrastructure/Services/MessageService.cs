@@ -131,6 +131,13 @@ public sealed class MessageService {
             return ServiceError.NotFound;
         }
 
+        // A retry of a message that was already queued gets its original id, even once the mailbox is full or its rate
+        // limit is spent (likely, if the push server is down). Answering 507 or 429 would tell the sender an accepted
+        // message wasn't. Nothing is queued again, so the recipient's budgets aren't charged.
+        if (idempotencyKey is not null && await _idempotency.GetDoneAsync(mailboxId, idempotencyKey) is { } original) {
+            return original;
+        }
+
         // These limits protect the recipient from a hostile contact flooding them.
         foreach (var policy in new[] { RatePolicies.SendPerMailboxDaily, RatePolicies.SendPerMailbox }) {
             var decision = await _limiter.CheckAsync(policy, mailboxId);
