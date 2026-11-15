@@ -140,6 +140,14 @@ fun shortTime(ts: Long): String = TimeFormats.short(ts)
 
 fun fullTime(ts: Long): String = TimeFormats.full(ts)
 
+/** The time of day ("14:05"), whatever the day: chat bubbles, under a day separator. */
+fun clockTime(ts: Long): String = TimeFormats.clock(ts)
+
+/** Day separator labels in the current locale, and the current time zone's day of [ts]. */
+fun dayLabels(): app.goldfishsend.ui.DayLabels = TimeFormats.dayLabels()
+
+fun localDay(ts: Long): Long = app.goldfishsend.ui.ChatRows.epochDay(ts, TimeZone.getDefault())
+
 /**
  * Creating a DateFormat and two Calendars per call cost more than the rest of a chat row; this keeps them until the
  * locale, time zone or day changes.
@@ -160,6 +168,25 @@ private object TimeFormats {
     }
 
     @Synchronized
+    fun clock(ts: Long): String {
+        refresh(System.currentTimeMillis())
+        return time.format(Date(ts))
+    }
+
+    private var labels: app.goldfishsend.ui.DayLabels? = null
+
+    @Synchronized
+    fun dayLabels(): app.goldfishsend.ui.DayLabels {
+        refresh(System.currentTimeMillis())
+        return labels ?: run {
+            val l = locale!!
+            fun pattern(skeleton: String) =
+                java.time.format.DateTimeFormatter.ofPattern(android.text.format.DateFormat.getBestDateTimePattern(l, skeleton), l)
+            app.goldfishsend.ui.DayLabels(l, pattern("MMMMd"), pattern("yMMMMd")).also { labels = it }
+        }
+    }
+
+    @Synchronized
     fun full(ts: Long): String {
         refresh(System.currentTimeMillis())
         return dateTime.format(Date(ts))
@@ -174,6 +201,7 @@ private object TimeFormats {
             time = DateFormat.getTimeInstance(DateFormat.SHORT)
             date = DateFormat.getDateInstance(DateFormat.SHORT)
             dateTime = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+            labels = null
             todayEnd = 0L
         }
         if (now !in todayStart until todayEnd) {
