@@ -1,9 +1,8 @@
-# libsignal's native code calls back into its Java classes by name (its bundled rules alone aren't enough: the store
-# callbacks go missing). Every libsignal class the app uses keeps its name and all its members, but classes nothing
-# uses are removed (keeping all of libsignal added about 0.5 MB to classes.dex). The benchmark build is minified with
-# these rules and runs a real PQXDH handshake, safety numbers and HPKE when it seeds its data (app/src/benchmark).
--keepnames class org.signal.libsignal.**
--keepclassmembers class org.signal.libsignal.** { *; }
+# libsignal's native code finds Java classes by name: store callbacks, and exception classes it constructs and throws
+# (duplicate message, untrusted identity, invalid key id...). An exception the app never names in Java would be removed
+# by a narrower rule and only crash on that error path, which the benchmark seed's happy path can't catch. So keep all of
+# it; it costs about 330 KB of DEX.
+-keep class org.signal.libsignal.** { *; }
 # SQLCipher and kotlinx.serialization ship their own rules (consumer rules, META-INF/com.android.tools/r8).
 -keepattributes *Annotation*, InnerClasses
 -dontnote kotlinx.serialization.**
