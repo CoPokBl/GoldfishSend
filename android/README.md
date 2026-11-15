@@ -42,6 +42,44 @@ absolute path, produce identical unsigned APKs. To make that hold:
 To verify a published release yourself, see [`../docs/RELEASING.md`](../docs/RELEASING.md#7-verifying-a-release-is-reproducible).
 In short: build `assembleRelease` from the tag, then `apksigcopier compare published.apk --unsigned app-release-unsigned.apk`.
 
+### Baseline profiles
+
+The release APK ships a baseline profile (code ART compiles ahead of time, so startup, scrolling and opening chats
+don't run interpreted) and a startup profile (R8 puts the classes needed at startup first in `classes.dex`). Both are
+generated on a device by the `:baselineprofile` module and committed under `app/src/release/generated/baselineProfiles/`.
+A normal `assembleRelease` only compiles those text files: it never regenerates them and needs no device, so the build
+stays reproducible. `androidx.profileinstaller` installs the profile on first launch, so installs from F-Droid,
+Obtainium or adb benefit too, not just Play.
+
+Regenerate the profiles after changes to startup, the chat list, the chat screen, unlocking or settings, after
+Compose or other UI dependency updates, and before a release. With one device or emulator connected (Android 13+, or a
+rooted device):
+
+```sh
+cd android
+./gradlew :app:generateReleaseBaselineProfile
+# on an emulator, add: -Pandroid.testInstrumentationRunnerArguments.androidx.benchmark.suppressErrors=EMULATOR -Pgf.abis=x86_64
+git add app/src/release/generated/baselineProfiles
+```
+
+The generator drives the real UI with UiAutomator: cold start to the chat list, cold start to the PIN lock screen and
+unlocking, scrolling the chat list, opening and scrolling a long conversation, typing and sending, a group chat, and
+settings (`baselineprofile/src/main/java/.../BaselineProfileGenerator.kt`). Its data comes from a seeding provider that
+exists only in the `benchmarkRelease` and `nonMinifiedRelease` build types (`app/src/benchmark/`), which the
+baseline-profile plugin adds for measuring. They use the application id `app.goldfishsend.bench`, so they never touch a
+real install, and every server in the seeded data is `127.0.0.1`, so nothing leaves the device. The provider is not in
+debug or release builds.
+
+Macrobenchmarks (cold and warm startup, unlocking, scrolling the chat list and a long conversation, opening a chat), each
+without AOT compilation and with the baseline profile:
+
+```sh
+./gradlew :baselineprofile:connectedBenchmarkReleaseAndroidTest
+# results: baselineprofile/build/outputs/connected_android_test_additional_output/benchmarkRelease/connected/*/*benchmarkData.json
+```
+
+Use a physical device for absolute numbers. Emulator results are only good for comparisons.
+
 ### Verifying your download
 
 Official releases are signed with a single key whose certificate SHA-256 fingerprint is:
@@ -56,7 +94,7 @@ updates signed with a different key. F-Droid packaging notes are in [`../docs/fd
 
 ## Architecture
 
-There's a single `:app` module, so the build stays simple and fast. It has no DI framework, no Room, no KSP and no reflection-based libraries.
+There's a single `:app` module, so the build stays simple and fast. It has no DI framework, no Room, no KSP and no reflection-based libraries. (`:baselineprofile` only generates profiles and runs benchmarks; see "Baseline profiles".)
 
 | Package | Responsibility |
 |---|---|

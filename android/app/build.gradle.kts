@@ -4,6 +4,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
+    id("androidx.baselineprofile")
 }
 
 // Release signing is optional: it's configured from an untracked android/keystore.properties, or from
@@ -139,6 +140,33 @@ kotlin {
     jvmToolchain(17)
 }
 
+// The baseline and startup profiles are generated on a device by :baselineprofile and committed under
+// src/release/generated/baselineProfiles, so a release build only compiles the committed text files (reproducible, no
+// device needed). Regenerate them as described in README.md, "Baseline profiles".
+baselineProfile {
+    automaticGenerationDuringBuild = false
+    saveInSrc = true
+    // R8 lays out classes.dex so the startup classes come first.
+    dexLayoutOptimization = true
+    filter {
+        exclude("app.goldfishsend.bench.**")
+    }
+}
+
+// The two build types the baseline-profile plugin adds for measuring get the benchmark-only seeding provider
+// (src/benchmark), which is never compiled into debug or release. Their own application id keeps the benchmarks, which
+// clear the app's data, away from a real install on the same device.
+androidComponents {
+    onVariants(selector().withBuildType("benchmarkRelease")) { benchmarkVariant(it) }
+    onVariants(selector().withBuildType("nonMinifiedRelease")) { benchmarkVariant(it) }
+}
+
+fun benchmarkVariant(variant: com.android.build.api.variant.ApplicationVariant) {
+    variant.applicationId.set("app.goldfishsend.bench")
+    variant.sources.java?.addStaticSourceDirectory("src/benchmark/java")
+    variant.sources.manifests.addStaticManifestFile("src/benchmark/AndroidManifest.xml")
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.09.00")
     implementation(composeBom)
@@ -179,6 +207,10 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:5.5.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.13.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // Installs the bundled baseline profile on first launch, so installs outside Play (F-Droid, Obtainium, adb) get it too.
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+    baselineProfile(project(":baselineprofile"))
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 

@@ -101,6 +101,9 @@ jobs:
           ./gradlew --stacktrace
           :app:testDebugUnitTest :app:lintDebug :app:lintRelease
           :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest
+      - name: Compile the baseline-profile generator and benchmarks
+        # Compile only: generating profiles and benchmarking need a device (see android/README.md, "Baseline profiles").
+        run: ./gradlew --stacktrace :app:compileBenchmarkReleaseKotlin :baselineprofile:compileBenchmarkReleaseKotlin
       - name: Upload reports
         if: failure()
         uses: actions/upload-artifact@v4
