@@ -38,8 +38,9 @@ android {
         applicationId = "app.goldfishsend"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // CI release builds pass both (see .github/workflows/release.yml); verifiers pass the values from the release notes.
+        versionCode = ((project.findProperty("gf.versionCode") as String?) ?: "1").toInt()
+        versionName = (project.findProperty("gf.versionName") as String?) ?: "0.1.0"
         // Deterministic: the APK depends only on this value, never on the build time or the VCS state.
         // Verifiers must build with the same -Pgf.defaultServer as the release (or none for the default).
         val defaultServer = (project.findProperty("gf.defaultServer") as String?) ?: "https://relay.goldfishsend.app"

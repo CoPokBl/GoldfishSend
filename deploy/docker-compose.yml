@@ -82,7 +82,8 @@ x-goldfish-env: &goldfish-env
 
 x-goldfish-app: &goldfish-app
   <<: *hardening
-  image: localhost/goldfishsend:latest
+  # Set GOLDFISH_IMAGE in .env to use a published image instead of building one (see server/README.md).
+  image: ${GOLDFISH_IMAGE:-localhost/goldfishsend:latest}
   build:
     context: ../server
     dockerfile: Dockerfile

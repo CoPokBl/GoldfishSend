@@ -6,7 +6,8 @@ have to trust, and its fingerprint must be published widely and never change cas
 
 ## 1. Generate the release key (once, offline)
 
-Do this on an offline or freshly installed machine, or keep the key on a hardware token. Never on a CI runner.
+Generate it on an offline or freshly installed machine, never on a CI runner. GitHub Actions only receives a copy as
+an environment secret so it can sign automatic releases (section 3).
 
 ```bash
 keytool -genkeypair -v \
@@ -39,17 +40,71 @@ keyPassword=...
 or set environment variables: `GF_KEYSTORE_FILE`, `GF_KEYSTORE_PASSWORD`, `GF_KEY_ALIAS` and `GF_KEY_PASSWORD`.
 The release is signed with APK Signature Scheme v3. v1 is off, and AGP omits v2 because minSdk 29 means every device verifies v3.
 
-## 3. Build
+## 3. Automatic releases (GitHub Actions and Obtainium)
+
+`.github/workflows/ci.yml` runs on pull requests and on pushes to any branch except `main`. It runs the server tests
+against MySQL and Redis, builds the server image, and runs the app's unit tests, lint, debug and release builds, and the
+device tests on an emulator.
+
+`.github/workflows/release.yml` runs on every push to `main`. It reruns CI, then:
+
+- publishes the server image to `ghcr.io/<owner>/goldfishsend` as `latest`, `<version>` and `sha-<commit>`, for
+  `linux/amd64` and `linux/arm64`, with a build provenance attestation;
+- if anything under `android/` or `.github/` changed since the last `v*` tag (or when you run it by hand with
+  **force**), builds the signed APK, checks it was signed with the expected certificate, and creates a GitHub release
+  `v<version>` with `goldfishsend-<version>.apk`, its SHA-256, a provenance attestation, the commit list since the
+  previous release, and the exact command to reproduce the build.
+
+The version is `0.1.<number of commits on main>`, and the version code is that commit count, so every release is
+higher than the last. Change `VERSION_BASE` in `release.yml` for a new minor or major version.
+
+### One-time setup
+
+In the repository settings, under **Environments**, create an environment named `release` and limit its
+deployment branches to `main`. Add these **secrets** to it:
+
+| Secret | Value |
+|---|---|
+| `GF_KEYSTORE_BASE64` | `base64 -w0 goldfishsend-release.jks` |
+| `GF_KEYSTORE_PASSWORD` | the store password |
+| `GF_KEY_PASSWORD` | optional; the key password if it differs from the store password (PKCS12 keys normally don't) |
+
+and these **variables** (to the environment, or as repository variables):
+
+| Variable | Value |
+|---|---|
+| `GF_SIGNING_CERT_SHA256` | the certificate fingerprint from section 5, with or without colons. The release fails if the APK was signed with any other key. |
+| `GF_DEFAULT_SERVER` | the app's default server, e.g. `https://relay.example.org` |
+| `GF_DEFAULT_SERVER_KEY` | that server's identity fingerprint (`docker compose run --rm --no-deps api fingerprint` on the server; see "Server identity" in `server/README.md`). Leave it empty to trust the server's key on first use; the release then warns. |
+| `GF_KEY_ALIAS` | optional, default `goldfishsend` |
+
+The release job fails with a list of what's missing until all of these are set. Server image publishing needs no setup.
+After the first image push, the package is private: under the package's settings, make it public if others should
+pull it.
+
+Putting the key in GitHub means anyone who takes over the GitHub account, or a compromised action in the release job,
+could sign an update. The environment's branch rule keeps the secrets away from pull requests and other branches. Turn
+on two-factor authentication. If you'd rather keep the key offline, delete the `app` job from `release.yml` and build
+and upload releases by hand (section 4).
+
+### Installing with Obtainium
+
+In Obtainium, add the app from `https://github.com/<owner>/<repo>`. The defaults work: each release has one APK, and
+the tag (`v0.1.123`) matches the app's version (`0.1.123`). Obtainium checks that every update is signed by the same key
+as the installed app. Compare the fingerprint in the release notes with the published one when you first install.
+
+## 4. Build by hand
 
 ```bash
 cd android
-./gradlew clean :app:assembleRelease -Pgf.defaultServer=https://your.relay.example
+./gradlew clean :app:assembleRelease -Pgf.defaultServer=https://your.relay.example \
+  -Pgf.defaultServerKey=<fingerprint> -Pgf.versionCode=<n> -Pgf.versionName=0.1.<n>
 # app/build/outputs/apk/release/app-release.apk
 ```
 
-Record the exact `-Pgf.defaultServer` value in the release notes. Verifiers need it to reproduce the build.
+Record every `-P` value in the release notes. Verifiers need them to reproduce the build.
 
-## 4. Print and publish the signing-certificate fingerprint
+## 5. Print and publish the signing-certificate fingerprint
 
 ```bash
 $ANDROID_HOME/build-tools/37.0.0/apksigner verify --print-certs --verbose app/build/outputs/apk/release/app-release.apk \
@@ -65,21 +120,21 @@ Publish the SHA-256 (it never changes between releases) in:
 - a signed git tag (`git tag -s v0.1.0`)
 - the F-Droid recipe's `AllowedAPKSigningKeys` (lower-case hex, no colons)
 
-## 5. How users verify an APK
+## 6. How users verify an APK
 
 - **AppVerifier** (open source, on F-Droid and Accrescent): share the APK or the installed app to it and compare it with the
   published fingerprint.
 - **apksigner**: `apksigner verify --print-certs app.apk`, then compare the SHA-256 digest.
 - **Obtainium and F-Droid** check the signature on every update and refuse a key change. Pin the fingerprint in Obtainium.
 
-## 6. Verifying a release is reproducible
+## 7. Verifying a release is reproducible
 
 From the tagged commit, with JDK 21 for Gradle and a JDK 17 toolchain installed, Android build-tools 37.0.0 and
 NDK 27.1.12297006 (both pinned in `app/build.gradle.kts`):
 
 ```bash
 cd android
-./gradlew --no-build-cache clean :app:assembleRelease -Pgf.defaultServer=<value from the release notes>
+./gradlew --no-build-cache clean :app:assembleRelease <the -P values from the release notes>
 # compare the published signed APK with your unsigned one, ignoring only the signature:
 pip install apksigcopier          # needs apksigner on PATH, e.g. export PATH=$ANDROID_HOME/build-tools/37.0.0:$PATH
 apksigcopier compare goldfishsend-0.1.0.apk --unsigned app/build/outputs/apk/release/app-release-unsigned.apk && echo REPRODUCIBLE
@@ -88,7 +143,7 @@ apksigcopier compare goldfishsend-0.1.0.apk --unsigned app/build/outputs/apk/rel
 `apksigcopier` copies the signature from the published APK onto your unsigned build and compares the result. If
 they differ, `diffoscope goldfishsend-0.1.0.apk app/build/outputs/apk/release/app-release-unsigned.apk` shows where.
 
-## 7. Updating dependencies
+## 8. Updating dependencies
 
 All artifacts and their SHA-256 checksums are pinned in `android/gradle/verification-metadata.xml`. Builds fail if a
 downloaded artifact doesn't match. After changing a dependency version:
@@ -106,7 +161,7 @@ means the artifact was altered.
 There is deliberately no dependency lock file. Every version in `app/build.gradle.kts` is fixed (no ranges or
 `+`), so resolution is already deterministic, and the verification metadata pins the exact bytes.
 
-## 8. Key rotation (only if the key is compromised or weak)
+## 9. Key rotation (only if the key is compromised or weak)
 
 APK Signature Scheme v3 supports rotation on Android 9+ (all supported devices). Create a lineage that proves the old
 key authorised the new one, then sign with both:

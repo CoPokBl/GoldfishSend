@@ -12,7 +12,9 @@
 # ---------------------------------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------------------------------
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+# The build stage runs on the build machine's own platform: the output is portable IL (no RID, no app host), so a
+# multi-platform image doesn't need to emulate the SDK.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1

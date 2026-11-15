@@ -1,0 +1,149 @@
+# Tests for pull requests and feature branches. release.yml also calls this before publishing from main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the same branch or PR cancels the older run. When release.yml calls this, github.workflow is
+  # "Release", so it gets its own group, and runs on main are never cancelled.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  server:
+    name: Server tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: goldfish
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ptest"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      GF_TEST_MYSQL: "Server=127.0.0.1;Port=3306;User=root;Password=test;Database=goldfish"
+      GF_TEST_REDIS: "127.0.0.1:6379"
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: server/**/packages.lock.json
+      - name: Restore
+        run: dotnet restore GoldfishSend.slnx --locked-mode
+      - name: Build
+        run: dotnet build GoldfishSend.slnx -c Release --no-restore
+      - name: Test
+        run: dotnet test GoldfishSend.slnx -c Release --no-build --logger "trx" --results-directory TestResults
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-test-results
+          path: server/TestResults
+          retention-days: 7
+
+  server-image:
+    name: Server image builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  android:
+    name: Android build, unit tests and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/android-setup
+      - name: Unit tests, lint and builds
+        # The release build is unsigned here; it checks R8 and resource shrinking.
+        run: >-
+          ./gradlew --stacktrace
+          :app:testDebugUnitTest :app:lintDebug :app:lintRelease
+          :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest
+      - name: Upload reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-reports
+          path: |
+            android/app/build/reports
+            android/app/build/test-results
+          retention-days: 7
+
+  android-device:
+    name: Android device tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/android-setup
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Build the test APKs
+        working-directory: android
+        run: ./gradlew -Pgf.abis=x86_64 :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Run device tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          ram-size: 4096M
+          disk-size: 6G
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          disable-animations: true
+          working-directory: android
+          script: ./gradlew -Pgf.abis=x86_64 :app:connectedDebugAndroidTest
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-device-reports
+          path: |
+            android/app/build/reports/androidTests
+            android/app/build/outputs/androidTest-results
+          retention-days: 7

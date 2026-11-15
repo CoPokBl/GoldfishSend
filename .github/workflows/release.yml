@@ -1,0 +1,227 @@
+# Every push to main: run CI, then publish the server image to GHCR and, if the app changed since the last release,
+# a signed APK as a GitHub release (Obtainium picks it up). See docs/RELEASING.md for the secrets and variables.
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Release the app even if android/ hasn't changed since the last release
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # versionName is <base>.<commit count>, versionCode is the commit count. Bump the base for a minor/major release.
+  VERSION_BASE: "0.1"
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: Work out the version
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.v.outputs.code }}
+      name: ${{ steps.v.outputs.name }}
+      previous: ${{ steps.v.outputs.previous }}
+      app-changed: ${{ steps.v.outputs.app-changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          code=$(git rev-list --count HEAD)
+          name="${VERSION_BASE}.${code}"
+          previous=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ -z "$previous" ] || [ "${{ inputs.force }}" = "true" ] \
+              || ! git diff --quiet "$previous" HEAD -- android .github; then
+            changed=true
+          else
+            changed=false
+          fi
+          {
+            echo "code=$code"
+            echo "name=$name"
+            echo "previous=$previous"
+            echo "app-changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $name ($code), previous release ${previous:-none}, app changed: $changed"
+
+  server-image:
+    name: Publish the server image
+    needs: [ci, version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image
+        # Registry paths must be lower case; GitHub owner names needn't be.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/goldfishsend" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.version.outputs.name }}
+            type=sha,format=long
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  app:
+    name: Publish the app
+    needs: [ci, version]
+    if: needs.version.outputs.app-changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Signing secrets live in this environment, so only this job (on main) can read them.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      CODE: ${{ needs.version.outputs.code }}
+      NAME: ${{ needs.version.outputs.name }}
+      PREVIOUS: ${{ needs.version.outputs.previous }}
+      DEFAULT_SERVER: ${{ vars.GF_DEFAULT_SERVER }}
+      DEFAULT_SERVER_KEY: ${{ vars.GF_DEFAULT_SERVER_KEY }}
+      CERT_SHA256: ${{ vars.GF_SIGNING_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/android-setup
+      - name: Check the release configuration
+        env:
+          KEYSTORE_BASE64: ${{ secrets.GF_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.GF_KEYSTORE_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "$KEYSTORE_BASE64" ] || missing="$missing GF_KEYSTORE_BASE64(secret)"
+          [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing GF_KEYSTORE_PASSWORD(secret)"
+          [ -n "$DEFAULT_SERVER" ] || missing="$missing GF_DEFAULT_SERVER(variable)"
+          [ -n "$CERT_SHA256" ] || missing="$missing GF_SIGNING_CERT_SHA256(variable)"
+          if [ -n "$missing" ]; then
+            echo "::error::Release configuration missing:$missing. See docs/RELEASING.md."
+            exit 1
+          fi
+          if [ -z "$DEFAULT_SERVER_KEY" ]; then
+            echo "::warning::GF_DEFAULT_SERVER_KEY is not set: the app will trust the default server's key on first use."
+          fi
+      - name: Build the signed APK
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.GF_KEYSTORE_BASE64 }}
+          GF_KEYSTORE_PASSWORD: ${{ secrets.GF_KEYSTORE_PASSWORD }}
+          GF_KEY_PASSWORD: ${{ secrets.GF_KEY_PASSWORD || secrets.GF_KEYSTORE_PASSWORD }}
+          GF_KEY_ALIAS: ${{ vars.GF_KEY_ALIAS || 'goldfishsend' }}
+        run: |
+          export GF_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GF_KEYSTORE_FILE"
+          trap 'rm -f "$GF_KEYSTORE_FILE"' EXIT
+          ./gradlew --no-build-cache --no-configuration-cache clean :app:assembleRelease \
+            "-Pgf.defaultServer=$DEFAULT_SERVER" \
+            "-Pgf.defaultServerKey=$DEFAULT_SERVER_KEY" \
+            "-Pgf.versionCode=$CODE" \
+            "-Pgf.versionName=$NAME"
+      - name: Verify the signature
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          apksigner="$ANDROID_HOME/build-tools/37.0.0/apksigner"
+          "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          actual=$(grep -m1 'certificate SHA-256 digest' "$RUNNER_TEMP/certs.txt" | awk '{print $NF}')
+          expected=$(echo "$CERT_SHA256" | tr -d ': ' | tr 'A-F' 'a-f')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Signed with $actual, expected $expected (GF_SIGNING_CERT_SHA256)."
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$apk" "dist/goldfishsend-$NAME.apk"
+          (cd dist && sha256sum "goldfishsend-$NAME.apk" > "goldfishsend-$NAME.apk.sha256")
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/goldfishsend-${{ needs.version.outputs.name }}.apk
+      - name: Write the release notes
+        run: |
+          cert=$(echo "$CERT_SHA256" | tr -d ': ' | tr 'a-f' 'A-F' | sed 's/../&:/g; s/:$//')
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$PREVIOUS" ]; then
+              git log --no-merges --pretty='- %s' "$PREVIOUS..HEAD"
+            else
+              git log --no-merges --pretty='- %s' -n 30
+            fi
+            echo
+            echo "## Verify"
+            echo
+            echo "Signing certificate SHA-256 (never changes; pin it in Obtainium or check it with AppVerifier):"
+            echo
+            echo '```'
+            echo "$cert"
+            echo '```'
+            echo
+            echo "APK SHA-256: \`$(cut -d' ' -f1 "dist/goldfishsend-$NAME.apk.sha256")\`. The build has a GitHub"
+            echo "provenance attestation: \`gh attestation verify goldfishsend-$NAME.apk --repo $GITHUB_REPOSITORY\`."
+            echo
+            echo "Reproduce it from this tag (see docs/RELEASING.md, section 7):"
+            echo
+            echo '```'
+            echo "./gradlew --no-build-cache clean :app:assembleRelease \\"
+            echo "  -Pgf.defaultServer=$DEFAULT_SERVER \\"
+            echo "  -Pgf.defaultServerKey=$DEFAULT_SERVER_KEY \\"
+            echo "  -Pgf.versionCode=$CODE -Pgf.versionName=$NAME"
+            echo '```'
+            echo
+            echo "Server image: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/goldfishsend:$NAME\`"
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$NAME" \
+            --target "$GITHUB_SHA" \
+            --title "GoldfishSend $NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "dist/goldfishsend-$NAME.apk" \
+            "dist/goldfishsend-$NAME.apk.sha256"

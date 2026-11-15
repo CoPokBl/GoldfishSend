@@ -37,9 +37,9 @@ absolute path, produce identical unsigned APKs. To make that hold:
   values go into the APK. `BuildConfig.DEFAULT_SERVER_URL` depends only on `-Pgf.defaultServer`, so verifiers
   must pass the same value as the release (stated in its notes), or none for the default.
 - Every downloaded artifact is checked against `gradle/verification-metadata.xml` (SHA-256). See
-  [`../docs/RELEASING.md`](../docs/RELEASING.md#7-updating-dependencies) for updating it when dependencies change.
+  [`../docs/RELEASING.md`](../docs/RELEASING.md#8-updating-dependencies) for updating it when dependencies change.
 
-To verify a published release yourself, see [`../docs/RELEASING.md`](../docs/RELEASING.md#6-verifying-a-release-is-reproducible).
+To verify a published release yourself, see [`../docs/RELEASING.md`](../docs/RELEASING.md#7-verifying-a-release-is-reproducible).
 In short: build `assembleRelease` from the tag, then `apksigcopier compare published.apk --unsigned app-release-unsigned.apk`.
 
 ### Verifying your download
@@ -47,7 +47,7 @@ In short: build `assembleRelease` from the tag, then `apksigcopier compare publi
 Official releases are signed with a single key whose certificate SHA-256 fingerprint is:
 
 ```
-TBD: published with the first release (see docs/RELEASING.md §4)
+TBD: published with the first release (see docs/RELEASING.md §5)
 ```
 
 Check an APK before installing it with [AppVerifier](https://github.com/soupslurpr/AppVerifier), or run

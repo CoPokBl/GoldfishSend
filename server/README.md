@@ -325,6 +325,9 @@ dumps disabled.
    docker compose build api
    docker run --rm localhost/goldfishsend:latest keygen
    ```
+   Or skip the build: set `GOLDFISH_IMAGE=ghcr.io/<owner>/goldfishsend:latest` in `.env` (the image CI publishes from
+   `main` for amd64 and arm64; see `docs/RELEASING.md`), `docker compose pull api worker`, and run `keygen` with that
+   image.
    Copy the five keys into `goldfish.env` (`Goldfish__Keys__Pepper=…` and so on), set
    `Goldfish__Keys__VapidSubject`, and **back them up offline now** (see below). Note the server key fingerprint
    printed on stderr: that's your server's identity (see [Server identity](#server-identity)).
@@ -341,7 +344,10 @@ dumps disabled.
 
 Podman works too: `podman compose` (backed by docker-compose or podman-compose) and `podman build`.
 
-**Upgrading:** `git pull && docker compose up -d --build`. Migrations run automatically at startup.
+**Upgrading:** `git pull && docker compose up -d --build`, or with a published image,
+`docker compose pull api worker && docker compose up -d`. Migrations run automatically at startup. Pin a version tag
+(`ghcr.io/<owner>/goldfishsend:0.1.123`) instead of `latest` if you'd rather upgrade on purpose. Each image has a
+provenance attestation: `gh attestation verify oci://ghcr.io/<owner>/goldfishsend:latest --owner <owner>`.
 
 ### Keys as Docker secrets instead of environment variables
 
