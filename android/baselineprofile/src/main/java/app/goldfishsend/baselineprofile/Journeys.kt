@@ -48,7 +48,14 @@ object Seed {
 private const val TIMEOUT = 15_000L
 
 fun UiDevice.need(selector: BySelector, timeout: Long = TIMEOUT): UiObject2 =
-    wait(Until.findObject(selector), timeout) ?: error("not found on screen: $selector")
+    wait(Until.findObject(selector), timeout) ?: error("not found on screen: $selector\n${screenText()}")
+
+/** What's on screen, for failure messages. */
+private fun UiDevice.screenText(): String {
+    val out = java.io.ByteArrayOutputStream()
+    dumpWindowHierarchy(out)
+    return Regex("""(?:text|content-desc)="([^"]+)"""").findAll(out.toString()).joinToString(" | ") { it.groupValues[1] }
+}
 
 /** The chat list has drawn its chats. */
 fun MacrobenchmarkScope.waitForChatList() {

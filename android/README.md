@@ -70,7 +70,7 @@ baseline-profile plugin adds for measuring. They use the application id `app.gol
 real install, and every server in the seeded data is `127.0.0.1`, so nothing leaves the device. The provider is not in
 debug or release builds.
 
-Macrobenchmarks (cold and warm startup, unlocking, scrolling the chat list and a long conversation, opening a chat), each
+Macrobenchmarks (cold and warm startup, unlocking, scrolling the chat list and a long conversation, opening a chat, sending), each
 without AOT compilation and with the baseline profile:
 
 ```sh

@@ -113,6 +113,25 @@ class Benchmarks(private val compilation: CompilationMode) {
         scrollConversation(times = 3)
     }
 
+    /** Typing and sending in the long conversation: its frames, and how long re-loading the chat after a send takes. */
+    @Test
+    fun sendMessage() = rule.measureRepeated(
+        packageName = targetPackage,
+        metrics = listOf(
+            FrameTimingMetric(),
+            // Reports the count too.
+            TraceSectionMetric("gf.messages", TraceSectionMetric.Mode.Sum),
+        ),
+        compilationMode = compilation,
+        iterations = ITERATIONS,
+        setupBlock = {
+            atChatList()
+            openChat(Seeded.LONG_CHAT)
+        },
+    ) {
+        typeAndSend("Benchmark message ${++sent}")
+    }
+
     /** A started app showing the chat list (started cold in the first iteration only). */
     private fun MacrobenchmarkScope.atChatList() {
         Seed.ensure(device, packageName, Lock.NONE)
@@ -129,6 +148,9 @@ class Benchmarks(private val compilation: CompilationMode) {
 
     companion object {
         private const val ITERATIONS = 10
+
+        /** Makes each sent message unique, so the benchmark waits for the new one. */
+        private var sent = 0
 
         @JvmStatic
         @Parameterized.Parameters(name = "{0}")
