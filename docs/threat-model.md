@@ -143,6 +143,8 @@ Anyone without a capability.
   (hardware-backed, unusable while the device is locked). With an app secret, it also needs an Argon2id-hardened
   passphrase or PIN, so extracting Keystore keys isn't enough.
   - Each message has its own key, so deleted messages are crypto-shredded.
+  - Deleted rows are zeroed in the file (`secure_delete`), so even someone who later gets the database key (coerced
+    unlock) finds no deleted message, key or name. `ForensicDeviceTest` checks this against a full dump.
   - Options: wrong-PIN wipe, a duress PIN that erases everything or opens a decoy, an inactivity wipe, erase on
     restart, a PanicKit trigger.
 - **App unlocked:** everything visible in the app is exposed. Use a short auto-lock timeout.

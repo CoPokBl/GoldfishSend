@@ -333,7 +333,7 @@ Flash wear-levelling and SQLite free pages and WAL mean "delete" doesn't reliabl
 - **Every message body is encrypted with its own random key** (AES-256-GCM, with the message id as AAD), stored in a separate
   `message_keys` table. **Deleting a message deletes its key first.** Any ciphertext left behind is then unrecoverable.
 - SQLCipher runs with `PRAGMA secure_delete = ON` (zeroes freed pages), `cipher_memory_security = ON`, and
-  `journal_mode = WAL` with frequent `wal_checkpoint(TRUNCATE)`. An idle-time `VACUUM` runs after bulk deletes.
+  `journal_mode = DELETE` (no long-lived WAL holding old page copies). An idle-time `VACUUM` runs after bulk deletes.
 - libsignal already deletes used one-time prekeys and old chain keys, so forward secrecy holds on the device too.
 
 ### Auto-delete (disappearing messages)
@@ -420,7 +420,7 @@ The exact wire format lives in `docs/protocol.md`.
 | M3 | Reliability: MySQL retry queue, backoff, `EndpointGone` hold and flush, idempotency, sweeper, epoch-key shredding | Chaos test (kill worker and push server) loses nothing within TTL |
 | M4 | Abuse: GCRA limits, PoW, verification push, per-host breakers | Load test (k6/NBomber) plus abuse test suite |
 | M5 | Android: UP registration, mailbox lifecycle, QR exchange, libsignal sessions, send/receive, SQLCipher key hierarchy, per-message keys, outbox and receipts | Two phones chat through a self-hosted ntfy |
-| M6 | Security controls: disappearing messages and view-once, app lock, wrong-PIN, duress and panic wipe, notification and screen hardening | Forensic test: no deleted plaintext or keys recoverable from a DB or file dump |
+| M6 | Security controls: disappearing messages and view-once, app lock, wrong-PIN, duress and panic wipe, notification and screen hardening | Done: forensic test (`ForensicDeviceTest`): no deleted plaintext or keys recoverable from a DB or file dump, even with the DB key |
 | M7 | Hardening: padding, chunking, pinning, Baseline Profiles, external security review | Review findings closed |
 | Future | Abuse resistance: a memory-hard PoW (e.g. Equi-X/Argon2-based) or Privacy Pass (RFC 9576/9578) tokens. SHA-256 hashcash costs a GPU milliseconds but a phone tens of seconds. Changing it is a protocol change for clients. | n/a |
 | M8 | Groups: pairwise fan-out, signed rosters and cards, sender hints, inbox rotation on removal, batch send (`docs/groups.md`) | Done: multi-party simulation, device tests, live batch send |
