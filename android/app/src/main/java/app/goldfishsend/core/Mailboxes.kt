@@ -16,6 +16,7 @@ import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -46,6 +47,17 @@ object Mailboxes {
     /** True while a mailbox is being prepared in the background (drives a subtle spinner). */
     val busy: kotlinx.coroutines.flow.StateFlow<Boolean> = _busy
 
+    /**
+     * A mailbox being created: [solved] is the estimated progress of its proof of work, or null once that's done and
+     * the server's confirmation push is awaited.
+     */
+    class Progress(val solved: Float?)
+
+    private val _progress = kotlinx.coroutines.flow.MutableStateFlow<Progress?>(null)
+
+    /** Progress of the mailbox being created right now, or null. Proof of work can take tens of seconds on a phone. */
+    val progress: kotlinx.coroutines.flow.StateFlow<Progress?> = _progress
+
     fun endpoint(s: Session): PushEndpointData? =
         s.repo.kvString("push_endpoint")?.let { ProtoJson.decodeFromString(PushEndpointData.serializer(), it) }
 
@@ -68,7 +80,22 @@ object Mailboxes {
         try {
             val api = Graph.api()
             val ch = api.powChallenge()
-            val nonce = Outbox.solvePow(ch.challenge, ch.difficulty)
+            val hashes = java.util.concurrent.atomic.AtomicLong()
+            _progress.value = Progress(0f)
+            val nonce = kotlinx.coroutines.coroutineScope {
+                val ticker = launch {
+                    while (true) {
+                        kotlinx.coroutines.delay(250)
+                        _progress.value = Progress(app.goldfishsend.proto.Pow.estimatedProgress(hashes.get(), ch.difficulty))
+                    }
+                }
+                try {
+                    Outbox.solvePow(ch.challenge, ch.difficulty, hashes)
+                } finally {
+                    ticker.cancel()
+                }
+            }
+            _progress.value = Progress(null)
             api.createMailbox(
                 CreateMailboxRequest(
                     pow = PowSolution(ch.challenge, B64.enc(nonce)),
@@ -100,6 +127,7 @@ object Mailboxes {
         } finally {
             waiters.remove(key)
             _busy.value = false
+            _progress.value = null
         }
     }
 
