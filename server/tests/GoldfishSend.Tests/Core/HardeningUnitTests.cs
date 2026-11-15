@@ -1,9 +1,9 @@
 using System.Net;
+using System.Security.Cryptography;
 using GoldfishSend.Core.Net;
 using GoldfishSend.Infrastructure.Delivery;
 using GoldfishSend.Infrastructure.Push;
 using GoldfishSend.Infrastructure.Services;
-using System.Security.Cryptography;
 
 namespace GoldfishSend.Tests.Core;
 

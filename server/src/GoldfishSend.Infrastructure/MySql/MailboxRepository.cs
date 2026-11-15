@@ -45,7 +45,12 @@ public sealed class MailboxRepository {
                 VALUES (@id, @ownerHash, @sealedEndpoint, @state, @verifyHash, 0, @verifyExpiresAt, @expiresAt)
                 """,
                 new {
-                    id, ownerHash, sealedEndpoint, state = (byte)MailboxState.PendingVerification, verifyHash, verifyExpiresAt,
+                    id,
+                    ownerHash,
+                    sealedEndpoint,
+                    state = (byte)MailboxState.PendingVerification,
+                    verifyHash,
+                    verifyExpiresAt,
                     expiresAt = expiresAt.ToDateTime(TimeOnly.MinValue),
                 },
                 cancellationToken: ct));

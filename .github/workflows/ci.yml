@@ -59,6 +59,8 @@ jobs:
           cache-dependency-path: server/**/packages.lock.json
       - name: Restore
         run: dotnet restore GoldfishSend.slnx --locked-mode
+      - name: Check formatting
+        run: dotnet format GoldfishSend.slnx --verify-no-changes --no-restore
       - name: Build
         run: dotnet build GoldfishSend.slnx -c Release --no-restore
       - name: Test
@@ -70,6 +72,69 @@ jobs:
           name: server-test-results
           path: server/TestResults
           retention-days: 7
+
+  server-load:
+    name: Server load test (smoke)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: goldfish_load
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ptest"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: server/**/packages.lock.json
+      - name: Build
+        run: |
+          dotnet build -c Release src/GoldfishSend.Api
+          dotnet build -c Release tools/LoadTest
+      - name: Run the smoke load test
+        # About a minute: a server with the load-test settings (tools/LoadTest/server.env) and a short, modest load.
+        run: |
+          api=src/GoldfishSend.Api/bin/Release/net10.0
+          Goldfish__Keys__ServerKey="$(dotnet $api/GoldfishSend.Api.dll keygen 2>/dev/null | jq -r .Goldfish.Keys.ServerKey)"
+          export Goldfish__Keys__ServerKey
+          export ConnectionStrings__MySql='Server=127.0.0.1;Port=3306;User=root;Password=test;Database=goldfish_load'
+          export ConnectionStrings__Redis='127.0.0.1:6379,defaultDatabase=2'
+          export ConnectionStrings__RedisEphemeral='127.0.0.1:6379,defaultDatabase=3'
+          env $(grep -v '^#' tools/LoadTest/server.env | xargs) \
+            dotnet $api/GoldfishSend.Api.dll --contentRoot "$PWD/$api" --urls http://127.0.0.1:5299 > server.log 2>&1 &
+          server=$!
+          status=0
+          dotnet run --project tools/LoadTest -c Release --no-build -- \
+            --url http://127.0.0.1:5299 --smoke --json loadtest.json || status=$?
+          kill $server
+          exit $status
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-load-test
+          path: |
+            server/loadtest.json
+            server/server.log
+          retention-days: 14
 
   server-image:
     name: Server image builds

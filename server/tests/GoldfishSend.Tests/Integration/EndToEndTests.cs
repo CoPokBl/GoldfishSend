@@ -170,7 +170,9 @@ public sealed class EndToEndTests {
             pow = new { challenge = B64(challenge), nonce = B64(nonce) },
             sendSecret = B64(RandomNumberGenerator.GetBytes(32)),
             ownerHash = B64(RandomNumberGenerator.GetBytes(32)),
-            endpoint = d.Url, p256dh = B64(d.P256dh), auth = B64(d.Auth),
+            endpoint = d.Url,
+            p256dh = B64(d.P256dh),
+            auth = B64(d.Auth),
         };
         var device = _f.Push.NewDevice();
         Assert.Equal(HttpStatusCode.Accepted, (await _f.Client.PostAsJsonAsync("/v1/mailboxes", Body(device))).StatusCode);
@@ -277,7 +279,10 @@ public sealed class EndToEndTests {
 
         var other = _f.Push.NewDevice();
         var rotate = await _f.Client.PutAsJsonAsync("/v1/mailboxes/endpoint", new {
-            items = new[] { mailbox.Credential }, endpoint = other.Url, p256dh = B64(other.P256dh), auth = B64(other.Auth),
+            items = new[] { mailbox.Credential },
+            endpoint = other.Url,
+            p256dh = B64(other.P256dh),
+            auth = B64(other.Auth),
         });
         Assert.Equal(HttpStatusCode.NotFound, rotate.StatusCode);
         Assert.False(other.TryNext(out _), "no push may be sent to the new URL");
