@@ -230,8 +230,8 @@ object Outbox {
      * Solves a server's challenge, treating an absurd difficulty or a timeout as a server failure (retried later) rather
      * than letting it pin the CPU or crash the send loop.
      */
-    suspend fun solvePow(challengeB64: String, difficulty: Int): ByteArray = try {
-        Pow.solve(B64.dec(challengeB64), difficulty)
+    suspend fun solvePow(challengeB64: String, difficulty: Int, hashes: java.util.concurrent.atomic.AtomicLong? = null): ByteArray = try {
+        Pow.solve(B64.dec(challengeB64), difficulty, hashes = hashes)
     } catch (e: Pow.TooHardException) {
         throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
     } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
@@ -244,12 +244,22 @@ object Outbox {
         val jitter = (base * (Rand.int(40) - 20)) / 100
         val delay = maxOf(base + jitter, (retryAfter ?: 0) * 1000)
         s.repo.outboxBackoff(item.seq, attempts, System.currentTimeMillis() + delay)
+        if (attempts == 1) {
+            // The chat now shows the message as waiting.
+            s.db.notifyChanged()
+        }
     }
 
     private fun fail(s: Session, item: OutboxItem) {
         s.repo.outboxDelete(item.seq)
         item.messageId?.let { s.repo.setStatus(it, MsgStatus.FAILED) }
         s.db.notifyChanged()
+    }
+
+    /** Tries a contact's waiting messages again now instead of at their next backoff time, and waits for the attempt. */
+    suspend fun retryNow(s: Session, contactId: Long) {
+        s.repo.outboxRetryNow(contactId, System.currentTimeMillis())
+        runAndSchedule(s)
     }
 
     /** Retries a failed message (user tapped "retry"). */

@@ -91,6 +91,15 @@ import app.goldfishsend.ui.components.SwitchRow
 import app.goldfishsend.ui.components.blockWhenObscured
 import app.goldfishsend.ui.components.memberColor
 import app.goldfishsend.ui.components.rememberQuery
+import app.goldfishsend.ui.components.BusyDialog
+import app.goldfishsend.ui.components.ButtonKind
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.ProgressRow
+import app.goldfishsend.ui.components.TopProgressBar
+import app.goldfishsend.ui.components.rememberWork
+import app.goldfishsend.core.Mailboxes
+import androidx.compose.foundation.layout.Box
+import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -156,7 +165,12 @@ fun NewGroupScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                     )
                 }
             }
-            Button(
+            val making by Mailboxes.progress.collectAsState()
+            ProgressRow(
+                busy, "Creating the group…", Modifier.padding(horizontal = 20.dp),
+                hint = if (making != null) "Setting up the group's private inbox. This can take up to a minute." else null,
+            )
+            ProgressButton(
                 onClick = {
                     busy = true
                     scope.launch {
@@ -167,14 +181,11 @@ fun NewGroupScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                         }
                     }
                 },
-                enabled = !busy && name.isNotBlank() && picked.isNotEmpty(),
+                busy = busy,
+                enabled = name.isNotBlank() && picked.isNotEmpty(),
                 modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp).height(52.dp),
             ) {
-                if (busy) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                } else {
-                    Text(if (picked.isEmpty()) "Create group" else "Create group with ${picked.size}")
-                }
+                Text(if (picked.isEmpty()) "Create group" else "Create group with ${picked.size}")
             }
         }
     }
@@ -226,6 +237,8 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     var promoteFirst by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
+    val erasing = rememberWork()
+    val deleting = rememberWork()
     val c = contact ?: return
     val g = info ?: return
     val m = g.model
@@ -234,8 +247,12 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     val amAdmin = joined && r?.isAdmin(g.me) == true
     val canEdit = Groups.canEditInfo(m, g.me)
 
-    fun act(block: suspend () -> Unit) {
-        scope.launch {
+    val work = rememberWork()
+    var doing by remember { mutableStateOf("") }
+
+    fun act(what: String, block: suspend () -> Unit) {
+        work.run {
+            doing = what
             val res = withContext(Dispatchers.IO) { runCatching { block() } }
             res.onFailure { snackbar.showSnackbar(groupError(it, "Something went wrong. Try again.")) }
         }
@@ -243,7 +260,10 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { }, navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
+            Box {
+                TopAppBar(title = { }, navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
+                TopProgressBar(work.busy, Modifier.align(Alignment.BottomCenter))
+            }
         },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { pad ->
@@ -267,6 +287,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                 },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            ProgressRow(work.busy, doing)
             Spacer(Modifier.height(16.dp))
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainer,
@@ -335,7 +356,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                         "The name and disappearing-messages timer",
                         Icons.Rounded.AdminPanelSettings,
                         checked = r?.adminsOnly == true,
-                        onChange = { v -> act { Groups.setAdminsOnly(s, cid, v) } },
+                        onChange = { v -> act("Saving…") { Groups.setAdminsOnly(s, cid, v) } },
                     )
                 }
                 val hiddenOn by rememberQuery(s) { q -> !q.decoy && q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
@@ -383,7 +404,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                         colors = colors,
                         modifier = Modifier.clickable {
                             selected = null
-                            act { Groups.setAdmin(s, cid, row.id, !isAdmin) }
+                            act("Updating ${row.name}…") { Groups.setAdmin(s, cid, row.id, !isAdmin) }
                         },
                     )
                 }
@@ -418,7 +439,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
             confirmButton = {
                 TextButton(onClick = {
                     confirmRemove = null
-                    act { Groups.removeMember(s, cid, row.id) }
+                    act(if (invite) "Cancelling the invitation…" else "Removing ${row.name}…") { Groups.removeMember(s, cid, row.id) }
                 }) { Text(if (invite) "Cancel invitation" else "Remove", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { confirmRemove = null }) { Text("Keep") } },
@@ -440,6 +461,9 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Spacer(Modifier.height(4.dp))
+                    if (number == null) {
+                        ProgressRow(true, "Calculating…")
+                    }
                     for (line in number?.chunked(5)?.chunked(4).orEmpty()) {
                         Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                             for (gp in line) {
@@ -455,7 +479,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     if (adding) {
         AddMembersDialog(s, r?.ids().orEmpty().toSet(), onDismiss = { adding = false }) { ids ->
             adding = false
-            act { Groups.addMembers(s, cid, ids) }
+            act(if (ids.size == 1) "Adding a member…" else "Adding ${ids.size} members…") { Groups.addMembers(s, cid, ids) }
         }
     }
     if (rename) {
@@ -467,7 +491,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
             confirmButton = {
                 TextButton(enabled = name.isNotBlank(), onClick = {
                     rename = false
-                    act { Groups.rename(s, cid, name) }
+                    act("Renaming…") { Groups.rename(s, cid, name) }
                 }) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { rename = false }) { Text("Cancel") } },
@@ -475,15 +499,17 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     }
     if (timer) {
         ChoiceDialog("Disappearing messages", TIMER_CHOICES.map { it to timerLabel(it) }, c.timerSecs, { timer = false }) { secs ->
-            act { Groups.setTimer(s, cid, secs) }
+            act("Saving…") { Groups.setTimer(s, cid, secs) }
         }
     }
     if (confirmClear) {
         ConfirmDialog("Clear chat?", "All messages in this group will be permanently erased from this phone.", "Clear", true, { confirmClear = false }) {
-            scope.launch(Dispatchers.IO) {
-                s.repo.clearConversation(cid)
-                s.db.notifyChanged()
-                Notifier.cancel(Graph.app)
+            erasing.run {
+                withContext(Dispatchers.IO) {
+                    s.repo.clearConversation(cid)
+                    s.db.notifyChanged()
+                    Notifier.cancel(Graph.app)
+                }
             }
         }
     }
@@ -499,16 +525,18 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
         ConfirmDialog(
             "Leave ${c.name}?", "You'll stop getting messages from this group. The chat stays on this phone until you delete it.",
             "Leave", true, { confirmLeave = false },
-        ) { act { Groups.leave(s, cid) } }
+        ) { act("Leaving the group…") { Groups.leave(s, cid) } }
     }
     if (confirmDelete) {
         ConfirmDialog("Delete ${c.name}?", "The group and all its messages will be erased from this phone.", "Delete", true, { confirmDelete = false }) {
-            scope.launch(Dispatchers.IO) {
-                Messenger.deleteContact(s, cid)
-                launch(Dispatchers.Main) { onDeleted() }
+            deleting.run {
+                withContext(Dispatchers.IO) { Messenger.deleteContact(s, cid) }
+                onDeleted()
             }
         }
     }
+    BusyDialog(erasing.busy, "Clearing the chat…")
+    BusyDialog(deleting.busy, "Deleting the group…", hint = "Telling the server to delete its inbox.")
 }
 
 @Composable
@@ -549,6 +577,7 @@ private fun AddMembersDialog(s: Session, already: Set<String>, onDismiss: () -> 
 fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String) -> Unit, onDeclined: () -> Unit) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
+    var joining by remember { mutableStateOf(false) }
     Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.navigationBarsPadding().padding(16.dp)) {
             Text("$inviter invited you to this group", style = MaterialTheme.typography.titleSmall)
@@ -561,23 +590,25 @@ fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String)
             )
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(enabled = !busy, onClick = {
+                ProgressButton(busy = busy && !joining, enabled = !busy, kind = ButtonKind.OUTLINED, onClick = {
                     busy = true
+                    joining = false
                     scope.launch {
                         withContext(Dispatchers.IO) { runCatching { Groups.leave(s, cid) } }
                         busy = false
                         onDeclined()
                     }
                 }, modifier = Modifier.weight(1f)) { Text("Decline") }
-                Button(enabled = !busy, onClick = {
+                ProgressButton(busy = busy && joining, enabled = !busy, onClick = {
                     busy = true
+                    joining = true
                     scope.launch {
                         val r = withContext(Dispatchers.IO) { runCatching { Groups.join(s, cid) } }
                         busy = false
                         r.onFailure { onError(groupError(it, "Couldn't join. Try again.")) }
                     }
                 }, modifier = Modifier.weight(1f).blockWhenObscured()) {
-                    if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Text("Join")
+                    Text("Join")
                 }
             }
         }

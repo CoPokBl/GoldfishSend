@@ -91,13 +91,17 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
         pendingLink.value = null
         confirmLink = raw
     }
+    var adding by remember { mutableStateOf(false) }
     LaunchedEffect(accepting) {
         val raw = accepting ?: return@LaunchedEffect
         accepting = null
-        acceptInvite(s, raw, viaQr = false)
-            .onSuccess { id -> nav.navigate("chat/$id") { popUpTo("home") } }
+        adding = true
+        val r = acceptInvite(s, raw, viaQr = false)
+        adding = false
+        r.onSuccess { id -> nav.navigate("chat/$id") { popUpTo("home") } }
             .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't add that contact.") }
     }
+    app.goldfishsend.ui.components.BusyDialog(adding, "Adding contact…")
     // Our own server presented a different identity key: explain, and let the user trust it (after re-authenticating).
     app.goldfishsend.ui.screens.ServerIdentityChangedDialog(s)
     confirmLink?.takeIf { InviteLink.isOutdated(it) }?.let {

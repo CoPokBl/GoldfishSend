@@ -324,8 +324,9 @@ class Repo(val db: Db, private val vault: MessageVault) {
             val last = db.queryOne(
                 "SELECT m.id, m.ciphertext, mk.key, m.ts, m.outgoing, m.status, m.view_once, m.kind, mk.bucket, m.sender_key FROM messages m " +
                     "JOIN message_keys mk ON mk.message_id = m.id " +
-                    "WHERE m.contact_id = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY m.ts DESC LIMIT 1",
-                c.id, now,
+                    // System lines ("You created the group") aren't conversation: the preview is the last real message.
+                    "WHERE m.contact_id = ? AND m.kind = ? AND (m.expires_at IS NULL OR m.expires_at > ?) ORDER BY m.ts DESC LIMIT 1",
+                c.id, MsgKind.TEXT, now,
             ) { cur ->
                 val body = if (cur.getInt(6) != 0) {
                     "View-once message"
@@ -796,6 +797,13 @@ class Repo(val db: Db, private val vault: MessageVault) {
     fun outboxDelete(seq: Long) = db.exec("DELETE FROM outbox WHERE seq = ?", seq)
 
     fun outboxRemaining(messageId: String): Long = db.long("SELECT COUNT(*) FROM outbox WHERE message_id = ?", messageId)
+
+    /** Messages of a chat whose sending failed at least once and is waiting to be retried. */
+    fun waitingMessageIds(contactId: Long): Set<String> = db.query(
+        "SELECT DISTINCT message_id FROM outbox WHERE contact_id = ? AND message_id IS NOT NULL AND attempts > 0", contactId,
+    ) { it.getString(0) }.toSet()
+
+    fun outboxRetryNow(contactId: Long, now: Long) = db.exec("UPDATE outbox SET next_at = ? WHERE contact_id = ? AND next_at > ?", now, contactId, now)
 
     fun outboxEarliest(): Long? = db.queryOne("SELECT MIN(next_at) FROM outbox") { if (it.isNull(0)) null else it.getLong(0) }
 }

@@ -51,6 +51,7 @@ class ReAuth internal constructor(
     internal var onCancel: () -> Unit = {}
     internal var reason by mutableStateOf("")
     internal var error by mutableStateOf<String?>(null)
+    internal var checking by mutableStateOf(false)
 
     fun require(why: String, cancel: () -> Unit = {}, action: () -> Unit) {
         if (s.decoy) {
@@ -106,6 +107,11 @@ class ReAuth internal constructor(
 
     internal fun check(secret: CharArray) {
         val action = pending ?: return
+        if (checking) {
+            secret.fill('\u0000')
+            return
+        }
+        checking = true
         scope.launch {
             val ok = withContext(Dispatchers.Default) {
                 try {
@@ -115,6 +121,11 @@ class ReAuth internal constructor(
                 } finally {
                     secret.fill('\u0000')
                 }
+            }
+            checking = false
+            if (pending !== action) {
+                // Cancelled while the secret was being checked.
+                return@launch
             }
             if (ok) {
                 pending = null
@@ -146,6 +157,7 @@ private fun ReAuthDialog(r: ReAuth) {
             onDismiss = { r.cancel() },
             minLength = 4,
             confirm = false,
+            busy = r.checking,
         ) { pin -> r.check(pin) }
         return
     }
@@ -161,11 +173,16 @@ private fun ReAuthDialog(r: ReAuth) {
             }
         },
         confirmButton = {
-            TextButton(enabled = pass.isNotEmpty(), onClick = {
-                val chars = pass.toCharArray()
-                pass = ""
-                r.check(chars)
-            }) { Text("Confirm") }
+            ProgressButton(
+                onClick = {
+                    val chars = pass.toCharArray()
+                    pass = ""
+                    r.check(chars)
+                },
+                busy = r.checking,
+                enabled = pass.isNotEmpty(),
+                kind = ButtonKind.TEXT,
+            ) { Text("Confirm") }
         },
         dismissButton = { TextButton(onClick = { r.cancel() }) { Text("Cancel") } },
     )

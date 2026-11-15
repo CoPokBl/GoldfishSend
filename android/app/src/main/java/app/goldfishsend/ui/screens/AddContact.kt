@@ -77,6 +77,13 @@ import app.goldfishsend.ui.components.QrScanner
 import app.goldfishsend.ui.components.SecureTextField
 import app.goldfishsend.ui.components.rememberQuery
 import app.goldfishsend.ui.components.rememberTicker
+import app.goldfishsend.ui.components.ButtonKind
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.ProgressRow
+import app.goldfishsend.ui.components.TopProgressBar
+import app.goldfishsend.core.Mailboxes
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -138,11 +145,14 @@ fun AddContactScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Add contact") },
-                navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
-                actions = { IconButton(onClick = { pasteOpen = true }) { Icon(Icons.Rounded.ContentPaste, "Paste link") } },
-            )
+            Box {
+                TopAppBar(
+                    title = { Text("Add contact") },
+                    navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                    actions = { IconButton(onClick = { pasteOpen = true }, enabled = !accepting) { Icon(Icons.Rounded.ContentPaste, "Paste link") } },
+                )
+                TopProgressBar(accepting, Modifier.align(Alignment.BottomCenter))
+            }
         },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { pad ->
@@ -167,6 +177,8 @@ fun AddContactScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                     icon = { Icon(Icons.Rounded.QrCodeScanner, null, Modifier.size(18.dp)) },
                 ) { Text("Scan") }
             }
+            // A pasted link is accepted while "My code" shows: say so above it (the scanner shows its own).
+            ProgressRow(accepting && mode == 0, "Adding contact…")
             Spacer(Modifier.height(24.dp))
             AnimatedContent(mode, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "mode") { m ->
                 if (m == 0) {
@@ -251,7 +263,20 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
             if (inv != null) {
                 QrImage(inv.link.toUri(), Modifier.fillMaxSize())
             } else {
-                CircularProgressIndicator(color = Color(0xFF9A4A00))
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Color(0xFF9A4A00))
+                    // Only when no ready mailbox was left and a new one is being made (proof of work).
+                    val p by Mailboxes.progress.collectAsState()
+                    p?.let {
+                        Spacer(Modifier.height(20.dp))
+                        val solved = it.solved
+                        if (solved != null) {
+                            LinearProgressIndicator(progress = { solved }, Modifier.fillMaxWidth(0.7f), color = Color(0xFF9A4A00), trackColor = Color(0x339A4A00))
+                        } else {
+                            LinearProgressIndicator(Modifier.fillMaxWidth(0.7f), color = Color(0xFF9A4A00), trackColor = Color(0x339A4A00))
+                        }
+                    }
+                }
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -264,6 +289,15 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
             textAlign = TextAlign.Center,
             style = MaterialTheme.typography.bodyLarge,
         )
+        val making by Mailboxes.progress.collectAsState()
+        if (inv == null && making != null) {
+            Text(
+                "Setting up a new private inbox. This can take up to a minute.",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
         if (inv != null) {
             val left = ((inv.expiresAt - now) / 1000).coerceAtLeast(0)
             Text(
@@ -273,8 +307,9 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
             )
         }
         Spacer(Modifier.height(24.dp))
-        OutlinedButton(
-            enabled = !sharing,
+        ProgressButton(
+            busy = sharing,
+            kind = ButtonKind.OUTLINED,
             onClick = {
                 sharing = true
                 scope.launch {

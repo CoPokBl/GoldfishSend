@@ -242,6 +242,9 @@ object GroupOutbox {
         val jitter = (base * (Rand.int(40) - 20)) / 100
         val delay = maxOf(base + jitter, (retryAfter ?: 0) * 1000)
         s.repo.outboxBackoff(item.seq, attempts, System.currentTimeMillis() + delay)
+        if (attempts == 1) {
+            s.db.notifyChanged()
+        }
     }
 
     private fun failRow(s: Session, item: OutboxItem) {

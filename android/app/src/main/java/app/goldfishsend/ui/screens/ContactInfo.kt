@@ -62,6 +62,11 @@ import androidx.fragment.app.FragmentActivity
 import app.goldfishsend.ui.components.blockWhenObscured
 import app.goldfishsend.ui.components.rememberReAuth
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import app.goldfishsend.ui.components.BusyDialog
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.ProgressRow
+import app.goldfishsend.ui.components.rememberWork
 import kotlinx.coroutines.launch
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.fingerprint.NumericFingerprintGenerator
@@ -80,7 +85,8 @@ internal fun safetyNumber(s: Session, remote: ByteArray): String? = runCatching 
 fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: () -> Unit) {
     val scope = rememberCoroutineScope()
     val contact by rememberQuery(s, contactId) { it.repo.contact(contactId) }
-    val safety by rememberQuery(s, contact?.identityKey?.size) { q -> contact?.identityKey?.let { safetyNumber(q, it) } }
+    // Null while it's computed (it takes a moment), empty when there's nothing to compare yet.
+    val safety by rememberQuery(s, contact?.identityKey?.size) { q -> contact?.identityKey?.let { safetyNumber(q, it) }.orEmpty() }
     var rename by remember { mutableStateOf(false) }
     var timer by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -88,6 +94,10 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
     var confirmAccept by remember { mutableStateOf(false) }
     val activity = LocalActivity.current as FragmentActivity
     val reauth = rememberReAuth(s, activity)
+    val trusting = rememberWork()
+    val accepting = rememberWork()
+    val erasing = rememberWork()
+    val deleting = rememberWork()
     val c = contact ?: return
     val newSafety by rememberQuery(s, c.pendingIdentity?.size) { q -> c.pendingIdentity?.let { safetyNumber(q, it) } }
 
@@ -149,16 +159,19 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                         Spacer(Modifier.height(12.dp))
                         FingerprintPair(c.outServerKey, presented)
                         Spacer(Modifier.height(12.dp))
-                        Button(
+                        ProgressButton(
                             onClick = {
                                 reauth.require("Trusting a new server identity.") {
-                                    scope.launch(Dispatchers.IO) {
-                                        s.repo.trustPendingServerKey(contactId, presented)
-                                        s.db.notifyChanged()
-                                        app.goldfishsend.core.Outbox.kick()
+                                    trusting.run {
+                                        withContext(Dispatchers.IO) {
+                                            s.repo.trustPendingServerKey(contactId, presented)
+                                            s.db.notifyChanged()
+                                            app.goldfishsend.core.Outbox.kick()
+                                        }
                                     }
                                 }
                             },
+                            busy = trusting.busy,
                             modifier = Modifier.blockWhenObscured(),
                         ) { Text("Trust new identity") }
                     }
@@ -182,6 +195,9 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Spacer(Modifier.height(12.dp))
+                        if (newSafety == null) {
+                            ProgressRow(true, "Calculating the new safety number…")
+                        }
                         newSafety?.chunked(5)?.chunked(4)?.forEach { row ->
                             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                                 for (g in row) {
@@ -190,7 +206,7 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                             }
                         }
                         Spacer(Modifier.height(12.dp))
-                        Button(onClick = { confirmAccept = true }) { Text("Accept new safety number") }
+                        ProgressButton(onClick = { confirmAccept = true }, busy = accepting.busy) { Text("Accept new safety number") }
                     }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -222,6 +238,8 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                         }
                     }
                     if (safety == null) {
+                        ProgressRow(true, "Calculating…")
+                    } else if (safety == "") {
                         Text("Available once you've exchanged a message.", style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -287,10 +305,12 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
     }
     if (confirmClear) {
         ConfirmDialog("Clear chat?", "All messages in this chat will be permanently erased from this phone.", "Clear", true, { confirmClear = false }) {
-            scope.launch(Dispatchers.IO) {
-                s.repo.clearConversation(contactId)
-                s.db.notifyChanged()
-                Notifier.cancel(Graph.app)
+            erasing.run {
+                withContext(Dispatchers.IO) {
+                    s.repo.clearConversation(contactId)
+                    s.db.notifyChanged()
+                    Notifier.cancel(Graph.app)
+                }
             }
         }
     }
@@ -299,7 +319,7 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
             "Accept the new safety number?",
             "Only do this if you've confirmed with ${c.name} that the new number is theirs. They'll be marked as not verified.",
             "Accept", false, { confirmAccept = false },
-        ) { scope.launch { app.goldfishsend.core.Messenger.acceptIdentityChange(s, contactId) } }
+        ) { accepting.run { withContext(Dispatchers.IO) { app.goldfishsend.core.Messenger.acceptIdentityChange(s, contactId) } } }
     }
     if (confirmDelete) {
         ConfirmDialog(
@@ -307,10 +327,12 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
             "The chat and all its messages will be erased, and ${c.name} won't be able to reach you anymore.",
             "Block and delete", true, { confirmDelete = false },
         ) {
-            scope.launch(Dispatchers.IO) {
-                Messenger.deleteContact(s, contactId)
-                launch(Dispatchers.Main) { onDeleted() }
+            deleting.run {
+                withContext(Dispatchers.IO) { Messenger.deleteContact(s, contactId) }
+                onDeleted()
             }
         }
     }
+    BusyDialog(erasing.busy, "Clearing the chat…")
+    BusyDialog(deleting.busy, "Deleting ${c.name}…", hint = "Telling the server to delete their inbox.")
 }

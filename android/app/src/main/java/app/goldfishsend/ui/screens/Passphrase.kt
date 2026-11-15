@@ -50,6 +50,8 @@ import app.goldfishsend.ui.components.ConfirmDialog
 import app.goldfishsend.ui.components.FieldKind
 import app.goldfishsend.ui.components.PinBuffer
 import app.goldfishsend.ui.components.PinPad
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.ProgressRow
 import app.goldfishsend.ui.components.SecureTextField
 import app.goldfishsend.ui.components.promptScreenLock
 import kotlinx.coroutines.Dispatchers
@@ -94,6 +96,8 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
     LaunchedEffect(Unit) {
         reauth.require("Changing how GoldfishSend unlocks.", cancel = back) { authed = true }
     }
+    // A change in progress finishes before leaving (it's crash-safe either way, but the result would go unseen).
+    androidx.activity.compose.BackHandler(busy) { }
 
     /** Every change generates a new master key and rekeys the database (KeyVault: master-key rotation). */
     fun saveSecret(secret: CharArray?, isPin: Boolean) {
@@ -157,7 +161,7 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
             TopAppBar(
                 title = { Text("Unlock method") },
                 navigationIcon = {
-                    IconButton(onClick = {
+                    IconButton(enabled = !busy, onClick = {
                         if (step == Step.CHOOSE) back() else {
                             firstPin?.fill('\u0000')
                             firstPin = null
@@ -177,7 +181,7 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
                 Step.CHOOSE -> {
                     Option(
                         "No app lock", "GoldfishSend opens whenever your phone is unlocked.",
-                        current == Choice.NONE,
+                        current == Choice.NONE, enabled = !busy,
                     ) { pick(Choice.NONE) }
                     Option(
                         "Phone screen lock",
@@ -187,23 +191,24 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
                         } else {
                             "Needs Android 11 or newer and a screen lock set on your phone."
                         },
-                        current == Choice.SCREEN_LOCK, enabled = screenLockSupported,
+                        current == Choice.SCREEN_LOCK, enabled = screenLockSupported && !busy,
                     ) { pick(Choice.SCREEN_LOCK) }
                     Option(
                         "App PIN",
                         "Typed on GoldfishSend's own keypad, so your keyboard app never sees it. It also protects your data with " +
                             "its own key, and supports the duress PIN and erasing after failed attempts.",
-                        current == Choice.PIN,
+                        current == Choice.PIN, enabled = !busy,
                     ) { pick(Choice.PIN) }
                     Option(
                         "Passphrase (advanced)",
                         "Letters and numbers, typed with your keyboard app. That's stronger than a PIN, but your keyboard sees what you type.",
-                        current == Choice.PASSPHRASE,
+                        current == Choice.PASSPHRASE, enabled = !busy,
                     ) { pick(Choice.PASSPHRASE) }
                     error?.let {
                         Spacer(Modifier.height(12.dp))
                         Text(it, color = MaterialTheme.colorScheme.error)
                     }
+                    ProgressRow(busy, "Re-encrypting your data…", Modifier.fillMaxWidth(), hint = "This takes a few seconds.")
                 }
                 Step.PIN_NEW, Step.PIN_CONFIRM -> {
                     Text(
@@ -214,7 +219,7 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
                     Spacer(Modifier.height(6.dp))
                     Text(error ?: "Longer is stronger.", color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(20.dp))
-                    PinPad(pin, scrambled = Graph.prefs.scramblePinPad, enabled = !busy, onSubmit = {
+                    PinPad(pin, scrambled = Graph.prefs.scramblePinPad, busyText = if (busy) "Saving…" else null, onSubmit = {
                         if (step == Step.PIN_NEW) {
                             firstPin = pin.take()
                             error = null
@@ -235,10 +240,7 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
                             }
                         }
                     })
-                    if (busy) {
-                        Spacer(Modifier.height(16.dp))
-                        CircularProgressIndicator()
-                    }
+                    ProgressRow(busy, "Re-encrypting your data…", hint = "This takes a few seconds.")
                 }
                 Step.PASSPHRASE -> {
                     Text(
@@ -260,13 +262,13 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
                         color = MaterialTheme.colorScheme.error,
                     )
                     Spacer(Modifier.height(16.dp))
-                    Button(
-                        enabled = !busy && pass.length >= 8 && pass == confirm,
+                    ProgressButton(
+                        busy = busy,
+                        enabled = pass.length >= 8 && pass == confirm,
                         onClick = { saveSecret(pass.toCharArray().also { pass = ""; confirm = "" }, isPin = false) },
                         modifier = Modifier.fillMaxWidth().height(52.dp),
-                    ) {
-                        if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text("Save")
-                    }
+                    ) { Text("Save") }
+                    ProgressRow(busy, "Re-encrypting your data…", hint = "This takes a few seconds.")
                 }
             }
         }

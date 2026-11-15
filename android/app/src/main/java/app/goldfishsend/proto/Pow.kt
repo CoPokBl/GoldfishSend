@@ -2,6 +2,7 @@ package app.goldfishsend.proto
 
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -85,10 +86,12 @@ object Pow {
      * Parallel solver using all cores, on Dispatchers.Default. It's cancellable (cancelling the caller stops every worker
      * within ~1024 hashes) and gives up after [timeoutMs].
      *
+     * [hashes], if given, counts the hashes tried so far (for [estimatedProgress]).
+     *
      * @throws TooHardException if [difficulty] is outside 0..[MAX_DIFFICULTY].
      * @throws kotlinx.coroutines.TimeoutCancellationException on timeout.
      */
-    suspend fun solve(challenge: ByteArray, difficulty: Int, timeoutMs: Long = TIMEOUT_MS): ByteArray {
+    suspend fun solve(challenge: ByteArray, difficulty: Int, timeoutMs: Long = TIMEOUT_MS, hashes: AtomicLong? = null): ByteArray {
         if (difficulty !in 0..MAX_DIFFICULTY) {
             throw TooHardException(difficulty)
         }
@@ -102,6 +105,7 @@ object Pow {
                             ensureActive()
                             val job = coroutineContext[Job]
                             val r = solveRange(challenge, difficulty, w.toLong(), workers.toLong()) {
+                                hashes?.addAndGet(1024)
                                 found.get() || job?.isActive == false
                             }
                             if (r != null) {
@@ -114,5 +118,15 @@ object Pow {
                 }
             }
         }
+    }
+
+    /**
+     * How far a search is after [hashes] tries, for a progress bar. A solution takes 2^difficulty tries on average but
+     * can come at any moment, so this is the chance of having found one by then (stretched so the average lands near
+     * 80%). It never reaches 1: the bar fills when the solution is found.
+     */
+    fun estimatedProgress(hashes: Long, difficulty: Int): Float {
+        val expected = Math.scalb(1.0, difficulty.coerceIn(0, 62))
+        return (1 - Math.exp(-1.6 * hashes / expected)).toFloat().coerceIn(0f, 0.99f)
     }
 }

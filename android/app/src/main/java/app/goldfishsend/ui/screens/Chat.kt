@@ -94,10 +94,36 @@ import app.goldfishsend.ui.components.countdown
 import app.goldfishsend.ui.components.fullTime
 import app.goldfishsend.ui.components.rememberQuery
 import app.goldfishsend.ui.components.rememberTicker
-import app.goldfishsend.ui.components.shortTime
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.graphics.graphicsLayer
+import app.goldfishsend.ui.ChatRow
+import app.goldfishsend.ui.ChatRows
+import app.goldfishsend.ui.DayRow
+import app.goldfishsend.ui.MessageRow
+import app.goldfishsend.ui.UnreadRow
+import app.goldfishsend.ui.components.ButtonKind
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.Spinner
+import app.goldfishsend.ui.components.clockTime
+import app.goldfishsend.ui.components.dayLabels
+import app.goldfishsend.ui.components.localDay
+import app.goldfishsend.ui.components.rememberShowProgress
+import app.goldfishsend.ui.components.rememberWork
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** A chat's messages (newest first) and which outgoing ones are waiting to be retried. */
+private class ChatData(val messages: List<Message>, val waiting: Set<String>)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -122,22 +148,29 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
     val bodies = remember(contactId) { java.util.concurrent.atomic.AtomicReference<Map<String, String>>(emptyMap()) }
     val loaded by rememberQuery(s, contactId, expiredEpoch) { q ->
         traced("gf.messages") {
-            q.repo.messages(contactId, System.currentTimeMillis(), known = bodies.get()).also { list ->
-                bodies.set(list.associate { it.id to it.body })
-            }
+            val list = q.repo.messages(contactId, System.currentTimeMillis(), known = bodies.get())
+            bodies.set(list.associate { it.id to it.body })
+            ChatData(list, q.repo.waitingMessageIds(contactId))
         }
     }
-    val messages = remember(loaded, now) { loaded?.filter { it.expiresAt == null || it.expiresAt > now } }
     LaunchedEffect(loaded) {
-        hasTimers = loaded?.any { it.expiresAt != null } == true
+        hasTimers = loaded?.messages?.any { it.expiresAt != null } == true
     }
-    val expiredNow = remember(loaded, now) { loaded?.count { it.expiresAt != null && it.expiresAt <= now } ?: 0 }
+    val expiredNow = remember(loaded, now) { loaded?.messages?.count { it.expiresAt != null && it.expiresAt <= now } ?: 0 }
+    // Rebuilt when a message expires, not on every tick: countdowns get the clock separately.
+    val messages = remember(loaded, expiredNow) { loaded?.messages?.filter { it.expiresAt == null || it.expiresAt > now } }
     LaunchedEffect(expiredNow) {
         if (expiredNow > 0) {
             withContext(Dispatchers.IO) { runCatching { app.goldfishsend.core.Sweeper.sweep(s) } }
             expiredEpoch++
         }
     }
+    // Where "New messages" goes: the oldest unread message when the chat opened. Taken from the first load, before the
+    // chat is marked read.
+    val firstUnread = remember(messages != null) { messages?.let(ChatRows::firstUnread) }
+    // Gone once we reply.
+    var dividerCleared by remember { mutableStateOf(false) }
+    val unreadFrom = if (dividerCleared) null else firstUnread
     // Read only inside the composer, so typing doesn't recompose the whole chat.
     val draft = remember { mutableStateOf("") }
     // Set when we send, so the list follows our new message even if we were scrolled up.
@@ -150,19 +183,81 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
     val listState = rememberLazyListState()
     val atBottom by remember { derivedStateOf { listState.firstVisibleItemIndex <= 1 } }
 
+    val c = contact
+    // Sending to the contact is paused until the user reviews their new safety number or server key.
+    val paused = c != null && !c.isGroup && (c.pendingIdentity != null || c.pendingServerKey != null)
+    val waiting = loaded?.waiting.orEmpty()
+    val today = remember(loaded) { localDay(System.currentTimeMillis()) }
+    // Bumped when a message has been "sending" for too long, to show it as waiting.
+    var staleCheck by remember { mutableStateOf(0) }
+    val rows = remember(messages, unreadFrom, waiting, paused, staleCheck) {
+        val staleBefore = System.currentTimeMillis() - ChatRows.SENDING_MS
+        messages?.let { ChatRows.build(it, unreadFrom, waiting, paused, ::localDay, staleBefore) }
+    }
+    val anyWaiting = remember(rows) { rows.orEmpty().any { it is MessageRow && it.waiting } }
+    LaunchedEffect(rows) {
+        val sending = rows?.mapNotNull { r -> (r as? MessageRow)?.takeIf { it.m.outgoing && it.m.status == MsgStatus.QUEUED && !it.waiting }?.m?.ts }
+        val oldest = sending?.minOrNull() ?: return@LaunchedEffect
+        delay((oldest + ChatRows.SENDING_MS - System.currentTimeMillis()).coerceAtLeast(0) + 50)
+        staleCheck++
+    }
+
+    // The newest message the user has had on screen. Incoming messages after it count on the "scroll to latest" button.
+    var seenUpTo by remember { mutableStateOf<Long?>(null) }
+    var positioned by remember { mutableStateOf(false) }
+    LaunchedEffect(rows, positioned) {
+        val r = rows ?: return@LaunchedEffect
+        if (!positioned) {
+            return@LaunchedEffect
+        }
+        snapshotFlow { listState.firstVisibleItemIndex }.collect { first ->
+            val newest = (first until r.size).firstNotNullOfOrNull { (r[it] as? MessageRow)?.m?.ts } ?: return@collect
+            val seen = seenUpTo
+            if (seen == null || newest > seen) {
+                seenUpTo = newest
+            }
+        }
+    }
+    val unseen = remember(messages, seenUpTo) {
+        val seen = seenUpTo
+        if (messages == null || seen == null) 0 else ChatRows.unseen(messages, seen)
+    }
+
     DisposableEffect(contactId) {
         Messenger.openChat.value = contactId
         onDispose { Messenger.openChat.value = null }
     }
-    LaunchedEffect(messages?.firstOrNull()?.id) {
-        withContext(Dispatchers.IO) { runCatching { Messenger.markChatRead(s, contactId) } }
+    // Opened with unread messages: start at "New messages" rather than at the bottom, unless they all fit on screen.
+    LaunchedEffect(rows != null) {
+        val r = rows ?: return@LaunchedEffect
+        val divider = r.indexOfFirst { it is UnreadRow }
+        if (divider > 0) {
+            // With the day's separator above it, if it's the day's first unread message.
+            val top = if (r.getOrNull(divider + 1) is DayRow) divider + 1 else divider
+            listState.scrollToItem(top)
+            val info = listState.layoutInfo
+            val shown = info.visibleItemsInfo.filter { it.index in divider..top }.sumOf { it.size }
+            val room = info.viewportEndOffset - info.viewportStartOffset - shown - info.afterContentPadding - info.beforeContentPadding
+            if (room > 0) {
+                listState.scrollBy(-room.toFloat())
+            }
+        }
+        positioned = true
+    }
+    // Marks the chat read once the user has seen its newest message (not while they're scrolled up reading older ones).
+    LaunchedEffect(messages?.firstOrNull()?.id, unseen == 0, positioned) {
+        if (messages == null || !positioned) {
+            return@LaunchedEffect
+        }
+        if (unseen == 0) {
+            withContext(Dispatchers.IO) { runCatching { Messenger.markChatRead(s, contactId) } }
+        }
         if (atBottom || followSent) {
             followSent = false
             listState.animateScrollToItem(0)
         }
     }
 
-    val c = contact
     val group by rememberQuery(s, contactId) { q -> if (q.repo.contact(contactId)?.isGroup == true) chatGroup(q, contactId) else null }
     val isGroup = c?.isGroup == true
     val g = group
@@ -253,55 +348,96 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                 // Groups: membership notices are system lines; delivery issues show per member in group info.
             } else if (c != null && c.pendingServerKey != null) {
                 Banner("Can't verify ${c.name}'s server. Messages will wait until it's sorted out. Tap to review.", onClick = showInfo)
+            } else if (c != null && c.pendingIdentity != null) {
+                Banner("${c.name}'s safety number changed. Messages are paused until you review it. Tap to review.", onClick = showInfo)
             } else if (c != null && c.unreachable) {
                 Banner("This contact can't be reached right now. They may have removed you.")
             } else if (c != null && !c.verified) {
                 Banner("Not verified. Compare safety numbers in contact info.", onClick = showInfo)
             }
             Box(Modifier.weight(1f)) {
+                val r = rows
                 // Not composed before the messages are loaded: bubbles arriving in an empty list would all fade in.
-                if (messages != null) LazyColumn(
+                if (r != null) LazyColumn(
                     state = listState,
                     reverseLayout = true,
-                    modifier = Modifier.fillMaxSize(),
+                    // Hidden for the frame or two it takes to move to "New messages", so the chat doesn't jump.
+                    modifier = Modifier.fillMaxSize().graphicsLayer { alpha = if (positioned) 1f else 0f },
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    items(messages, key = { it.id }, contentType = { it.kind }) { m ->
-                        if (m.kind == MsgKind.SYSTEM) {
-                            SystemChip(m.body, Modifier.animateItem())
-                        } else {
-                            Bubble(
-                                // Only counting-down bubbles take the ticking clock, so the others skip recomposition every second.
-                                m, if (m.expiresAt != null) now else 0L,
-                                Modifier.animateItem(),
-                                sender = if (g != null && !m.outgoing) m.senderKey?.let { k -> (g.names[k] ?: "Former member") to k } else null,
-                                onLongPress = { selected = m },
-                                onTap = {
-                                    if (m.viewOnce && !m.outgoing) {
-                                        scope.launch(Dispatchers.IO) {
-                                            // Consumed (deleted, key shredded) *before* it's shown, so rotation, process
-                                            // death, locking or dismissing can never show it twice.
-                                            Messenger.consumeViewOnce(s, m.id)?.let { viewing = it }
-                                        }
-                                    } else if (m.status == MsgStatus.FAILED) {
-                                        scope.launch(Dispatchers.IO) { Outbox.retry(s, m.id) }
-                                    }
-                                },
-                            )
+                    items(r, key = { it.key }, contentType = { rowType(it) }) { row ->
+                        when (row) {
+                            is DayRow -> DaySeparator(row.day, today, Modifier.animateItem())
+                            is UnreadRow -> NewMessagesDivider(Modifier.animateItem())
+                            is MessageRow -> {
+                                val m = row.m
+                                if (m.kind == MsgKind.SYSTEM) {
+                                    SystemChip(m.body, Modifier.animateItem())
+                                } else {
+                                    Bubble(
+                                        // Only counting-down bubbles take the ticking clock, so the others skip recomposition every second.
+                                        m, if (m.expiresAt != null) now else 0L,
+                                        Modifier.animateItem(),
+                                        waiting = row.waiting,
+                                        sender = if (g != null && !m.outgoing) m.senderKey?.let { k -> (g.names[k] ?: "Former member") to k } else null,
+                                        onLongPress = { selected = m },
+                                        onTap = {
+                                            if (m.viewOnce && !m.outgoing) {
+                                                scope.launch(Dispatchers.IO) {
+                                                    // Consumed (deleted, key shredded) *before* it's shown, so rotation, process
+                                                    // death, locking or dismissing can never show it twice.
+                                                    Messenger.consumeViewOnce(s, m.id)?.let { viewing = it }
+                                                }
+                                            } else if (m.status == MsgStatus.FAILED) {
+                                                scope.launch(Dispatchers.IO) { Outbox.retry(s, m.id) }
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Decrypting a long chat can take a moment on a slow phone.
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        if (rememberShowProgress(true)) {
+                            CircularProgressIndicator()
                         }
                     }
                 }
+                if (r != null) {
+                    FloatingDay(listState, r, today, Modifier.align(Alignment.TopCenter).padding(top = 8.dp))
+                }
                 androidx.compose.animation.AnimatedVisibility(
-                    !atBottom,
+                    !atBottom || unseen > 0,
                     enter = scaleIn(),
                     exit = scaleOut(),
                     modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
                 ) {
-                    SmallFloatingActionButton(onClick = { scope.launch { listState.animateScrollToItem(0) } }) {
-                        Icon(Icons.Rounded.KeyboardArrowDown, "Scroll to latest")
+                    BadgedBox(
+                        badge = {
+                            if (unseen > 0) {
+                                Badge(containerColor = MaterialTheme.colorScheme.primary) { Text(if (unseen > 99) "99+" else "$unseen") }
+                            }
+                        },
+                    ) {
+                        SmallFloatingActionButton(onClick = {
+                            scope.launch {
+                                // Far up: jump most of the way, then glide the rest, instead of animating through everything.
+                                if (listState.firstVisibleItemIndex > 12) {
+                                    listState.scrollToItem(12)
+                                }
+                                listState.animateScrollToItem(0)
+                            }
+                        }) {
+                            Icon(Icons.Rounded.KeyboardArrowDown, if (unseen > 0) "Scroll to latest, $unseen new" else "Scroll to latest")
+                        }
                     }
                 }
+            }
+            if (!paused && anyWaiting) {
+                WaitingBar(s, contactId)
             }
             when (g?.state) {
                 app.goldfishsend.group.GroupModel.INVITED -> GroupInvitationBar(
@@ -318,6 +454,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                 )
                 else -> Composer(draft) { text ->
                     followSent = true
+                    dividerCleared = true
                     scope.launch {
                         // Far up in the history: jump down now, then the new message animates in once it's stored.
                         if (listState.firstVisibleItemIndex > 20) {
@@ -353,6 +490,144 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
             confirmButton = { TextButton(onClick = { viewing = null }) { Text("Done") } },
         )
     }
+}
+
+private fun rowType(r: ChatRow): Int = when (r) {
+    is MessageRow -> r.m.kind
+    is DayRow -> 10
+    is UnreadRow -> 11
+}
+
+@Composable
+private fun DaySeparator(day: Long, today: Long, modifier: Modifier) {
+    val label = remember(day, today) { dayLabels().label(day, today) }
+    Box(modifier.fillMaxWidth().padding(top = 12.dp, bottom = 6.dp), contentAlignment = Alignment.Center) {
+        DayChip(label)
+    }
+}
+
+@Composable
+private fun DayChip(label: String) {
+    Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHigh, shadowElevation = 0.dp) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        )
+    }
+}
+
+/** While scrolling, the day of the messages at the top of the screen, so you know where you are in a long chat. */
+@Composable
+private fun FloatingDay(listState: LazyListState, rows: List<ChatRow>, today: Long, modifier: Modifier) {
+    // The topmost visible row (the list is reversed). Recomposes only when it moves to another day.
+    val topDay by remember(rows) {
+        derivedStateOf {
+            val top = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: return@derivedStateOf null
+            // A separator at the top already says it.
+            rows.getOrNull(top)?.takeIf { it !is DayRow }?.day
+        }
+    }
+    val scrolling = listState.isScrollInProgress
+    val away by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
+    var show by remember { mutableStateOf(false) }
+    LaunchedEffect(scrolling) {
+        if (scrolling) {
+            show = true
+        } else {
+            delay(1200)
+            show = false
+        }
+    }
+    val day = topDay
+    // Keeps the label while the chip fades out.
+    val last = remember { longArrayOf(Long.MIN_VALUE) }
+    if (day != null) {
+        last[0] = day
+    }
+    androidx.compose.animation.AnimatedVisibility(show && day != null && away, modifier, enter = fadeIn(), exit = fadeOut()) {
+        last[0].takeIf { it != Long.MIN_VALUE }?.let { d ->
+            val label = remember(d, today) { dayLabels().label(d, today) }
+            Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceContainerHighest, shadowElevation = 2.dp) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NewMessagesDivider(modifier: Modifier) {
+    Row(modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+        Text(
+            "New messages",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+    }
+}
+
+/** Messages are waiting in the outbox: why, and a way to try again now. */
+@Composable
+private fun WaitingBar(s: Session, contactId: Long) {
+    val online = rememberOnline()
+    val work = rememberWork()
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 2.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(12.dp))
+            Text(
+                if (online) {
+                    "Can't reach the server. Messages will send when it can be reached."
+                } else {
+                    "Not connected. Messages will send when you're back online."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            ProgressButton(
+                onClick = { work.run { withContext(Dispatchers.IO) { runCatching { Outbox.retryNow(s, contactId) } } } },
+                busy = work.busy,
+                kind = ButtonKind.TEXT,
+            ) { Text("Retry") }
+        }
+    }
+}
+
+/** Whether the phone has a network right now (ACCESS_NETWORK_STATE comes with WorkManager). */
+@Composable
+private fun rememberOnline(): Boolean {
+    val ctx = LocalContext.current
+    val cm = remember { ctx.getSystemService(android.net.ConnectivityManager::class.java) }
+    var online by remember { mutableStateOf(runCatching { cm.activeNetwork != null }.getOrDefault(true)) }
+    DisposableEffect(cm) {
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                online = true
+            }
+
+            // The default network went away; a replacement arrives through onAvailable.
+            override fun onLost(network: android.net.Network) {
+                online = false
+            }
+        }
+        val ok = runCatching { cm.registerDefaultNetworkCallback(cb) }.isSuccess
+        onDispose {
+            if (ok) {
+                runCatching { cm.unregisterNetworkCallback(cb) }
+            }
+        }
+    }
+    return online
 }
 
 @Composable
@@ -407,6 +682,7 @@ private fun Bubble(
     m: Message,
     now: Long,
     modifier: Modifier,
+    waiting: Boolean = false,
     sender: Pair<String, String>? = null,
     onLongPress: () -> Unit,
     onTap: () -> Unit,
@@ -451,12 +727,17 @@ private fun Bubble(
                     Icon(Icons.Rounded.Timer, "Disappears", Modifier.size(12.dp), tint = meta)
                     Text(countdown(exp - now), style = MaterialTheme.typography.labelSmall, color = meta)
                 }
-                Text(shortTime(m.ts), style = MaterialTheme.typography.labelSmall, color = meta)
-                if (out) {
+                Text(clockTime(m.ts), style = MaterialTheme.typography.labelSmall, color = meta)
+                if (out && m.status == MsgStatus.QUEUED && !waiting) {
+                    // On its way to the server.
+                    Spinner(Modifier.padding(1.dp).size(13.dp), color = meta, description = "Sending")
+                } else if (out) {
                     StatusTicks(m.status, meta)
                 }
             }
-            if (out && m.status == MsgStatus.FAILED) {
+            if (out && waiting) {
+                Text("Waiting to send", style = MaterialTheme.typography.labelSmall, color = meta, modifier = Modifier.align(Alignment.End))
+            } else if (out && m.status == MsgStatus.FAILED) {
                 Text("Not sent. Tap to retry", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.errorContainer)
             }
         }

@@ -97,6 +97,11 @@ import app.goldfishsend.ui.components.SwitchRow
 import app.goldfishsend.ui.components.biometricAvailable
 import app.goldfishsend.ui.components.promptBiometric
 import app.goldfishsend.ui.components.rememberQuery
+import app.goldfishsend.ui.components.BusyDialog
+import app.goldfishsend.ui.components.ButtonKind
+import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.ProgressRow
+import app.goldfishsend.ui.components.rememberWork
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -127,6 +132,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     val duressOn by rememberQuery(s, v) { q -> !q.decoy && q.repo.kvString(AppLock.KV_DURESS_ON) == "1" }
     val hiddenOn by rememberQuery(s, v) { q -> !q.decoy && q.repo.kvString(AppLock.KV_HIDDEN_ON) == "1" }
     var confirmWipeMessages by remember { mutableStateOf(false) }
+    val wiping = rememberWork()
     var confirmPanic by remember { mutableStateOf(false) }
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
     // Reading v makes this recompose on any preference change.
@@ -478,9 +484,10 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     }
     if (confirmWipeMessages) {
         ConfirmDialog("Erase all messages?", "Every message in every chat is destroyed. This can't be undone.", "Erase", true, { confirmWipeMessages = false }) {
-            scope.launch(Dispatchers.IO) { Wiper.wipeMessages() }
+            wiping.run { withContext(Dispatchers.IO) { Wiper.wipeMessages() } }
         }
     }
+    BusyDialog(wiping.busy, "Erasing messages…")
     if (confirmPanic) {
         ConfirmDialog(
             "Panic wipe?",
@@ -540,13 +547,13 @@ fun PushPickerDialog(onDismiss: () -> Unit) {
 @Composable
 private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val work = rememberWork()
     var url by remember { mutableStateOf(Graph.prefs.serverUrl) }
     var fingerprint by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     val hasContacts by rememberQuery(s) { it.repo.contacts().isNotEmpty() }
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!work.busy) onDismiss() },
         title = { Text("Server") },
         text = {
             Column {
@@ -562,23 +569,24 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                     Spacer(Modifier.height(8.dp))
                     SecureTextField(fingerprint, { fingerprint = it; error = null }, Modifier.fillMaxWidth(), hint = "Server fingerprint (optional)")
                     error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                    ProgressRow(work.busy, "Checking the server…")
                 }
             }
         },
         confirmButton = {
-            TextButton(enabled = hasContacts == false, onClick = {
+            ProgressButton(busy = work.busy, enabled = hasContacts == false, kind = ButtonKind.TEXT, onClick = {
                 if (!ServerApi.isValidServer(url)) {
                     error = "Use a secure https:// address."
-                    return@TextButton
+                    return@ProgressButton
                 }
                 val typed = fingerprint.trim()
                 val fp = if (typed.isEmpty()) null else app.goldfishsend.net.Gateway.parseFingerprintInput(typed)
                 if (typed.isNotEmpty() && fp == null) {
                     error = "That isn't a server fingerprint. Check it with the server's operator."
-                    return@TextButton
+                    return@ProgressButton
                 }
                 val target = url.trim().trimEnd('/')
-                scope.launch {
+                work.run {
                     // Verify the server before switching: against the typed fingerprint, the built-in one, or the key it
                     // presents now (remembered from here on).
                     var learned: String? = null
@@ -594,7 +602,7 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                         } else {
                             "Couldn't reach that server."
                         }
-                        return@launch
+                        return@run
                     }
                     withContext(Dispatchers.IO) {
                         // Drop pooled mailboxes on the old server; new ones are created on the new server.
@@ -620,8 +628,17 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
  */
 @Composable
 private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
-    val scope = rememberCoroutineScope()
+    val work = rememberWork()
     val vault = Graph.vault
+    // Setting or removing it runs Argon2 and deletes the decoy profile: the dialog stays, busy, until that's done.
+    fun save(block: () -> Unit) {
+        work.run {
+            if (!s.decoy) {
+                withContext(Dispatchers.Default) { block() }
+            }
+            onDismiss()
+        }
+    }
     PinEntryDialog(
         "Duress PIN",
         "If someone forces you to unlock GoldfishSend, enter this PIN instead of your real one. You choose what it does afterwards: " +
@@ -629,16 +646,15 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         onDismiss = onDismiss,
         minLength = 4,
         removeLabel = if (on) "Remove" else null,
+        busy = work.busy,
+        busyText = "Saving…",
         onRemove = {
-            if (!s.decoy) {
-                scope.launch(Dispatchers.Default) {
-                    vault.setDuress(null)
-                    app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
-                    s.repo.kvPutString(AppLock.KV_DURESS_ON, null)
-                    s.db.notifyChanged()
-                }
+            save {
+                vault.setDuress(null)
+                app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
+                s.repo.kvPutString(AppLock.KV_DURESS_ON, null)
+                s.db.notifyChanged()
             }
-            onDismiss()
         },
         validate = { pin ->
             // Must differ from the real secret and from the hidden-chats PIN.
@@ -648,16 +664,16 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
             if (clash) "This must be different from your other PINs." else null
         },
     ) { pin ->
-        onDismiss()
-        scope.launch(Dispatchers.Default) {
-            if (!s.decoy) {
-                // A verifier only: the duress PIN can't decrypt anything real. A new PIN starts a fresh decoy profile.
-                vault.setDuress(pin)
-                app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
-                s.repo.kvPutString(AppLock.KV_DURESS_ON, "1")
-                s.db.notifyChanged()
-            }
+        if (s.decoy) {
             pin.fill('\u0000')
+        }
+        save {
+            // A verifier only: the duress PIN can't decrypt anything real. A new PIN starts a fresh decoy profile.
+            vault.setDuress(pin)
+            pin.fill('\u0000')
+            app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
+            s.repo.kvPutString(AppLock.KV_DURESS_ON, "1")
+            s.db.notifyChanged()
         }
     }
 }
@@ -665,26 +681,33 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
 /** Sets or removes the hidden-chats PIN. Removing it un-hides every hidden chat. */
 @Composable
 private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
-    val scope = rememberCoroutineScope()
+    val work = rememberWork()
     val vault = Graph.vault
+    fun save(block: () -> Unit) {
+        work.run {
+            if (!s.decoy) {
+                withContext(Dispatchers.Default) { block() }
+            }
+            onDismiss()
+        }
+    }
     PinEntryDialog(
         if (on) "Change hidden-chats PIN" else "Hidden chats",
         "Choose a PIN for hidden chats. Hide a chat from its contact info. To see hidden chats, long-press \"Chats\" and enter this PIN. " +
             "They're hidden again when GoldfishSend locks.",
         onDismiss = onDismiss,
         removeLabel = if (on) "Turn off" else null,
+        busy = work.busy,
+        busyText = "Saving…",
         onRemove = {
-            if (!s.decoy) {
-                scope.launch(Dispatchers.Default) {
-                    vault.setHiddenPin(null)
-                    for (id in s.repo.hiddenContactIds()) {
-                        s.repo.setHidden(id, false)
-                    }
-                    s.repo.kvPutString(AppLock.KV_HIDDEN_ON, null)
-                    s.db.notifyChanged()
+            save {
+                vault.setHiddenPin(null)
+                for (id in s.repo.hiddenContactIds()) {
+                    s.repo.setHidden(id, false)
                 }
+                s.repo.kvPutString(AppLock.KV_HIDDEN_ON, null)
+                s.db.notifyChanged()
             }
-            onDismiss()
         },
         validate = { pin ->
             val copy = pin.copyOf()
@@ -694,14 +717,14 @@ private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
             if (clash) "This must be different from your other PINs." else null
         },
     ) { pin ->
-        onDismiss()
-        scope.launch(Dispatchers.Default) {
-            if (!s.decoy) {
-                vault.setHiddenPin(pin)
-                s.repo.kvPutString(AppLock.KV_HIDDEN_ON, "1")
-                s.db.notifyChanged()
-            }
+        if (s.decoy) {
             pin.fill('\u0000')
+        }
+        save {
+            vault.setHiddenPin(pin)
+            pin.fill('\u0000')
+            s.repo.kvPutString(AppLock.KV_HIDDEN_ON, "1")
+            s.db.notifyChanged()
         }
     }
 }

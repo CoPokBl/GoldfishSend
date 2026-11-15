@@ -88,6 +88,19 @@ import app.goldfishsend.ui.components.StatusTicks
 import app.goldfishsend.ui.components.rememberQuery
 import app.goldfishsend.ui.components.shortTime
 import androidx.compose.foundation.clickable
+import androidx.activity.compose.BackHandler
+import android.view.inputmethod.EditorInfo
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SearchOff
+import androidx.compose.material3.CircularProgressIndicator
+import app.goldfishsend.ui.components.MailboxProgressBar
+import app.goldfishsend.ui.components.SecureTextField
+import app.goldfishsend.ui.components.rememberShowProgress
+import app.goldfishsend.ui.components.rememberWork
 
 enum class Tab { CHATS, SECURITY, SETTINGS }
 
@@ -144,6 +157,23 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
     // Hidden chats stay out of the list until the hidden-chats PIN was entered in this session.
     val chats = remember(allChats, revealed) { allChats?.filter { !it.hidden || revealed } }
     var askHiddenPin by remember { mutableStateOf(false) }
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    // Filters by name only: searching message text would mean decrypting every message.
+    var searching by rememberSaveable { mutableStateOf(false) }
+    var query by rememberSaveable { mutableStateOf("") }
+    fun closeSearch() {
+        // The field is an EditText: its keyboard doesn't go away with it by itself.
+        focus.clearFocus()
+        keyboard?.hide()
+        searching = false
+        query = ""
+    }
+    BackHandler(searching) { closeSearch() }
+    val shown = remember(chats, query) {
+        val q = query.trim()
+        if (q.isEmpty()) chats else chats?.filter { it.name.contains(q, ignoreCase = true) }
+    }
     val busy by Mailboxes.busy.collectAsState()
     val prefsVersion by Graph.prefs.version.collectAsState()
     val pushOk = prefsVersion.let { Graph.prefs.pushStatus == "ok" }
@@ -162,6 +192,11 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
                     )
                 },
                 actions = {
+                    if (!allChats.isNullOrEmpty()) {
+                        IconButton(onClick = { if (searching) closeSearch() else searching = true }) {
+                            Icon(if (searching) Icons.Rounded.SearchOff else Icons.Rounded.Search, if (searching) "Close search" else "Search chats")
+                        }
+                    }
                     IconButton(onClick = newGroup) { Icon(Icons.Rounded.GroupAdd, "New group") }
                 },
                 scrollBehavior = scroll,
@@ -179,34 +214,70 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
     ) { pad ->
         Column(Modifier.padding(top = pad.calculateTopPadding()).fillMaxSize()) {
             StatusLine(!pushOk && Graph.prefs.onboarded, "Notifications aren't connected yet. Check your push app.", action = null)
-            StatusLine(pushOk && busy && chats.isNullOrEmpty(), "Getting ready…")
+            val preparing = pushOk && busy && chats.isNullOrEmpty()
+            StatusLine(preparing, "Getting ready… The first time can take up to a minute.")
+            if (preparing) {
+                MailboxProgressBar()
+            }
             StatusLine(revealed, "Showing hidden chats", action = "Hide") { s.hiddenRevealed.value = false }
-            val list = chats
-            if (list != null && list.isEmpty()) {
+            AnimatedVisibility(searching, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+                SecureTextField(
+                    query, { query = it },
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    hint = "Search by name",
+                    shape = RoundedCornerShape(28.dp),
+                    imeAction = EditorInfo.IME_ACTION_SEARCH,
+                    // Not again when coming back from a chat opened from the results.
+                    requestFocus = query.isEmpty(),
+                )
+            }
+            val list = shown
+            if (list == null) {
+                // The first frame waits up to a second for the chats; after that, say we're on it.
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    if (rememberShowProgress(true)) {
+                        CircularProgressIndicator()
+                    }
+                }
+            } else if (list.isEmpty() && query.isNotBlank()) {
+                Text(
+                    "No chats named “${query.trim()}”",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(32.dp),
+                )
+            } else if (list.isEmpty()) {
                 EmptyChats(addContact)
-            } else if (list != null) {
+            } else {
                 // Not composed before the chats are loaded: rows arriving in an empty list would all fade in.
                 LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 96.dp)) {
                     items(list, key = { it.id }, contentType = { "chat" }) { c ->
-                        ChatRow(c, Modifier.animateItem()) { openChat(c.id) }
+                        ChatRow(c, Modifier.animateItem()) {
+                            // From a search: the search field's keyboard shouldn't follow into the chat.
+                            focus.clearFocus()
+                            keyboard?.hide()
+                            openChat(c.id)
+                        }
                     }
                 }
             }
         }
     }
     if (askHiddenPin) {
-        val scope = rememberCoroutineScope()
+        val work = rememberWork()
         PinEntryDialog(
-            "Enter PIN", "", onDismiss = { askHiddenPin = false }, minLength = 4, confirm = false,
+            "Enter PIN", "", onDismiss = { askHiddenPin = false }, minLength = 4, confirm = false, busy = work.busy,
         ) { pin ->
-            askHiddenPin = false
-            scope.launch(Dispatchers.Default) {
-                // Never revealed in a decoy session (opened with the duress PIN).
-                val ok = !s.decoy && Graph.vault.isHiddenPin(pin)
-                pin.fill('\u0000')
+            // The dialog closes the same way whether or not the PIN matched (or hidden chats exist).
+            work.run {
+                val ok = withContext(Dispatchers.Default) {
+                    // Never revealed in a decoy session (opened with the duress PIN).
+                    (!s.decoy && Graph.vault.isHiddenPin(pin)).also { pin.fill('\u0000') }
+                }
                 if (ok) {
                     s.hiddenRevealed.value = true
                 }
+                askHiddenPin = false
             }
         }
     }
@@ -289,7 +360,8 @@ internal data class ChatEntry(
             lastBody = c.lastBody,
             lastOutgoing = c.lastOutgoing,
             lastStatus = c.lastStatus,
-            time = shortTime(c.lastTs ?: c.contact.lastActivity),
+            // The chat's latest activity, which orders the list (a system line can be newer than the previewed message).
+            time = shortTime(maxOf(c.lastTs ?: 0L, c.contact.lastActivity)),
             groupState = groupState,
             sender = sender,
         )

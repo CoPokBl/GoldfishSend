@@ -52,6 +52,11 @@ class BenchSeedProvider : ContentProvider() {
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
         require(method == "seed") { "unknown method" }
+        // A call that starts the process can arrive (on a binder thread) before Application.onCreate has run.
+        var tries = 0
+        while (runCatching { Graph.app }.isFailure && tries++ < 500) {
+            Thread.sleep(10)
+        }
         runBlocking { seed(lock = arg == "pin") }
         return Bundle().apply { putString("result", "seeded") }
     }
@@ -96,7 +101,9 @@ class BenchSeedProvider : ContentProvider() {
             // The long conversation: the first contact, a few weeks of chatting.
             conversation(s, rnd, people[0], LONG_CHAT, now, null)
             people.drop(1).forEachIndexed { i, id ->
-                conversation(s, rnd, id, 3 + rnd.nextInt(25), now - (i + 1) * 47 * 60_000L, null)
+                val count = 3 + rnd.nextInt(25)
+                // One longer chat further down the list, to come back to with many unread messages.
+                conversation(s, rnd, id, if (i == 7) 90 else count, now - (i + 1) * 47 * 60_000L, null)
             }
         }
         val group = group(s, people.subList(1, 7))
@@ -107,9 +114,16 @@ class BenchSeedProvider : ContentProvider() {
         s.db.tx {
             s.db.exec("UPDATE messages SET read_at = ts WHERE outgoing = 0")
             s.db.exec("UPDATE contacts SET last_activity = COALESCE((SELECT MAX(ts) FROM messages WHERE contact_id = contacts.id), last_activity)")
-            // A few unread chats further down the list (the journeys open the first ones, which stay read).
+            // A few unread chats further down the list (the journeys open the first ones, which stay read): their last
+            // incoming messages are unread, the first with more than a screenful.
             for ((i, id) in people.drop(8).take(4).withIndex()) {
-                s.db.exec("UPDATE contacts SET unread = ? WHERE id = ?", i + 1, id)
+                val ids = s.db.query(
+                    "SELECT id FROM messages WHERE contact_id = ? AND outgoing = 0 ORDER BY ts DESC LIMIT ?", id, if (i == 0) 25 else i + 1,
+                ) { it.getString(0) }
+                for (m in ids) {
+                    s.db.exec("UPDATE messages SET read_at = NULL WHERE id = ?", m)
+                }
+                s.db.exec("UPDATE contacts SET unread = ? WHERE id = ?", ids.size, id)
             }
             // The group was created offline: drop what it queued for the invitees.
             s.db.exec("DELETE FROM outbox")
