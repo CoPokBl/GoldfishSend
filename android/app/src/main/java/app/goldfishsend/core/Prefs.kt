@@ -77,6 +77,13 @@ class Prefs(context: Context) {
         changed()
     }
 
+    /** For values that background work writes again and again: an unchanged value doesn't recompose every screen. */
+    private fun setStrIfChanged(key: String, v: String?) {
+        if (sp.getString(key, null) != v) {
+            setStr(key, v)
+        }
+    }
+
     var onboarded: Boolean
         get() = bool("onboarded", false)
         set(v) = setBool("onboarded", v)
@@ -177,7 +184,10 @@ class Prefs(context: Context) {
             } else {
                 e.putLong("presence_wall", v.wallMs).putLong("presence_elapsed", v.elapsedMs).putInt("presence_boot", v.bootCount)
             }
-            e.commit()
+            // Recorded on the UI thread every time the app comes to the foreground. apply() updates the value at once and
+            // writes it in the background; Android finishes the write before the activity is stopped. A synchronous
+            // commit() here blocked the UI thread for a disk write (about 25 ms on an emulator) at every start.
+            e.apply()
         }
 
     /** Set by a reboot wipe while locked: the locked-inbox key pair is replaced at the next unlock (after draining). */
@@ -214,12 +224,12 @@ class Prefs(context: Context) {
     /** Human-readable push status for the UI: ok / none / failed / pending. */
     var pushStatus: String
         get() = str("push_status") ?: "none"
-        set(v) = setStr("push_status", v)
+        set(v) = setStrIfChanged("push_status", v)
 
     /** Host of the current push endpoint (not the full URL), for the security audit. */
     var pushHost: String?
         get() = str("push_host")
-        set(v) = setStr("push_host", v)
+        set(v) = setStrIfChanged("push_host", v)
 
     // --- Security features (each one optional, see PLAN.md §11.10) ---
 

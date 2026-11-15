@@ -50,7 +50,7 @@ object Wiper {
             // No boot counter on this device: the broadcast is the only signal.
             fromBootBroadcast
         }
-        if (count != -1) {
+        if (count != -1 && count != prefs.lastBootCount) {
             prefs.lastBootCount = count
         }
         if (rebooted && prefs.wipeOnReboot && prefs.onboarded) {

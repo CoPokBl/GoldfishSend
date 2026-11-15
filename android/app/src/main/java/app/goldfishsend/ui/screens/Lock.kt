@@ -52,6 +52,7 @@ import app.goldfishsend.ui.components.ConfirmDialog
 import android.view.inputmethod.EditorInfo
 import kotlinx.coroutines.launch
 import androidx.activity.compose.LocalActivity
+import app.goldfishsend.ui.ContentReady
 
 @Composable
 fun LockScreen() {
@@ -131,6 +132,7 @@ fun LockScreen() {
         }
     }
 
+    ContentReady()
     LaunchedEffect(Unit) {
         when {
             screenLock -> tryScreenLock()
@@ -240,6 +242,9 @@ fun UnlockingSplash() {
         } else {
             AppLock.afterUnlock(s)
         }
+    }
+    if (failed) {
+        ContentReady()
     }
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

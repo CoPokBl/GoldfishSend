@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.signal.libsignal.protocol.ecc.ECPrivateKey
@@ -82,6 +83,11 @@ object Graph {
 
     fun init(application: Application) {
         app = application
+        // Application.onCreate reads all three preference files straight away. Each one loads on its own thread once
+        // requested, so asking for them together means the main thread waits for the slowest, not for the sum.
+        for (f in listOf("gf_prefs", "gf_vault", "gf_net_prefs")) {
+            application.getSharedPreferences(f, android.content.Context.MODE_PRIVATE)
+        }
         ServerApi.defaultState = NetPrefs.gatewayState
     }
 
@@ -147,7 +153,9 @@ object Graph {
      * Opens the decoy profile with a key derived only from the duress PIN. It has its own database, Signal identity and
      * message root (kept inside the decoy DB, never under the real Keystore aliases), and persists across duress unlocks.
      */
-    suspend fun openDecoySession(decoyKey: ByteArray): Session = unlockMutex.withLock {
+    suspend fun openDecoySession(decoyKey: ByteArray): Session = withContext(Dispatchers.IO) { openDecoy(decoyKey) }
+
+    private suspend fun openDecoy(decoyKey: ByteArray): Session = unlockMutex.withLock {
         _session.value?.let {
             decoyKey.wipe()
             return it
@@ -167,8 +175,13 @@ object Graph {
         s
     }
 
-    /** Opens the DB with MK. Takes ownership of [mk]. */
-    suspend fun openSession(mk: ByteArray): Session = unlockMutex.withLock {
+    /**
+     * Opens the DB with MK. Takes ownership of [mk]. Runs on the IO dispatcher whoever calls it: opening (and on first use
+     * creating) the database must never block the UI thread.
+     */
+    suspend fun openSession(mk: ByteArray): Session = withContext(Dispatchers.IO) { open(mk) }
+
+    private suspend fun open(mk: ByteArray): Session = unlockMutex.withLock {
         _session.value?.let {
             mk.wipe()
             return it
@@ -278,6 +291,12 @@ object Graph {
      * the device itself is unlocked). Used by background work and push handling.
      */
     suspend fun tryAutoUnlock(): Session? {
+        _session.value?.let { return if (it.decoy) null else it }
+        // The Keystore call and the database open stay off the UI thread (the unlocking screen calls this too).
+        return withContext(Dispatchers.IO) { autoUnlock() }
+    }
+
+    private suspend fun autoUnlock(): Session? {
         _session.value?.let { return if (it.decoy) null else it }
         if (!vault.isSetUp || vault.requiresUserUnlock) {
             return null

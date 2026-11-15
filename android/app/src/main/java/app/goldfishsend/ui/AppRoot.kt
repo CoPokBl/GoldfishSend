@@ -1,6 +1,8 @@
 package app.goldfishsend.ui
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -58,7 +60,13 @@ fun AppRoot(pendingLink: MutableStateFlow<String?>) {
             else -> RootState.UNLOCKING
         }
     }
-    AnimatedContent(state, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "root") { st ->
+    AnimatedContent(
+        state,
+        transitionSpec = {
+            if (FirstFrame.drawn) fadeIn() togetherWith fadeOut() else EnterTransition.None togetherWith ExitTransition.None
+        },
+        label = "root",
+    ) { st ->
         when (st) {
             RootState.ONBOARDING -> OnboardingFlow()
             RootState.LOCKED -> LockScreen()
