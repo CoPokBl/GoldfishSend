@@ -123,12 +123,77 @@ Don't commit `goldfish-dev-keys.json`, and never reuse development keys in produ
 To test against a local ntfy on `http://localhost`, set `Goldfish__Push__DangerouslyAllowInsecureLoopback=true`.
 This turns off parts of the SSRF protection, and the server refuses to start with it in Production.
 
-Tests: `dotnet test`. The integration tests use Testcontainers. With podman, start the socket first:
+### Tests
+
+`dotnet test` runs the unit tests. The integration tests (real MySQL and Redis, a fake push server) run when
+`GF_TEST_MYSQL` and `GF_TEST_REDIS` point at **disposable** instances, because the fixture drops the tables and
+flushes every Redis database:
 
 ```bash
-systemctl --user start podman.socket
-export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock TESTCONTAINERS_RYUK_DISABLED=true
+podman run -d --name gf-test-mysql -p 127.0.0.1:33306:3306 -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=goldfish \
+  docker.io/library/mysql:8.4 --skip-log-bin
+podman run -d --name gf-test-redis -p 127.0.0.1:36379:6379 docker.io/library/redis:7.4-alpine
+
+export GF_TEST_MYSQL="Server=127.0.0.1;Port=33306;User=root;Password=test;Database=goldfish"
+export GF_TEST_REDIS="127.0.0.1:36379"
+dotnet test                                   # everything, about 2.5 minutes
+dotnet test --filter "Category!=Chaos"        # without the chaos tests, about 30 seconds
+dotnet test --filter "Category=Chaos"         # only the chaos tests, about 2 minutes
 ```
+
+The integration tests bind extra loopback addresses (127.0.0.2 to 127.0.0.8) for push servers of their own, which
+Linux provides out of the box.
+
+- **Chaos tests** (`ChaosTests`, milestone M3): messages keep flowing while a push server refuses connections,
+  answers 5xx or times out, and while a worker node is killed with deliveries in flight and a fresh node takes over.
+  Nothing accepted is lost within its TTL, nothing is delivered after it, and idempotent retries get the original id.
+  The worker test waits out the real recovery timeouts (stream entries are reclaimed after a minute or more, retry
+  leases after 85 s), which is why it is slow.
+- **Abuse suite** (`AbuseTests`, plus parts of `EndToEndTests`, `GatewayTests`, `HardeningTests` and
+  `BatchSendTests`, milestone M4): proof of work, adaptive difficulty, per-address, per-network, per-mailbox and global
+  limits, verification pushes and the new-host budget, the per-host circuit breaker, the gateway flood guard, replay
+  cache and size limits, and SSRF checks at registration and at connect time.
+
+### Load testing
+
+`tools/LoadTest` drives a running server the way the app does: every call goes through the encrypted gateway, and it
+runs its own push server, so verification codes and messages come back to it. Each simulated client creates and
+verifies mailboxes (solving the proof of work), then loops over a mix of single sends (60%), group batch sends (15%),
+invite upload and fetch (10%), mailbox refreshes (10%) and `/v1/info` (5%), and deletes its mailboxes at the end. It
+reports throughput, p50/p95/p99 latency per operation, error and throttling counts, and the time from send to the push
+arriving, and exits non-zero when a threshold is breached (`--help` lists them).
+
+The server under test must run in Development with `Goldfish__Push__DangerouslyAllowInsecureLoopback=true` (pushes go
+to `http://127.0.0.1`), on the same machine as the tool, with the limits in
+[`tools/LoadTest/server.env`](tools/LoadTest/server.env) relaxed: every simulated client shares one address and every
+simulated phone one push host. That file also lowers the PoW difficulty. **Use a separate (existing) database and
+separate Redis databases**, since the run leaves queue, rate-limit and idempotency state behind.
+
+Smoke run, as CI would do it (about a minute; 8 clients, 45 s, 50 ms think time, fails on more than 1% errors, more
+than 5% throttled calls, a p95 above 1 s or under 99% of messages pushed back):
+
+```bash
+cd server
+dotnet build -c Release src/GoldfishSend.Api
+dotnet build -c Release tools/LoadTest
+api=src/GoldfishSend.Api/bin/Release/net10.0
+export Goldfish__Keys__ServerKey="$(dotnet $api/GoldfishSend.Api.dll keygen 2>/dev/null | jq -r .Goldfish.Keys.ServerKey)"
+export ConnectionStrings__MySql='Server=127.0.0.1;Port=3306;User=root;Password=…;Database=goldfish_load'
+export ConnectionStrings__Redis='127.0.0.1:6379,defaultDatabase=2'
+export ConnectionStrings__RedisEphemeral='127.0.0.1:6379,defaultDatabase=3'
+env $(grep -v '^#' tools/LoadTest/server.env | xargs) \
+  dotnet $api/GoldfishSend.Api.dll --contentRoot "$PWD/$api" --urls http://127.0.0.1:5299 &
+server=$!
+dotnet run --project tools/LoadTest -c Release --no-build -- --url http://127.0.0.1:5299 --smoke --json loadtest.json
+status=$?
+kill $server
+exit $status
+```
+
+The other keys come from `appsettings.Development.json`. The tool waits up to a minute for the server to answer. For a
+real load test, raise `--clients` and `--duration` (the defaults are 32 clients for 120 s with no think time). On a
+16-core desktop, 16 clients with no think time reach about 1,500 calls/s and 2,000 pushes/s with a p95 under 50 ms,
+with the server, MySQL, Redis and the tool on the same machine.
 
 ## Configuration reference
 

@@ -1,10 +1,13 @@
 using System.Buffers.Text;
+using System.Net;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text.Json;
 using GoldfishSend.Core.Crypto;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 using MySqlConnector;
 using StackExchange.Redis;
 
@@ -130,10 +133,71 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         await Push.DisposeAsync();
     }
 
-    // Client helpers that mirror what the Android app does.
+    /// <summary>
+    /// Starts another node against the same MySQL and Redis, with configuration overrides (Program reads the environment
+    /// when the host is built, which happens here).
+    /// </summary>
+    public static (WebApplicationFactory<Program> Factory, HttpClient Client) Node(Dictionary<string, string> overrides) {
+        var previous = overrides.ToDictionary(kv => kv.Key, kv => Environment.GetEnvironmentVariable(kv.Key));
+        foreach (var (k, v) in overrides) {
+            Environment.SetEnvironmentVariable(k, v);
+        }
+        try {
+            var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseEnvironment("Development"));
+            return (factory, GatewayHandler.Client(factory));
+        } finally {
+            foreach (var (k, v) in previous) {
+                Environment.SetEnvironmentVariable(k, v);
+            }
+        }
+    }
 
-    public async Task<(byte[] Challenge, byte[] Nonce)> SolvePowAsync() {
-        var response = await Client.PostAsync("/v1/pow/challenge", null);
+    /// <summary>
+    /// Starts a node that pretends every connection comes from a trusted proxy at 10.9.9.9, so tests can pick each
+    /// request's client address with <see cref="GatewayHandler.ForwardedFor"/> (or a raw <c>X-Forwarded-For</c>).
+    /// Use made-up addresses: rate-limit buckets are shared with every other node.
+    /// </summary>
+    public static WebApplicationFactory<Program> NodeBehindProxy(Dictionary<string, string> overrides) {
+        overrides = new Dictionary<string, string>(overrides) { ["Goldfish__Network__TrustedProxies__0"] = "10.9.9.9" };
+        var previous = overrides.ToDictionary(kv => kv.Key, kv => Environment.GetEnvironmentVariable(kv.Key));
+        foreach (var (k, v) in overrides) {
+            Environment.SetEnvironmentVariable(k, v);
+        }
+        try {
+            var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b => {
+                b.UseEnvironment("Development");
+                b.ConfigureServices(s => s.AddSingleton<IStartupFilter, ProxyAddressFilter>());
+            });
+            _ = factory.Services; // Build now, while the overrides are set.
+            return factory;
+        } finally {
+            foreach (var (k, v) in previous) {
+                Environment.SetEnvironmentVariable(k, v);
+            }
+        }
+    }
+
+    /// <summary>A gateway client of a <see cref="NodeBehindProxy"/> node whose requests come from <paramref name="address"/>.</summary>
+    public static HttpClient ClientFrom(WebApplicationFactory<Program> factory, string address) {
+        var client = GatewayHandler.Client(factory, out var handler);
+        handler.ForwardedFor = address;
+        return client;
+    }
+
+    private sealed class ProxyAddressFilter : IStartupFilter {
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app => {
+            app.Use((context, nextMiddleware) => {
+                context.Connection.RemoteIpAddress = IPAddress.Parse("10.9.9.9");
+                return nextMiddleware(context);
+            });
+            next(app);
+        };
+    }
+
+    // Client helpers that mirror what the Android app does. They use the fixture node unless given another client.
+
+    public async Task<(byte[] Challenge, byte[] Nonce)> SolvePowAsync(HttpClient? client = null) {
+        var response = await (client ?? Client).PostAsync("/v1/pow/challenge", null);
         response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
         var challenge = Base64Url.DecodeFromChars(json.GetProperty("challenge").GetString());
@@ -146,9 +210,10 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         public byte[] Tag => MailboxCrypto.Tag(SendSecret);
     }
 
-    public async Task<HttpResponseMessage> RequestMailboxAsync(byte[] sendSecret, byte[] ownerSecret, FakeDevice device, string? url = null) {
-        var (challenge, nonce) = await SolvePowAsync();
-        return await Client.PostAsJsonAsync("/v1/mailboxes", new {
+    public async Task<HttpResponseMessage> RequestMailboxAsync(
+        byte[] sendSecret, byte[] ownerSecret, FakeDevice device, string? url = null, HttpClient? client = null) {
+        var (challenge, nonce) = await SolvePowAsync(client);
+        return await (client ?? Client).PostAsJsonAsync("/v1/mailboxes", new {
             pow = new { challenge = B64(challenge), nonce = B64(nonce) },
             sendSecret = B64(sendSecret),
             ownerHash = B64(MailboxCrypto.OwnerHash(ownerSecret)),
@@ -185,7 +250,8 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         });
     }
 
-    public async Task<HttpResponseMessage> SendAsync(byte[] sendSecret, byte[] body, byte[]? idempotencyKey = null, int? ttl = null) {
+    public async Task<HttpResponseMessage> SendAsync(
+        byte[] sendSecret, byte[] body, byte[]? idempotencyKey = null, int? ttl = null, HttpClient? client = null) {
         using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/messages") {
             Content = Octets(body),
         };
@@ -196,7 +262,7 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         if (ttl is not null) {
             request.Headers.Add("GF-TTL", ttl.Value.ToString());
         }
-        return await Client.SendAsync(request);
+        return await (client ?? Client).SendAsync(request);
     }
 
     public async Task<long> ScalarAsync(string sql, object? param = null) {

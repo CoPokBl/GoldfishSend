@@ -50,9 +50,37 @@ public sealed class FakePushServer : IAsyncDisposable {
 
     public string BaseUrl { get; private set; } = "";
 
-    public async Task StartAsync() {
+    /// <param name="address">
+    /// Another loopback address (127.0.0.2, ...) makes this server a push host of its own, so its circuit breaker, pacing
+    /// and slow-lane state can't leak into tests that use the shared server on 127.0.0.1.
+    /// </param>
+    public Task StartAsync(string address = "127.0.0.1") => ListenAsync($"http://{address}:0");
+
+    /// <summary>Stops listening, so pushes fail with "connection refused". Devices are kept.</summary>
+    public async Task StopAsync() {
+        if (_app is not null) {
+            await _app.DisposeAsync();
+            _app = null;
+        }
+    }
+
+    /// <summary>Listens again on the same address and port, so existing endpoints work again.</summary>
+    public async Task RestartAsync() {
+        await StopAsync();
+        for (var attempt = 0; ; attempt++) {
+            try {
+                await ListenAsync(BaseUrl);
+                return;
+            } catch (IOException) when (attempt < 50) {
+                // The port of a listener that just closed can be briefly unavailable.
+                await Task.Delay(100);
+            }
+        }
+    }
+
+    private async Task ListenAsync(string url) {
         var builder = WebApplication.CreateSlimBuilder();
-        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.WebHost.UseUrls(url);
         builder.Logging.ClearProviders();
         _app = builder.Build();
         _app.MapPost("/push/{name}", async (string name, HttpRequest request) => {
@@ -61,7 +89,12 @@ public sealed class FakePushServer : IAsyncDisposable {
             }
             Interlocked.Increment(ref device.Attempts);
             if (device.DelayMs > 0) {
-                await Task.Delay(device.DelayMs);
+                // Like a real push server, it doesn't accept a request the sender gave up on (a timeout or a crash).
+                try {
+                    await Task.Delay(device.DelayMs, request.HttpContext.RequestAborted);
+                } catch (OperationCanceledException) {
+                    return Results.Empty;
+                }
             }
             if (device.Status is < 200 or >= 300) {
                 return Results.StatusCode(device.Status);
@@ -80,6 +113,9 @@ public sealed class FakePushServer : IAsyncDisposable {
                 return Results.StatusCode(413);
             }
             var plaintext = WebPushCrypto.Decrypt(ms.ToArray(), device.Key, device.Auth);
+            if (request.HttpContext.RequestAborted.IsCancellationRequested) {
+                return Results.Empty;
+            }
             await device.Received.Writer.WriteAsync(plaintext);
             return Results.StatusCode(201);
         });

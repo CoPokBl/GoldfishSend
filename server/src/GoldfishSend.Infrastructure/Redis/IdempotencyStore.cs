@@ -52,6 +52,12 @@ public sealed class IdempotencyStore {
         return new IdempotencyReservation(existing[0] == Done ? IdempotencyState.Done : IdempotencyState.Pending, id);
     }
 
+    /// <returns>The original message id if a send with this key was already queued, otherwise null. Changes nothing.</returns>
+    public async Task<byte[]?> GetDoneAsync(byte[] mailboxId, byte[] idempotencyKey) {
+        var existing = (byte[]?)await _redis.Db.StringGetAsync(await KeyAsync(mailboxId, idempotencyKey));
+        return existing is { Length: > 1 } && existing[0] == Done ? existing[1..] : null;
+    }
+
     public async Task MarkDoneAsync(byte[] mailboxId, byte[] idempotencyKey, byte[] messageId) {
         var key = await KeyAsync(mailboxId, idempotencyKey);
         // SET ... XX KEEPTTL, through a script so it works on any client API version.
