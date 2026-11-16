@@ -217,7 +217,7 @@ or a head we know changes, for every active member of our view:
   members keep answering each other's states in flight.
 
 Besides members:
-- **Joined, not taken in yet:** we owe the owner our acceptance, once per head of ours: through their card if we have
+- **Joined, not taken in yet:** we owe the owner our state (our acceptance in it), once per head of ours: through their card if we have
   it, else over 1:1. Once the owner shows a head ahead of ours, we ask instead. Until the owner takes us in we don't
   know who else is in, so we send nothing to the group (the app says it's waiting).
 - **Taken out:** a member the owner removes is owed the rosters that say so (from the head they last showed, or their
@@ -237,8 +237,10 @@ Invitees are outside delivery: they have no inbox in the group, and nobody but t
   any member who has shown no head.
 - **A withdrawn invitation** goes to them once, over 1:1. If that's lost, they find out when they accept: the owner
   answers (see "Accepting a fact"). If that answer is lost too, they stay waiting to be let in, until they leave.
-- **A decline that reaches an inviter who has left** is answered like an acceptance; the invitee then sends it on to
-  the owner that answer names, once.
+- **A decline that reaches an inviter who has left** is answered like an acceptance. The invitee then sends it on to
+  the owner that answer names, and to every member they can reach (that owner may have left too), once each.
+- **A pending member's acceptance** goes with their state: someone who accepted may be the only one to have heard that
+  the inviter left, and so who owns the group now.
 
 ## Message format
 

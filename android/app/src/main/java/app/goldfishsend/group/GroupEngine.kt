@@ -433,10 +433,16 @@ class GroupEngine(
         store.save(m)
     }
 
-    /** Joined, not admitted yet: our acceptance is owed to the owner, through their card if we have it, else over 1:1. */
+    /**
+     * Joined, not admitted yet: our state, with our acceptance in it, is owed to the owner, through their card if we have
+     * it, else over 1:1. It may tell them more than that we accepted: that they're the owner now, say, when the one who
+     * invited us left and only we heard.
+     */
     private fun oweAcceptance(m: GroupModel, v: View, mine: Head) {
-        val owner = v.owner ?: return
-        val acc = m.facts.lastOrNull { it.fact.id == me && it.fact.kind == FactKind.ACCEPT && it.fact.since == m.since } ?: return
+        val owner = v.owner?.takeIf { it != me } ?: return
+        if (m.facts.none { it.fact.id == me && it.fact.kind == FactKind.ACCEPT && it.fact.since == m.since }) {
+            return
+        }
         val ps = m.peers[owner] ?: PeerSync()
         // Once the owner shows a head ahead of ours, it has taken us in: what we lack is what it sends us, so we ask.
         val ahead = ps.acked?.let { Head.compare(mine, it) == -1 } == true
@@ -444,15 +450,20 @@ class GroupEngine(
         if (ps.sent == key) {
             return
         }
-        val content = if (ahead) Content.GState(m.gid, mine) else Content.GState(m.gid, mine, facts = listOf(acc.wire()))
-        if (send(m, owner, content)) {
+        val ok = if (ahead) {
+            send(m, owner, Content.GState(m.gid, mine))
+        } else {
+            states(m, mine, ps.acked?.v ?: (m.since - 1).coerceAtLeast(0), withCards = true).all { send(m, owner, it) }
+        }
+        if (ok) {
             m.peers[owner] = ps.copy(sent = key, sentAt = mine.key, sentN = 1, sentTs = io.nowMillis())
         }
     }
 
     /**
-     * Declined: our departure is owed to the owner, once each. It went to the one we knew when we declined; if they had
-     * left, their answer ([redirect]) names the one after them.
+     * Declined: our departure is owed to the owner. It went to the one we knew when we declined; if they had left, their
+     * answer ([redirect]) names the one after them, with their card. That may be out of date too (they may not have heard
+     * of every departure), so then it goes to every member we can reach, once each: whoever holds it passes it on.
      */
     private fun oweDecline(m: GroupModel, v: View, mine: Head) {
         val owner = v.owner?.takeIf { it != me } ?: return
@@ -460,10 +471,24 @@ class GroupEngine(
         if (m.peers[owner]?.sent == DECLINED) {
             return
         }
-        if (io.sendDirect(m.gid, owner, Content.GState(m.gid, mine, facts = listOf(dep.wire())))) {
-            m.peers[owner] = PeerSync(sent = DECLINED)
-            store.save(m)
+        val content = Content.GState(m.gid, mine, facts = listOf(dep.wire()))
+        for (id in listOf(owner) + v.ids().filter { it != me && it != owner && v.isActive(it) }) {
+            if (m.peers[id]?.sent == DECLINED) {
+                continue
+            }
+            val sent = when {
+                io.sendDirect(m.gid, id, content) -> true
+                m.cards[id] != null -> {
+                    io.sendGroup(m.gid, id, content)
+                    true
+                }
+                else -> false
+            }
+            if (sent) {
+                m.peers[id] = PeerSync(sent = DECLINED)
+            }
         }
+        store.save(m)
     }
 
     /**
@@ -879,7 +904,10 @@ class GroupEngine(
     /** A card for someone in our roster, if it's newer than the one we hold. */
     private fun addCard(m: GroupModel, card: SignedCard) {
         val id = card.card.id
-        if (card.card.g != m.gid || id == me || m.roster?.roster?.role(id) == null || m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
+        // Out of the group, we keep no cards, but for one: having declined, the owner's, to send them the decline.
+        val declined = m.state == GroupModel.LEFT && m.roster?.roster?.role(me) == Role.INVITED
+        val out = (m.state == GroupModel.LEFT && !declined) || m.state == GroupModel.REMOVED
+        if (card.card.g != m.gid || id == me || m.roster?.roster?.role(id) == null || out || (declined && id != m.view()?.owner)) {
             return
         }
         val existing = m.cards[id]

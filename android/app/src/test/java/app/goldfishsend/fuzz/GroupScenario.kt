@@ -153,6 +153,9 @@ class GroupScenario(private val seed: Long) {
                 return Failure("exception: delivering the rest: ${e.javaClass.simpleName}: ${e.message}", e)
             }
             rolledBack()?.let { return it }
+            for (p in peers) {
+                model(p)?.let { m -> log("${p.name}: state ${m.state}, ${m.view()?.let(::describe)}, cards ${m.cards.keys.map(::who)}") }
+            }
             return drops.takeIf { it.isNotEmpty() }?.let { Failure("dropped: $it") } ?: check() ?: afterwards()
                 ?: drops.takeIf { it.isNotEmpty() }?.let { Failure("dropped: $it") }
         } finally {
