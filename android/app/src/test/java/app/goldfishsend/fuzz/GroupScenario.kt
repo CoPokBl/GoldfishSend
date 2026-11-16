@@ -670,7 +670,10 @@ class GroupScenario(private val seed: Long) {
         }
         net.deliverAll()
         for (p in honest) {
-            val got = p.texts.drop(before.getValue(p)).filter { it.third.startsWith("late ") }
+            // Only what their own view says is out: someone who never heard of a departure (it was lost, and nobody who
+            // knows can reach them) takes the leaver for a member, as far as they know.
+            val view = model(p)?.view()
+            val got = p.texts.drop(before.getValue(p)).filter { it.third.startsWith("late ") && view?.isActive(it.second) != true }
             if (got.isNotEmpty()) {
                 return Failure("posted after leaving: ${p.name} took ${got.map { it.third }}")
             }

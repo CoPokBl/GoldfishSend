@@ -146,7 +146,8 @@ server.
 - **Residual:**
   - **Eventual consistency.** Membership can briefly differ between members while facts and rosters travel. Nothing
     is sent in the background: a group nobody writes in doesn't catch up, and what was lost (retention expiry) is
-    sent again only once someone writes.
+    sent again only once someone writes. A member whose copy of a departure was lost, and whom nobody who holds it
+    can reach, goes on taking the leaver's messages (the leaver still has their sessions) until they hear.
   - **Invitees** are reached over 1:1 only, by the owner. An acceptance, a decline or a withdrawn invitation that's
     lost isn't sent again: the invitee learns how things stand when they act (the owner answers an acceptance), and
     the owner when the invitee writes to them again.
