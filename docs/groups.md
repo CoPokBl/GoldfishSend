@@ -133,16 +133,17 @@ For a received roster R, with current roster C:
    - **Older rosters.** One at or below our version is old news and is ignored. A second roster at a version we hold
      means the owner equivocated. That includes a successor who sent a departure and went on signing.
    - **Rosters with a gap.** One further on is kept (at most 16 per version, 2 per signer), and we ask for what's in
-     between with `gsync`: from whoever sent it, and from the owner, once per gap an hour. Kept rosters that follow on
-     are taken as the gap fills. One kept like that is looked at again if it comes once more (as an invitation, say).
+     between with `gsync`: from whoever sent it, and from the owner, once per gap and member an hour. An ask that
+     couldn't go out (no card, not a contact) doesn't count. Kept rosters that follow on are taken as the gap fills. One kept like that is looked at again if it comes once more (as an invitation, say).
 4. **Diff the view before and after:**
    - **Members who went:** stop sending to them. A departure shows as "left", a removal as "removed".
      - Their card is kept only until what's already queued to them (the roster that took them out) is delivered. Then
        it is deleted, and so is their session once they're in no other group.
    - **If we were taken out:** mark the group "You were removed" and stop sending.
-   - **Once out** (removed, left or declined), a roster that lists us as `invited` with a newer `since` is a new
-     invitation. Like a first invitation, it's taken on the word of the owner who sent it over 1:1, even past a gap:
-     what happened while we were out isn't ours to know.
+   - **Once out** (removed, left or declined), or while only invited, a roster that lists us as `invited` with a newer
+     `since`, signed by its owner, is a new invitation. Like a first invitation, it's taken on its owner's word, even
+     past a gap: what happened while we were out isn't ours to know. That includes one we kept from beyond a gap
+     before we learnt we were out. (Not while we're in: then we follow the chain.)
    - **If anyone went:** rotate our group inbox. That means a new mailbox and a new card with a new `hintKey`, sent to
      the remaining members; the old mailbox is deleted after a 15-day drain.
 

@@ -539,6 +539,48 @@ class GroupStatefulTest {
         ),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest (input sync-ask-that-could-not-go-out): Carol, invited, missed rosters and asked the
+     * owner, who wasn't her contact, so the ask went nowhere; once she had joined, a new ask was suppressed as a repeat.
+     */
+    @Test
+    fun syncAskThatCouldNotGoOut() = scenario(
+        0L,
+        listOf(
+            Op(2, 0, 98, 0), Op(8, 21, 0, 0), Op(8, 2, 0, 0), Op(0, 94, 0, 0), Op(0, 36, 0, 0), Op(8, 125, 0, 0), Op(2, 0, 102, 0),
+            Op(0, 98, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(1, 78, 0, 0), Op(8, 78, 0, 0), Op(0, 82, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input reinvited-while-still-invited): Dave got his re-invitation past a gap
+     * before the roster that had taken him out (still invited, or joined); he took that, and the re-invitation was never
+     * looked at again. A kept re-invitation now counts once we're out.
+     */
+    @Test
+    fun reinvitedWhileStillInvited() {
+        scenario(
+            7L,
+            listOf(
+                Op(8, 223, 224, 0), Op(2, 0, 128, 0), Op(8, 0, 0, 0), Op(0, 31, 0, 0), Op(0, 64, 0, 0), Op(8, 255, 255, 0), Op(8, 255, 255, 0),
+                Op(8, 255, 255, 0), Op(8, 255, 255, 0), Op(8, 223, 255, 0), Op(3, 0, 28, 0), Op(8, 223, 224, 0), Op(2, 0, 128, 0), Op(1, 0, 0, 0),
+                Op(8, 0, 0, 0), Op(8, 255, 255, 0),
+            ),
+        )
+        scenario(
+            7L,
+            listOf(
+                Op(8, 223, 224, 0), Op(2, 0, 128, 0), Op(8, 0, 0, 0), Op(0, 31, 0, 0), Op(0, 64, 0, 0), Op(0, 8, 0, 0), Op(8, 255, 255, 0),
+                Op(8, 255, 255, 0), Op(8, 255, 255, 0), Op(8, 255, 255, 0), Op(8, 223, 255, 0), Op(3, 0, 28, 0), Op(8, 223, 224, 0),
+                Op(2, 0, 128, 0), Op(1, 0, 0, 0), Op(8, 255, 255, 0), Op(8, 255, 112, 111), Op(8, 0, 255, 0),
+            ),
+        )
+    }
+
+    /** Seed 3839: Mallory, the owner by succession, signed two rosters at one version (her forks): equivocation, safety only. */
+    @Test
+    fun seed3839OwnerEquivocates() = scenario(3839L, GroupScenario.generate(3839L, length(3839L)))
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

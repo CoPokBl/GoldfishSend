@@ -498,7 +498,7 @@ class GroupEngine(
             invitation(from, signed, direct)
             return
         }
-        onSignedRoster(m, signed, from, direct)
+        onSignedRoster(m, signed, from)
     }
 
     /** A roster for a group we don't know: an invitation if it came over 1:1 from the owner who signed it, listing us. */
@@ -529,22 +529,15 @@ class GroupEngine(
      * A roster for a group we know. The chain is linear: the next one (signed by the owner of ours) is taken; an older one
      * is old news; one further on means we missed some, so it's kept and we ask for what's in between.
      */
-    private fun onSignedRoster(m: GroupModel, signed: SignedRoster, from: String, direct: Boolean) {
+    private fun onSignedRoster(m: GroupModel, signed: SignedRoster, from: String) {
         val cur = m.roster ?: return
         val r = signed.roster
         // (One we kept from beyond a gap may come again, now as something we can use: it's looked at again.)
         if (r.ver <= cur.roster.ver) {
             return
         }
-        val mine = r.member(me)
-        if ((m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) && direct && r.by == from && r.owner == from &&
-            mine?.role == Role.INVITED && mine.since > m.since && r.ver > cur.roster.ver + 1
-        ) {
-            // Out of the group and invited again: like a first invitation, it's taken on its owner's word, gap or not (what
-            // we missed meanwhile isn't ours to know).
-            m.roster = signed
-            store.addHistory(m.gid, signed)
-            settle(m, null, r.by)
+        if (r.ver > cur.roster.ver + 1 && invitesAgain(m, signed)) {
+            reinvited(m, signed)
             return
         }
         if (r.ver == cur.roster.ver + 1) {
@@ -557,12 +550,29 @@ class GroupEngine(
         store.addHistory(m.gid, signed)
         dbg { "gap: v${r.ver} on v${cur.roster.ver}" }
         // Whoever sent it, and the owner: the sender may only be passing on a departure, from a leaver who's gone. Once
-        // per gap and member an hour.
+        // per gap and member an hour (an ask that couldn't go out, for lack of a way to reach them, doesn't count).
         for (id in setOfNotNull(from, m.view()?.owner) - me) {
-            if (askOnce("$me ${m.gid} ${cur.hashB64} $id", io.nowMillis())) {
-                requestSync(m, id, cur.roster.ver)
+            val key = "$me ${m.gid} ${cur.hashB64} $id"
+            if (!askedRecently(key, io.nowMillis()) && requestSync(m, id, cur.roster.ver)) {
+                askOnce(key, io.nowMillis())
             }
         }
+    }
+
+    /**
+     * Out of the group (or only invited, and taken out meanwhile), [r] lists us as invited in a newer stint, signed by its
+     * owner. Like a first invitation, it's taken on its owner's word, gap or not: what we missed meanwhile isn't ours to
+     * know. (Not while we're in: then the chain is ours to follow.)
+     */
+    private fun invitesAgain(m: GroupModel, r: SignedRoster): Boolean {
+        val mine = r.roster.member(me) ?: return false
+        return m.state != GroupModel.JOINED && r.roster.by == r.roster.owner && mine.role == Role.INVITED && mine.since > m.since
+    }
+
+    private fun reinvited(m: GroupModel, signed: SignedRoster) {
+        m.roster = signed
+        store.addHistory(m.gid, signed)
+        settle(m, null, signed.roster.by)
     }
 
     private fun validNext(cur: SignedRoster, next: SignedRoster): Boolean {
@@ -570,14 +580,18 @@ class GroupEngine(
         return RosterRules.validChild(cur.roster, next.roster, proof)
     }
 
-    /** Rosters we kept from beyond a gap that follow on now. */
+    /** Rosters we kept from beyond a gap that follow on now, or (now we're out) invite us again. */
     private fun followHeld(m: GroupModel) {
         while (true) {
             val cur = m.roster ?: return
-            val next = store.historySince(m.gid, cur.roster.ver).firstOrNull {
-                it.roster.ver == cur.roster.ver + 1 && it.roster.prev == cur.hashB64 && validNext(cur, it)
-            } ?: return
-            take(m, next)
+            val held = store.historySince(m.gid, cur.roster.ver)
+            val next = held.firstOrNull { it.roster.ver == cur.roster.ver + 1 && it.roster.prev == cur.hashB64 && validNext(cur, it) }
+            if (next != null) {
+                take(m, next)
+                continue
+            }
+            held.lastOrNull { invitesAgain(m, it) }?.let { reinvited(m, it) }
+            return
         }
     }
 
@@ -620,7 +634,7 @@ class GroupEngine(
         // A departure carries the newest roster the leaver had: it may be one we haven't seen (they signed it just before).
         for (w in f.last) {
             val r = GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) } ?: continue
-            onSignedRoster(store.load(c.g) ?: return, r, from, direct = false)
+            onSignedRoster(store.load(c.g) ?: return, r, from)
         }
         val m = store.load(c.g) ?: return
         val r = m.roster?.roster ?: return
@@ -932,13 +946,14 @@ class GroupEngine(
         }
     }
 
-    private fun requestSync(m: GroupModel, to: String, have: Long) {
+    /** Returns false if [to] can't be reached (no card, not a contact). */
+    private fun requestSync(m: GroupModel, to: String, have: Long): Boolean {
         val content = Content.GSync(m.gid, have)
         if (m.cards[to] != null && m.state == GroupModel.JOINED) {
             io.sendGroup(m.gid, to, content)
-        } else {
-            io.sendDirect(m.gid, to, content)
+            return true
         }
+        return io.sendDirect(m.gid, to, content)
     }
 
     /** Groups whose membership changed in this engine's calls, so their held messages may be deliverable now. */
@@ -1008,6 +1023,9 @@ class GroupEngine(
             }
             return true
         }
+
+        @Synchronized
+        private fun askedRecently(key: String, now: Long): Boolean = asked[key]?.let { now - it in 0 until ASK_AGAIN_MS } == true
 
         /** For tests: each scenario starts with a fresh process, as far as this goes. */
         @Synchronized

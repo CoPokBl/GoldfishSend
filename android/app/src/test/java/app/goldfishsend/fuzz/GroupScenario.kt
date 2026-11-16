@@ -437,9 +437,17 @@ class GroupScenario(private val seed: Long) {
     /** [p] is invited, and nobody honest still in [r] has them as a contact. */
     private fun unreachable(p: Peer, r: View): Boolean = honest.none { q -> q != p && r.isActive(q.id) && p.id in q.contacts }
 
+    /**
+     * Mallory, the owner at some point (next in line once others left), equivocated: two rosters of hers at one version,
+     * or rosters signed after a departure of hers.
+     */
     private fun equivocated(): Boolean {
+        val hers = honest.flatMap { p -> p.store.historySince(gid, 0).filter { it.roster.by == mallory.id } }.distinctBy { it.hashB64 }
+        if (hers.groupBy { it.roster.ver }.any { it.value.size > 1 }) {
+            return true
+        }
         val at = malloryLeftAt ?: return false
-        return honest.any { p -> p.store.historySince(gid, at).any { it.roster.by == mallory.id } }
+        return hers.any { it.roster.ver > at }
     }
 
     private fun liveness(r: View): Failure? {
