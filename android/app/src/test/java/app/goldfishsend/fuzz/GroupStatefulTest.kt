@@ -1,7 +1,6 @@
 package app.goldfishsend.fuzz
 
 import org.junit.Assert.fail
-import org.junit.Ignore
 import org.junit.Test
 
 /**
@@ -62,6 +61,10 @@ class GroupStatefulTest {
     }
 
     // ---------- found by randomScenarios, shrunk (see GroupFindingsTest for some of them written out) ----------
+    //
+    // Most of these were found under the earlier design, with admins and a fork rule (docs/groups-redesign.md), and say
+    // what went wrong then. The steps mean the same under the owner design (role changes are ownership transfers now),
+    // so each still runs, as a scenario its fix has to keep working.
 
     /** Bob joined before Alice's card reached him: his card went to no one, so nobody could write to him. */
     @Test
@@ -340,11 +343,11 @@ class GroupStatefulTest {
         scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 211, 0, 0), Op(3, 0, 16, 0)))
 
     /**
-     * Seed 2549 (and the forks fuzzer): Bob left before he heard Alice had made him an admin, then Alice left. Bob's
-     * departure lost the fork, and the only admin who could apply it is Bob, whose inbox is gone. Open: see
-     * docs/groups-redesign.md.
+     * Seed 2549 (and the forks fuzzer, inputs last-admin-departure-lost*): Bob left before he heard Alice had made him an
+     * admin, then Alice left. Bob's departure lost the fork, and the only admin who could apply it was Bob, whose inbox
+     * was gone. The case that showed the fork rule couldn't be patched; now Bob's departure is a fact, and the next member
+     * takes over.
      */
-    @Ignore("open: a departure that loses a fork can need its absent author (docs/groups-redesign.md)")
     @Test
     fun departureOfTheLastAdminLostAFork() = scenario(
         7L,
@@ -358,6 +361,28 @@ class GroupStatefulTest {
     @Test
     fun invitationLostToTheInvitersRemoval() =
         scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 56, 0, 0), Op(2, 0, 98, 0)))
+
+    /** Seed 2549 itself, shrunk under the fork rule (Mallory's forks around the same departures). */
+    @Test
+    fun seed2549() = scenario(
+        2549L,
+        listOf(
+            Op(2, 0, 138, 0), Op(11, 0, 0, 0), Op(12, 0, 0, 0), Op(8, 5, 0, 0), Op(12, 0, 0, 0), Op(8, 0, 0, 0), Op(12, 0, 0, 0),
+            Op(0, 101, 0, 0), Op(12, 0, 0, 0), Op(8, 0, 18, 248), Op(8, 84, 230, 185), Op(4, 0, 201, 0), Op(0, 178, 0, 0),
+            Op(1, 46, 0, 0), Op(1, 0, 0, 0),
+        ),
+    )
+
+    /** The scenario fuzzer's last finding under the fork rule (input removed-but-still-a-member): Carol out, yet a member. */
+    @Test
+    fun removedButStillAMember() = scenario(
+        1L,
+        listOf(
+            Op(2, 0, 98, 0), Op(8, 21, 94, 196), Op(0, 71, 0, 0), Op(3, 83, 0, 0), Op(0, 54, 0, 0), Op(0, 83, 0, 0), Op(2, 0, 102, 0),
+            Op(5, 0, 0, 0), Op(8, 0, 200, 0), Op(8, 229, 229, 229), Op(5, 0, 0, 254), Op(10, 29, 0, 1), Op(9, 0, 0, 0),
+            Op(8, 41, 125, 0), Op(8, 0, 136, 229), Op(11, 0, 0, 0), Op(0, 82, 0, 0), Op(4, 0, 38, 0),
+        ),
+    )
 
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 

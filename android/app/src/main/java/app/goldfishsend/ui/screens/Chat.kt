@@ -664,7 +664,7 @@ private class ChatGroup(val state: Int, val inviter: String, val names: Map<Stri
 
 private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val m = app.goldfishsend.core.Groups.model(s, cid) ?: return null
-    val r = m.roster?.roster ?: return null
+    val r = m.view() ?: return null
     val me = app.goldfishsend.core.Groups.me(s)
     // Members now, plus anyone who sent a message here and has since left (their name is remembered from their card).
     val senders = s.repo.db.query("SELECT DISTINCT sender_key FROM messages WHERE contact_id = ? AND sender_key IS NOT NULL", cid) { it.getString(0) }

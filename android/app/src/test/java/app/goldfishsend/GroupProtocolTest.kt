@@ -5,9 +5,12 @@ import app.goldfishsend.net.MessageBatch
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
+import app.goldfishsend.proto.Fact
+import app.goldfishsend.proto.FactKind
 import app.goldfishsend.proto.GroupBlob
 import app.goldfishsend.proto.GroupCrypto
 import app.goldfishsend.proto.GroupJson
+import app.goldfishsend.proto.Membership
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.Rand
 import app.goldfishsend.proto.Role
@@ -15,6 +18,8 @@ import app.goldfishsend.proto.Roster
 import app.goldfishsend.proto.RosterMember
 import app.goldfishsend.proto.RosterOp
 import app.goldfishsend.proto.RosterRules
+import app.goldfishsend.proto.Signed
+import app.goldfishsend.proto.SignedFact
 import app.goldfishsend.proto.SignedRoster
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -25,7 +30,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.signal.libsignal.protocol.IdentityKeyPair
 
-/** Group wire formats and roster rules (docs/groups.md). */
+/** Group wire formats, roster rules and facts (docs/groups.md). */
 class GroupProtocolTest {
     private val a = IdentityKeyPair.generate()
     private val b = IdentityKeyPair.generate()
@@ -39,11 +44,10 @@ class GroupProtocolTest {
         ver: Long = 1,
         prev: String = "",
         by: String = ida,
-        members: List<RosterMember> = listOf(RosterMember(ida, Role.ADMIN), RosterMember(idb, Role.MEMBER), RosterMember(idc, Role.INVITED)),
+        members: List<RosterMember> = listOf(RosterMember(ida, Role.OWNER, 1), RosterMember(idb, Role.MEMBER, 1), RosterMember(idc, Role.INVITED, 1)),
         name: String = "Group",
         timer: Long = 0,
-        adminsOnly: Boolean = true,
-    ) = Roster(g = g, ver = ver, prev = prev, name = name, timer = timer, adminsOnly = adminsOnly, members = members, by = by, ts = 1)
+    ) = Roster(g = g, ver = ver, prev = prev, name = name, timer = timer, members = members, by = by, ts = 1)
 
     private fun keyOf(id: String) = when (id) {
         ida -> a
@@ -53,8 +57,11 @@ class GroupProtocolTest {
 
     private fun signed(r: Roster) = GroupCrypto.signRoster(keyOf(r.by).privateKey, r)
 
-    private fun next(base: SignedRoster, change: (Roster) -> Roster, by: String = ida): SignedRoster =
-        signed(RosterRules.successor(base, change(base.roster), by, 2))
+    private fun next(base: SignedRoster, change: (Roster) -> Roster, by: String = ida, proof: List<SignedFact> = emptyList()): SignedRoster =
+        signed(RosterRules.successor(base, change(base.roster), by, 2, proof.map { it.wire() }))
+
+    private fun fact(id: String, kind: String, since: Long = 1, last: SignedRoster? = null) =
+        GroupCrypto.signFact(keyOf(id).privateKey, Fact(g = g, kind = kind, id = id, since = since, ts = 1, last = last?.wire()))
 
     // --- signatures ---
 
@@ -69,6 +76,21 @@ class GroupProtocolTest {
         // Signed by someone other than `by`.
         val forged = GroupCrypto.signRoster(b.privateKey, roster(by = ida))
         assertNull(GroupCrypto.openRoster(forged.bytes, forged.sig))
+    }
+
+    @Test
+    fun factSignatureAndFormAreChecked() {
+        val f = fact(idb, FactKind.LEAVE)
+        assertNotNull(GroupCrypto.openFact(f.bytes, f.sig))
+        // Signed by someone other than its member.
+        val forged = GroupCrypto.signFact(a.privateKey, f.fact)
+        assertNull(GroupCrypto.openFact(forged.bytes, forged.sig))
+        // A kind we don't know, a stint before the first roster, a roster on an acceptance, an unreadable roster.
+        for (bad in listOf(f.fact.copy(kind = "own"), f.fact.copy(since = 0), f.fact.copy(kind = FactKind.ACCEPT, last = signed(roster()).wire()),
+            f.fact.copy(last = Signed("AAAA", "AAAA")))) {
+            val x = GroupCrypto.signFact(b.privateKey, bad)
+            assertNull(GroupCrypto.openFact(x.bytes, x.sig))
+        }
     }
 
     @Test
@@ -130,119 +152,123 @@ class GroupProtocolTest {
     fun wellFormed() {
         assertTrue(RosterRules.wellFormed(roster(), g))
         assertFalse(RosterRules.wellFormed(roster(), B64.enc(Rand.bytes(32))))
-        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.MEMBER))), g))
-        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.ADMIN), RosterMember(ida, Role.MEMBER))), g))
-        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, "owner"))), g))
-        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.ADMIN), RosterMember("junk", Role.MEMBER))), g))
+        // Exactly one owner.
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.MEMBER, 1))), g))
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.OWNER, 1), RosterMember(idb, Role.OWNER, 1))), g))
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.OWNER, 1), RosterMember(ida, Role.MEMBER, 1))), g))
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, "admin", 1))), g))
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.OWNER, 1), RosterMember("junk", Role.MEMBER, 1))), g))
+        // A stint can't start after the roster, or before the first.
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.OWNER, 2))), g))
+        assertFalse(RosterRules.wellFormed(roster(members = listOf(RosterMember(ida, Role.OWNER, 0))), g))
         assertFalse(RosterRules.wellFormed(roster(name = "   "), g))
         assertFalse(RosterRules.wellFormed(roster(timer = -1), g))
         assertFalse(RosterRules.wellFormed(roster(ver = 2, prev = ""), g))
-        val many = listOf(RosterMember(ida, Role.ADMIN)) + (1..100).map { RosterMember(B64.enc(IdentityKeyPair.generate().publicKey.serialize()), Role.MEMBER) }
+        // The first roster is its owner's own.
+        assertFalse(RosterRules.wellFormed(roster(by = idb), g))
+        val many = listOf(RosterMember(ida, Role.OWNER, 1)) + (1..100).map { RosterMember(B64.enc(IdentityKeyPair.generate().publicKey.serialize()), Role.MEMBER, 1) }
         assertFalse(RosterRules.wellFormed(roster(members = many), g))
         assertTrue(RosterRules.wellFormed(roster(members = many.take(100)), g))
     }
 
-    // --- authority ---
+    // --- authority and succession ---
 
     @Test
-    fun authority() {
-        val base = roster()
-        // An admin may do anything.
-        assertTrue(RosterRules.authorized(base, base.copy(members = base.members.filter { it.id != idb }, by = ida)))
-        // A member may not remove someone else, promote themselves, or add people.
-        assertFalse(RosterRules.authorized(base, base.copy(members = base.members.filter { it.id != idc }, by = idb)))
-        assertFalse(
-            RosterRules.authorized(base, base.copy(members = base.members.map { if (it.id == idb) it.copy(role = Role.ADMIN) else it }, by = idb)),
-        )
-        // Anyone may leave.
-        assertTrue(RosterRules.authorized(base, base.copy(members = base.members.filter { it.id != idb }, by = idb)))
-        // An invitee may accept (to member, not admin) or decline.
-        assertTrue(
-            RosterRules.authorized(base, base.copy(members = base.members.map { if (it.id == idc) it.copy(role = Role.MEMBER) else it }, by = idc)),
-        )
-        assertFalse(
-            RosterRules.authorized(base, base.copy(members = base.members.map { if (it.id == idc) it.copy(role = Role.ADMIN) else it }, by = idc)),
-        )
-        assertTrue(RosterRules.authorized(base, base.copy(members = base.members.filter { it.id != idc }, by = idc)))
-        // Name and timer: admins only, unless adminsOnly is off; never together with a membership change.
-        assertFalse(RosterRules.authorized(base, base.copy(name = "New", by = idb)))
-        val open = base.copy(adminsOnly = false)
-        assertTrue(RosterRules.authorized(open, open.copy(name = "New", timer = 60, by = idb)))
-        assertFalse(RosterRules.authorized(open, open.copy(adminsOnly = true, by = idb)))
-        assertFalse(RosterRules.authorized(open, open.copy(name = "New", by = idc)))
-        assertFalse(RosterRules.authorized(open, open.copy(name = "New", members = open.members.filter { it.id != idc }, by = idb)))
-        // Strangers can't do anything.
-        val stranger = B64.enc(IdentityKeyPair.generate().publicKey.serialize())
-        assertFalse(RosterRules.authorized(base, base.copy(by = stranger)))
-    }
-
-    // --- ordering ---
-
-    @Test
-    fun aChildIsOneVersionOnAndAllowed() {
+    fun onlyTheOwnerSignsTheNextRoster() {
         val v1 = signed(roster())
         val v2 = next(v1, { it.copy(name = "Renamed") })
-        assertTrue(RosterRules.validChild(v1.roster, v2.roster))
-        assertFalse(RosterRules.validChild(v2.roster, v1.roster))
+        assertTrue(RosterRules.validChild(v1.roster, v2.roster, emptyList()))
+        assertFalse(RosterRules.validChild(v2.roster, v1.roster, emptyList()))
         // Skipping versions isn't a child.
-        assertFalse(RosterRules.validChild(v1.roster, v2.roster.copy(ver = 5)))
-        // A member's change to others isn't allowed; their own departure is.
-        val kick = next(v2, { r -> r.copy(members = r.members.filter { it.id != idc }) }, by = idb)
-        assertFalse(RosterRules.validChild(v2.roster, kick.roster))
-        val leave = next(v2, { r -> r.copy(members = r.members.filter { it.id != idb }) }, by = idb)
-        assertTrue(RosterRules.validChild(v2.roster, leave.roster))
+        assertFalse(RosterRules.validChild(v1.roster, v2.roster.copy(ver = 5), emptyList()))
+        // A member can't sign one, not even to leave or rename; an invitee can't either.
+        assertFalse(RosterRules.validChild(v1.roster, next(v1, { it.copy(name = "Mine") }, by = idb).roster, emptyList()))
+        assertFalse(RosterRules.validChild(v1.roster, next(v1, { r -> r.copy(members = r.members.filter { it.id != idc }) }, by = idc).roster, emptyList()))
+        // Stints carry over; a new one starts at the roster's version, as an invitation.
+        assertFalse(RosterRules.validChild(v1.roster, next(v1, { r -> r.copy(members = r.members.map { if (it.id == idb) it.copy(since = 2) else it }) }).roster, emptyList()))
+        val stranger = B64.enc(IdentityKeyPair.generate().publicKey.serialize())
+        assertTrue(RosterRules.validChild(v1.roster, next(v1, { r -> r.copy(members = r.members + RosterMember(stranger, Role.INVITED, 2)) }).roster, emptyList()))
+        assertFalse(RosterRules.validChild(v1.roster, next(v1, { r -> r.copy(members = r.members + RosterMember(stranger, Role.MEMBER, 2)) }).roster, emptyList()))
     }
 
     @Test
-    fun forkChoice() {
-        val v1 = signed(roster(members = listOf(RosterMember(ida, Role.ADMIN), RosterMember(idb, Role.ADMIN), RosterMember(idc, Role.MEMBER))))
-        val x = next(v1, { it.copy(name = "By A") }, by = ida)
-        val y = next(v1, { it.copy(timer = 60) }, by = idb)
-        // Two admins: the larger hash, and both sides agree.
-        val xWins = RosterRules.beats(v1.roster, listOf(x), listOf(y))
-        assertEquals(!xWins, RosterRules.beats(v1.roster, listOf(y), listOf(x)))
-        assertEquals(RosterRules.compareUnsigned(x.hash, y.hash) > 0, xWins)
-        // A member's branch never outweighs an admin's, however long.
-        val open = signed(roster(members = v1.roster.members, adminsOnly = false))
-        val byAdmin = next(open, { it.copy(name = "Admin") }, by = ida)
-        var byMember = next(open, { it.copy(name = "Member 1") }, by = idc)
-        val chain = mutableListOf(byMember)
-        repeat(5) { i ->
-            byMember = next(byMember, { it.copy(name = "Member ${i + 2}") }, by = idc)
-            chain += byMember
-        }
-        assertTrue(RosterRules.beats(open.roster, listOf(byAdmin), chain))
-        assertFalse(RosterRules.beats(open.roster, chain, listOf(byAdmin)))
-        // Taking out the other branch's author wins, even against an admin.
-        val kickB = next(v1, { r -> r.copy(members = r.members.filter { it.id != idb }) }, by = ida)
-        assertTrue(RosterRules.beats(v1.roster, listOf(kickB), listOf(y)))
-        assertFalse(RosterRules.beats(v1.roster, listOf(y), listOf(kickB)))
+    fun theNextMemberTakesOverFromAnOwnerWhoLeft() {
+        val v1 = signed(roster())
+        val aLeft = fact(ida, FactKind.LEAVE)
+        // Bob is next: with Alice's departure as proof, his roster follows.
+        val takeover = next(v1, { r -> r.copy(members = r.members.filter { it.id != ida }.map { if (it.id == idb) it.copy(role = Role.OWNER) else it }) }, by = idb, proof = listOf(aLeft))
+        assertTrue(RosterRules.validChild(v1.roster, takeover.roster, listOf(aLeft.fact)))
+        // Not without the proof, and not with a proof that still lists her.
+        assertFalse(RosterRules.validChild(v1.roster, takeover.roster, emptyList()))
+        val keeps = next(v1, { r -> r.copy(members = r.members.map { if (it.id == idb) it.copy(role = Role.OWNER) else if (it.id == ida) it.copy(role = Role.MEMBER) else it }) }, by = idb, proof = listOf(aLeft))
+        assertFalse(RosterRules.validChild(v1.roster, keeps.roster, listOf(aLeft.fact)))
+        // Carol (invited) is never next, even if she accepted: only departures decide who is.
+        val cTakes = next(v1, { r -> r.copy(members = r.members.filter { it.id != ida }) }, by = idc, proof = listOf(aLeft))
+        assertFalse(RosterRules.validChild(v1.roster, cTakes.roster, listOf(aLeft.fact)))
+        assertEquals(idb, Membership.owner(v1.roster, listOf(aLeft.fact, fact(idc, FactKind.ACCEPT).fact)))
+        // Bob's departure as well: nobody's next (Carol is still invited).
+        assertNull(Membership.owner(v1.roster, listOf(aLeft.fact, fact(idb, FactKind.LEAVE).fact)))
+        // Someone's own departure is no proof they're next.
+        val bLeft = fact(idb, FactKind.LEAVE)
+        assertFalse(RosterRules.validChild(v1.roster, next(v1, { it.copy(name = "x") }, by = idb, proof = listOf(bLeft)).roster, listOf(bLeft.fact)))
+    }
+
+    @Test
+    fun factsApplyToTheirStintOnly() {
+        val v1 = roster()
+        val v = Membership.view(v1, listOf(fact(idb, FactKind.LEAVE).fact, fact(idc, FactKind.ACCEPT).fact))
+        assertNull(v.role(idb))
+        assertEquals(Role.MEMBER, v.role(idc))
+        assertEquals(ida, v.owner)
+        // A fact about another stint (an old one, replayed) doesn't apply; nor does accepting as a member.
+        val later = v1.copy(ver = 5, members = v1.members.map { if (it.id == idb) it.copy(since = 4) else it })
+        assertFalse(Membership.applies(later, fact(idb, FactKind.LEAVE).fact))
+        assertTrue(Membership.stale(later, fact(idb, FactKind.LEAVE).fact))
+        assertFalse(Membership.applies(v1, fact(idb, FactKind.ACCEPT).fact))
+        // One about a stint our roster doesn't reach yet isn't stale: it waits.
+        assertFalse(Membership.stale(v1, fact(idb, FactKind.LEAVE, since = 3).fact))
+        // A departure carrying a roster newer than ours waits for ours to catch up.
+        val v3 = signed(roster(ver = 3, prev = "x"))
+        assertFalse(Membership.applies(v1, fact(idb, FactKind.LEAVE, last = v3).fact))
+        assertFalse(Membership.stale(v1, fact(idb, FactKind.LEAVE, last = v3).fact))
+        assertTrue(Membership.applies(v1.copy(ver = 3), fact(idb, FactKind.LEAVE, last = v3).fact))
+    }
+
+    @Test
+    fun foldingTakesTheFactsIn() {
+        val v1 = roster()
+        val facts = listOf(fact(ida, FactKind.LEAVE).fact, fact(idc, FactKind.ACCEPT).fact)
+        val folded = Membership.fold(v1, facts, idb)
+        assertEquals(listOf(RosterMember(idb, Role.OWNER, 1), RosterMember(idc, Role.MEMBER, 1)), folded.members)
+        assertEquals(listOf(ida), Membership.departures(v1, facts).map { it.id })
     }
 
     @Test
     fun opsApply() {
         val r = roster()
-        assertEquals(Role.INVITED, RosterOp.Add(listOf(B64.enc(IdentityKeyPair.generate().publicKey.serialize()))).apply(r, ida)!!.members.last().role)
-        assertNull(RosterOp.Add(listOf(idb)).apply(r, ida))
-        assertNull(RosterOp.Remove(listOf(ida)).apply(r, ida))
-        assertEquals(2, RosterOp.Remove(listOf(idb)).apply(r, ida)!!.members.size)
-        assertNull(RosterOp.SetRole(idc, Role.ADMIN).apply(r, ida))
-        assertEquals(Role.ADMIN, RosterOp.SetRole(idb, Role.ADMIN).apply(r, ida)!!.role(idb))
-        assertNull(RosterOp.Meta(name = "Group").apply(r, ida))
-        assertEquals(Role.MEMBER, RosterOp.Accept.apply(r, idc)!!.role(idc))
-        assertNull(RosterOp.Accept.apply(r, idb))
-        assertNull(RosterOp.Leave.apply(r, B64.enc(IdentityKeyPair.generate().publicKey.serialize())))
-        for (op in listOf(RosterOp.Add(listOf(idb)), RosterOp.Remove(listOf(idc)), RosterOp.SetRole(idb, Role.ADMIN), RosterOp.Meta("x", 1, false), RosterOp.Leave, RosterOp.Accept)) {
-            assertEquals(op, RosterOp.decode(op.encode()))
-        }
+        val stranger = B64.enc(IdentityKeyPair.generate().publicKey.serialize())
+        assertEquals(RosterMember(stranger, Role.INVITED, 2), RosterOp.Add(listOf(stranger)).apply(r, ida, 2)!!.members.last())
+        assertNull(RosterOp.Add(listOf(idb)).apply(r, ida, 2))
+        assertNull(RosterOp.Remove(listOf(ida)).apply(r, ida, 2))
+        assertEquals(2, RosterOp.Remove(listOf(idb)).apply(r, ida, 2)!!.members.size)
+        // Ownership goes to a member, not an invitee; the old owner stays on as a member.
+        assertNull(RosterOp.MakeOwner(idc).apply(r, ida, 2))
+        val handed = RosterOp.MakeOwner(idb).apply(r, ida, 2)!!
+        assertEquals(idb, handed.owner)
+        assertEquals(Role.MEMBER, handed.role(ida))
+        assertNull(RosterOp.MakeOwner(idc).apply(handed, idb, 3))
+        assertNull(RosterOp.MakeOwner(idc).apply(handed, ida, 3))
+        assertNull(RosterOp.Meta(name = "Group").apply(r, ida, 2))
+        assertEquals(60L, RosterOp.Meta(timer = 60).apply(r, ida, 2)!!.timer)
     }
 
     @Test
     fun rosterJsonIsCanonical() {
         val r = roster()
         val json = GroupJson.encodeToString(Roster.serializer(), r)
-        assertTrue(json.contains("\"v\":1"))
-        assertTrue(json.contains("\"adminsOnly\":true"))
+        assertTrue(json.contains("\"v\":2"))
+        assertTrue(json.contains("\"proof\":[]"))
+        assertTrue(json.contains("\"since\":1"))
     }
 
     // --- chunking and batches ---

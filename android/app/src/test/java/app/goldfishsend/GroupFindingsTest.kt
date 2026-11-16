@@ -3,11 +3,12 @@ package app.goldfishsend
 import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupModel
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.FactKind
 import app.goldfishsend.proto.GroupCrypto
 import app.goldfishsend.proto.Rand
 import app.goldfishsend.proto.Role
 import app.goldfishsend.proto.RosterOp
-import app.goldfishsend.proto.SignedRoster
+import app.goldfishsend.proto.SignedFact
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -28,33 +29,37 @@ class GroupFindingsTest {
         alice.befriend(dave)
     }
 
-    private fun mine(p: Peer, by: Peer): SignedRoster = p.store.historySince(gid, 0).last { it.roster.by == by.id }
+    /** [p]'s own fact of [kind] (they hold it until it's folded into a roster). */
+    private fun factOf(p: Peer, kind: String): SignedFact = p.model(gid).facts.last { it.fact.id == p.id && it.fact.kind == kind }
 
     private fun everyone(vararg ps: Peer, check: (Peer) -> Unit) = ps.forEach(check)
 
-    /** Bob is an admin who never saw Dave's first stint, so an old acceptance replayed to him looked current. */
+    /**
+     * Bob (an admin then, the owner now) never saw Dave's first stint, so an old acceptance replayed to him looked
+     * current. Facts name their stint: an old one does nothing.
+     */
     @Test
     fun aReplayedOldAcceptanceDoesNotAdmitAnInvitee() {
         alice.create(gid, "Trip", bob, dave)
         net.deliverAll()
         bob.join(gid)
         dave.join(gid)
+        val oldAcceptance = factOf(dave, FactKind.ACCEPT)
         net.deliverAll()
-        val oldAcceptance = mine(alice, dave)
         alice.publish(gid, RosterOp.Remove(listOf(dave.id)))
         net.deliverAll()
         alice.publish(gid, RosterOp.Add(listOf(dave.id)))
-        alice.publish(gid, RosterOp.SetRole(bob.id, Role.ADMIN))
+        alice.publish(gid, RosterOp.MakeOwner(bob.id))
         net.deliverAll()
         // Anyone who kept it (a member, a removed member) sends it to Bob again.
-        bob.engine.onDirect(alice.id, GroupEngine.rosterContent(oldAcceptance))
+        bob.engine.onDirect(alice.id, GroupEngine.factContent(oldAcceptance))
         net.deliverAll()
-        everyone(alice, bob) { assertEquals(it.name, Role.INVITED, it.roster(gid).roster.role(dave.id)) }
+        everyone(alice, bob) { assertEquals(it.name, Role.INVITED, it.view(gid).role(dave.id)) }
         assertEquals(GroupModel.INVITED, dave.model(gid).state)
         // And Dave can still join.
         dave.join(gid)
         net.deliverAll()
-        everyone(alice, bob) { assertEquals(Role.MEMBER, it.roster(gid).roster.role(dave.id)) }
+        everyone(alice, bob) { assertEquals(Role.MEMBER, it.view(gid).role(dave.id)) }
     }
 
     @Test
@@ -65,16 +70,16 @@ class GroupFindingsTest {
         carol.join(gid)
         net.deliverAll()
         carol.engine.leave(carol.model(gid))
+        val oldDeparture = factOf(carol, FactKind.LEAVE)
         net.deliverAll()
-        val oldDeparture = mine(alice, carol)
         alice.publish(gid, RosterOp.Add(listOf(carol.id)))
-        alice.publish(gid, RosterOp.SetRole(bob.id, Role.ADMIN))
+        alice.publish(gid, RosterOp.MakeOwner(bob.id))
         net.deliverAll()
         carol.join(gid)
         net.deliverAll()
-        bob.engine.onDirect(alice.id, GroupEngine.rosterContent(oldDeparture))
+        bob.engine.onDirect(alice.id, GroupEngine.factContent(oldDeparture))
         net.deliverAll()
-        everyone(alice, bob, carol) { assertEquals(it.name, Role.MEMBER, it.roster(gid).roster.role(carol.id)) }
+        everyone(alice, bob, carol) { assertEquals(it.name, Role.MEMBER, it.view(gid).role(carol.id)) }
     }
 
     /** Signed, so it passed every check, but no one could start a session from it. */
@@ -123,13 +128,12 @@ class GroupFindingsTest {
     }
 
     /**
-     * The same, when the withdrawal never reaches Bob (Carol, an admin who isn't his contact, removed him). He joins, and
-     * the inviter's answer to his sync tells him. (Repeated: his acceptance and the removal are concurrent, and either can
-     * have the larger hash.)
+     * The same, when the withdrawal never reaches Bob (Carol, the owner now and not his contact, removed him). He joins,
+     * and the inviter's answer to his sync tells him.
      */
     @Test
     fun joiningAWithdrawnInvitationEndsInRemoved() {
-        repeat(8) {
+        repeat(2) {
             val net = GroupNet()
             val alice = net.peer("alice")
             val bob = net.peer("bob")
@@ -140,7 +144,7 @@ class GroupFindingsTest {
             net.deliverAll()
             carol.join(gid)
             net.deliverAll()
-            alice.publish(gid, RosterOp.SetRole(carol.id, Role.ADMIN))
+            alice.publish(gid, RosterOp.MakeOwner(carol.id))
             net.deliverAll()
             carol.publish(gid, RosterOp.Remove(listOf(bob.id)))
             net.deliverAll()
@@ -148,51 +152,51 @@ class GroupFindingsTest {
             bob.join(gid)
             net.deliverAll()
             assertEquals(GroupModel.REMOVED, bob.model(gid).state)
-            everyone(alice, carol) { p -> assertEquals(null, p.roster(gid).roster.role(bob.id)) }
+            everyone(alice, carol) { p -> assertEquals(null, p.view(gid).role(bob.id)) }
         }
     }
 
     /**
-     * Fork choice: Bob renames on top of his own acceptance, which a concurrent change of Alice's (an admin) beats. Bob's
-     * rename is re-signed on top of Alice's change, and everyone ends on the same roster with both.
+     * Once a fork rule's case: Bob's change raced Alice's, and his had to be re-signed on top of hers. Now only the owner
+     * signs rosters (Bob can't), and what Bob and Carol do concurrently (leave, accept) are facts that stand on any roster.
      */
     @Test
-    fun aMemberOnABranchThatLostRebasesOntoTheWinner() {
-        alice.create(gid, "Trip", bob, carol)
-        net.deliverAll()
-        alice.publish(gid, RosterOp.Meta(adminsOnly = false))
+    fun concurrentFactsAndTheOwnersChangesAllStand() {
+        alice.create(gid, "Trip", bob, carol, dave)
         net.deliverAll()
         bob.join(gid)
+        net.deliverAll()
+        assertNull(bob.publish(gid, RosterOp.Meta(name = "Bob's")))
+        // Nobody hears anyone else before they've all acted.
+        val held = mutableListOf<GroupNet.Envelope>()
+        net.filter = { e -> false.also { held += e } }
+        alice.publish(gid, RosterOp.Meta(timer = 3600))
+        alice.publish(gid, RosterOp.Remove(listOf(dave.id)))
+        bob.leave(gid)
         carol.join(gid)
         net.deliverAll()
-        // Neither hears the other before building on their own.
-        val held = mutableListOf<GroupNet.Envelope>()
-        net.filter = { e -> !((e.to() == alice && e.from() == bob) || (e.to() == bob && e.from() == alice)).also { if (it) held += e } }
-        alice.publish(gid, RosterOp.Meta(timer = 3600))
-        bob.publish(gid, RosterOp.Meta(name = "Bob's"))
-        bob.publish(gid, RosterOp.Meta(name = "Bob's again"))
-        net.deliverAll()
         net.filter = { true }
-        net.queue.addAll(held)
+        net.queue.addAll(held.reversed())
         net.deliverAll()
-        everyone(alice, bob, carol) { p ->
+        everyone(alice, carol) { p ->
             assertEquals(p.name, alice.roster(gid).hashB64, p.roster(gid).hashB64)
-            assertEquals(3600L, p.roster(gid).roster.timer)
-            assertEquals("Bob's again", p.roster(gid).roster.name)
+            assertEquals(3600L, p.view(gid).timer)
+            assertEquals(listOf(alice.id, carol.id), p.view(gid).ids())
+            assertEquals(Role.MEMBER, p.view(gid).role(carol.id))
         }
+        assertEquals(GroupModel.LEFT, bob.model(gid).state)
+        assertEquals(GroupModel.REMOVED, dave.model(gid).state)
     }
 
     /**
-     * Mallory, removed, forks from the roster before her removal: a long chain of renames, hashes ground to win ties.
-     * Her branch has no admin's change in it and leaves out nobody, so the removal stands; and it costs little traffic.
+     * Mallory, removed, forks from the roster before her removal: a long chain of renames she signs herself. Only the
+     * owner signs rosters, so none of it counts; the removal stands, and it costs little traffic.
      */
     @Test
     fun aRemovedMembersForkCantUndoTheRemoval() {
         val mallory = net.peer("mallory")
         alice.befriend(mallory)
         alice.create(gid, "Trip", bob, mallory)
-        net.deliverAll()
-        alice.publish(gid, RosterOp.Meta(adminsOnly = false))
         net.deliverAll()
         bob.join(gid)
         mallory.join(gid)
@@ -204,8 +208,7 @@ class GroupFindingsTest {
         var tip = before
         val chain = (1..6).map { i ->
             val change = tip.roster.copy(name = "Mine $i")
-            (0 until 16).map { t -> GroupCrypto.signRoster(mallory.identity.privateKey, app.goldfishsend.proto.RosterRules.successor(tip, change, mallory.id, 99L + t)) }
-                .maxWith { x, y -> app.goldfishsend.proto.RosterRules.compareUnsigned(x.hash, y.hash) }
+            GroupCrypto.signRoster(mallory.identity.privateKey, app.goldfishsend.proto.RosterRules.successor(tip, change, mallory.id, 99L, emptyList()))
                 .also { tip = it }
         }
         val sent = net.delivered
@@ -216,7 +219,7 @@ class GroupFindingsTest {
         }
         net.deliverAll()
         everyone(alice, bob) { p ->
-            assertNull(p.name, p.roster(gid).roster.role(mallory.id))
+            assertNull(p.name, p.view(gid).role(mallory.id))
             assertEquals(alice.roster(gid).hashB64, p.roster(gid).hashB64)
         }
         // Mallory's own sends, and nothing much in reply.

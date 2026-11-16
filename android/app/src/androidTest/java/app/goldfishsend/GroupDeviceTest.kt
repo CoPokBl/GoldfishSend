@@ -165,7 +165,7 @@ class GroupDeviceTest {
             bob.lock.unlock()
         }
         route(listOf(alice, bob))
-        assertEquals(Role.MEMBER, Groups.model(alice, aliceCid)!!.roster!!.roster.role(id(bob)))
+        assertEquals(Role.MEMBER, Groups.model(alice, aliceCid)!!.view()!!.role(id(bob)))
         assertEquals(Groups.model(alice, aliceCid)!!.roster!!.hashB64, Groups.model(bob, bobCid)!!.roster!!.hashB64)
 
         // Messages both ways, stored per sender, crypto-shredded like any other.

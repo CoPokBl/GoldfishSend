@@ -146,26 +146,27 @@ object Groups {
         Outbox.kick()
     }
 
-    /** Declines an invitation, or leaves. The last admin has to make someone else an admin first. */
+    /** Declines an invitation, or leaves. An owner who leaves hands the group to the next member ([heir]). */
     suspend fun leave(s: Session, cid: Long) {
-        val ok = withEngine(s) { e ->
+        withEngine(s) { e ->
             val m = model(s, cid) ?: return@withEngine true
             if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
                 return@withEngine true
             }
             e.leave(m)
         }
-        if (!ok) {
-            throw GroupException("Make someone else an admin before you leave.")
-        }
         s.db.notifyChanged()
         Outbox.kick()
     }
 
-    /** True if we're the only admin and there are other members: leaving needs a new admin first. */
-    fun mustPromoteFirst(m: GroupModel, me: String): Boolean {
-        val r = m.roster?.roster ?: return false
-        return r.isAdmin(me) && r.members.count { it.role == Role.ADMIN } == 1 && r.members.size > 1
+    /** If we own the group: who becomes the owner when we leave (the first other member in the roster), or null. */
+    fun heir(m: GroupModel, me: String): String? {
+        val v = m.view() ?: return null
+        if (!v.isOwner(me)) {
+            return null
+        }
+        // Like Membership.owner: the roster's members, in order, who haven't left.
+        return m.roster!!.roster.members.firstOrNull { it.id != me && it.role == Role.MEMBER && v.role(it.id) != null }?.id
     }
 
     private suspend fun change(s: Session, cid: Long, op: RosterOp): Boolean {
@@ -188,7 +189,7 @@ object Groups {
         if (ids.isEmpty()) {
             return false
         }
-        val size = model(s, cid)?.roster?.roster?.members?.size ?: 0
+        val size = model(s, cid)?.view()?.members?.size ?: 0
         if (size + ids.size > RosterRules.MAX_MEMBERS) {
             throw GroupException("A group can have at most ${RosterRules.MAX_MEMBERS} members.")
         }
@@ -197,8 +198,8 @@ object Groups {
 
     suspend fun removeMember(s: Session, cid: Long, member: String) = change(s, cid, RosterOp.Remove(listOf(member)))
 
-    suspend fun setAdmin(s: Session, cid: Long, member: String, admin: Boolean) =
-        change(s, cid, RosterOp.SetRole(member, if (admin) Role.ADMIN else Role.MEMBER))
+    /** Hands ownership to [member]; we stay on as a member. */
+    suspend fun makeOwner(s: Session, cid: Long, member: String) = change(s, cid, RosterOp.MakeOwner(member))
 
     suspend fun rename(s: Session, cid: Long, name: String): Boolean {
         val clean = Sanitize.name(name) ?: return false
@@ -208,13 +209,8 @@ object Groups {
     suspend fun setTimer(s: Session, cid: Long, secs: Long) =
         change(s, cid, RosterOp.Meta(timer = secs.coerceIn(0, Sanitize.MAX_TIMER_SECS)))
 
-    suspend fun setAdminsOnly(s: Session, cid: Long, on: Boolean) = change(s, cid, RosterOp.Meta(adminsOnly = on))
-
-    /** Whether we may change the name and timer (admins, or everyone when `adminsOnly` is off). */
-    fun canEditInfo(m: GroupModel, me: String): Boolean {
-        val r = m.roster?.roster ?: return false
-        return m.state == GroupModel.JOINED && (r.isAdmin(me) || (!r.adminsOnly && r.isActive(me)))
-    }
+    /** Whether we may change the group: only its owner can. */
+    fun canEditInfo(m: GroupModel, me: String): Boolean = m.state == GroupModel.JOINED && m.view()?.isOwner(me) == true
 
     // ---------- messages ----------
 
@@ -258,7 +254,8 @@ object Groups {
      */
     private fun recipients(s: Session, m: GroupModel): List<String> {
         val me = B64.enc(s.signal.identityKeyPair.publicKey.serialize())
-        return m.roster?.roster?.members.orEmpty().filter { it.id != me && m.roster!!.roster.isActive(it.id) }.map { it.id }
+        val v = m.view() ?: return emptyList()
+        return v.members.filter { it.id != me && v.isActive(it.id) }.map { it.id }
     }
 
     /** Group fan-out of control content (rosters, cards, receipts). */
@@ -569,25 +566,20 @@ object Groups {
                             "Someone new joined."
                         }
                     }
-                    is GroupEvent.RoleChanged -> {
-                        val who = memberName(s, m, e.id).name
-                        val by = memberName(s, m, e.by).name
-                        if (e.role == Role.ADMIN) "$by made $who an admin." else "$by removed $who as an admin."
-                    }
+                    is GroupEvent.OwnerChanged ->
+                        if (e.id == me(s)) "You're the owner of the group now." else "${memberName(s, m, e.id).name} is the owner of the group now."
                     is GroupEvent.Renamed -> "${memberName(s, m, e.by).name} renamed the group to “${Sanitize.name(e.name) ?: ""}”."
                     is GroupEvent.TimerChanged ->
                         "${memberName(s, m, e.by).name} set disappearing messages to ${timerLabel(e.secs).lowercase()}."
-                    is GroupEvent.AdminsOnlyChanged ->
-                        if (e.on) "Only admins can change the group's name and timer now." else "Everyone can change the group's name and timer now."
                     is GroupEvent.YouWereRemoved -> {
-                        s.repo.db.query("SELECT DISTINCT message_id FROM outbox WHERE contact_id = ? AND message_id IS NOT NULL", cid) {
-                            it.getString(0)
-                        }.let { ids ->
-                            s.repo.db.exec("DELETE FROM outbox WHERE contact_id = ?", cid)
-                            ids.forEach { settleStatus(s, it) }
-                        }
+                        dropOutbox(cid)
                         afterDeparture(cid, m)
                         "${memberName(s, m, e.by).name} removed you from the group."
+                    }
+                    GroupEvent.Ended -> {
+                        dropOutbox(cid)
+                        afterDeparture(cid, m)
+                        "The owner left with nobody else left to manage the group, so it has ended."
                     }
                     GroupEvent.YouLeft -> {
                         afterDeparture(cid, m)
@@ -618,6 +610,16 @@ object Groups {
         }
 
         /** We're out: our inbox goes (server-side, best effort) and so do this group's prekeys (forward secrecy). */
+        /** Nothing queued to this group goes out any more. */
+        private fun dropOutbox(cid: Long) {
+            s.repo.db.query("SELECT DISTINCT message_id FROM outbox WHERE contact_id = ? AND message_id IS NOT NULL", cid) {
+                it.getString(0)
+            }.let { ids ->
+                s.repo.db.exec("DELETE FROM outbox WHERE contact_id = ?", cid)
+                ids.forEach { settleStatus(s, it) }
+            }
+        }
+
         private fun afterDeparture(cid: Long, m: GroupModel) {
             m.myCard?.card?.bundle?.let { b ->
                 s.signal.removeSignedPreKey(b.signedPreKeyId)

@@ -71,7 +71,7 @@ object GroupOutbox {
             heads[member] = r
         }
         val ready = mutableListOf<Ready>()
-        val roster = Groups.model(s, cid)?.roster?.roster
+        val roster = Groups.model(s, cid)?.view()
         for ((member, item) in heads) {
             val route = routes[member]
             when {

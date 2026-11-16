@@ -13,6 +13,8 @@ import app.goldfishsend.proto.CardBundle
 import app.goldfishsend.proto.CardInbox
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
+import app.goldfishsend.proto.Fact
+import app.goldfishsend.proto.FactKind
 import app.goldfishsend.proto.GroupBlob
 import app.goldfishsend.proto.GroupCard
 import app.goldfishsend.proto.GroupCrypto
@@ -22,6 +24,7 @@ import app.goldfishsend.proto.Roster
 import app.goldfishsend.proto.RosterMember
 import app.goldfishsend.proto.RosterRules
 import app.goldfishsend.proto.SignedCard
+import app.goldfishsend.proto.SignedFact
 import app.goldfishsend.proto.SignedRoster
 import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
@@ -38,8 +41,8 @@ import org.signal.libsignal.protocol.state.SignedPreKeyRecord
 /**
  * One honest member (Bob) receives whatever a hostile member (Mallory), an invitee and a stranger whose keys the attacker
  * holds can send: raw blobs on Bob's group inbox, content over Mallory's group session or the 1:1 session, forged and
- * replayed rosters and cards, chunks in any order, and messages claiming another sender. After every input, nothing may
- * have thrown, and the attacker must not have changed anything only the honest members' keys allow.
+ * replayed rosters, facts and cards, chunks in any order, and messages claiming another sender. After every input,
+ * nothing may have thrown, and the attacker must not have changed anything only the honest members' keys allow.
  */
 class GroupReceiveFuzzTest {
     @FuzzTest(maxDuration = "60s")
@@ -47,7 +50,7 @@ class GroupReceiveFuzzTest {
         if (System.getProperty("gf.fuzz.debug") != null) {
             GroupEngine.debugLog = { println("  " + it) }
         }
-        val bob = Bob(admin = data.consumeBoolean())
+        val bob = Bob(owner = data.consumeBoolean())
         repeat(data.consumeInt(1, 6)) {
             val action = data.consumeInt(0, 7)
             GroupEngine.debugLog?.invoke("action $action")
@@ -60,7 +63,10 @@ class GroupReceiveFuzzTest {
                 5 -> bob.chunked(data, content(data))
                 6 -> ParserFuzzTest.rejectsOnly(IllegalArgumentException::class.java) { Content.decode(data.consumeBytes(400)) }
                     ?.let { bob.engine.onDirect(W.id(W.mallory), it) }
-                else -> bob.fromMallory(W.honest[data.consumeInt(0, W.honest.size - 1)].let { GroupEngine.rosterContent(it) })
+                else -> bob.fromMallory(
+                    if (data.consumeBoolean()) GroupEngine.rosterContent(W.honest[data.consumeInt(0, W.honest.size - 1)])
+                    else GroupEngine.factContent(W.facts[data.consumeInt(0, W.facts.size - 1)]),
+                )
             }
             bob.replayHeld()
             bob.check()
@@ -68,10 +74,12 @@ class GroupReceiveFuzzTest {
     }
 
     /** Content the attacker can make: anything, but mostly group content for this group, signed with keys it holds. */
-    private fun content(data: FuzzedDataProvider): Content = when (data.consumeInt(0, 9)) {
+    private fun content(data: FuzzedDataProvider): Content = when (data.consumeInt(0, 11)) {
         0 -> data.content()
         1, 2, 3 -> GroupEngine.rosterContent(forgeRoster(data))
         4 -> GroupEngine.rosterContent(W.honest[data.consumeInt(0, W.honest.size - 1)])
+        10 -> GroupEngine.factContent(forgeFact(data))
+        11 -> GroupEngine.factContent(W.facts[data.consumeInt(0, W.facts.size - 1)])
         5, 6 -> forgeCard(data)
         7 -> Content.GSync(W.gid, data.consumeLong())
         8 -> Content.GLeave(W.gid)
@@ -84,7 +92,7 @@ class GroupReceiveFuzzTest {
         repeat(data.consumeInt(0, 3)) {
             members = when (data.consumeInt(0, 3)) {
                 0 -> if (members.isEmpty()) members else members - members[data.consumeInt(0, members.size - 1)]
-                1 -> members + RosterMember(W.pickId(data), W.pickRole(data))
+                1 -> members + RosterMember(W.pickId(data), W.pickRole(data), data.consumeLong(0, 12))
                 2 -> members.map { if (data.consumeBoolean()) it.copy(role = W.pickRole(data)) else it }
                 else -> members.shuffled(java.util.Random(data.consumeLong()))
             }
@@ -106,12 +114,27 @@ class GroupReceiveFuzzTest {
             ver = ver, prev = prev, members = members,
             name = if (data.consumeBoolean()) base.roster.name else data.str(70),
             timer = if (data.consumeBoolean()) base.roster.timer else data.consumeLong(),
-            adminsOnly = if (data.consumeBoolean()) base.roster.adminsOnly else !base.roster.adminsOnly,
+            // "Proof" that the signer is the owner's successor: departures it holds or makes up.
+            proof = List(data.consumeInt(0, 2)) { (if (data.consumeBoolean()) W.facts[data.consumeInt(0, W.facts.size - 1)] else forgeFact(data)).wire() },
             by = if (data.consumeBoolean()) W.id(signer) else W.pickId(data),
             ts = if (data.consumeBoolean()) base.roster.ts else data.consumeLong(),
             g = if (data.consumeInt(0, 15) == 0) data.str(50) else W.gid,
         )
         return GroupCrypto.signRoster(signer.privateKey, r)
+    }
+
+    /** A fact signed with a key the attacker holds: about anyone, any stint, maybe carrying a roster. */
+    private fun forgeFact(data: FuzzedDataProvider): SignedFact {
+        val signer = W.attackers[data.consumeInt(0, W.attackers.size - 1)]
+        val f = Fact(
+            g = if (data.consumeInt(0, 15) == 0) data.str(50) else W.gid,
+            kind = listOf(FactKind.ACCEPT, FactKind.LEAVE, data.str(6))[data.consumeInt(0, 2)],
+            id = if (data.consumeBoolean()) W.id(signer) else W.pickId(data),
+            since = if (data.consumeBoolean()) data.consumeLong(0, 12) else data.consumeLong(),
+            ts = data.consumeLong(),
+            last = if (data.consumeBoolean()) null else W.honest[data.consumeInt(0, W.honest.size - 1)].wire(),
+        )
+        return GroupCrypto.signFact(signer.privateKey, f)
     }
 
     private fun forgeCard(data: FuzzedDataProvider): Content.GCard {
@@ -163,7 +186,7 @@ class GroupReceiveFuzzTest {
         fun pickId(data: FuzzedDataProvider): String = if (data.consumeInt(0, 15) == 0) data.str(50) else id(all[data.consumeInt(0, all.size - 1)])
 
         fun pickRole(data: FuzzedDataProvider): String =
-            listOf(Role.ADMIN, Role.MEMBER, Role.INVITED)[data.consumeInt(0, 3).coerceAtMost(2)].takeIf { data.consumeInt(0, 15) != 0 } ?: data.str(8)
+            listOf(Role.OWNER, Role.MEMBER, Role.INVITED)[data.consumeInt(0, 3).coerceAtMost(2)].takeIf { data.consumeInt(0, 15) != 0 } ?: data.str(8)
 
         private class Keys(val spk: ECKeyPair, val spkSig: ByteArray, val kyber: KEMKeyPair, val kyberSig: ByteArray)
 
@@ -196,44 +219,55 @@ class GroupReceiveFuzzTest {
             s.storeKyberPreKey(12, KyberPreKeyRecord(12, 0, kk.kyber, kk.kyberSig))
         }
 
-        /** The honest history. Carol leaves and is added back, Dave accepts, is removed and is invited again. */
+        /**
+         * The honest history: everyone accepts, Carol leaves and is invited back (with Dave, removed meanwhile, and Ivan),
+         * and accepts again; then Alice makes Bob the owner, who renames the group. [facts]: the members' own facts in it.
+         */
         val honest: List<SignedRoster>
+        val facts: List<SignedFact>
 
-        /** Bob's starting roster: [honest] up to Carol's return (non-admin) or up to his promotion. */
+        /** Bob's starting roster: [honest] up to Carol's return (a member), or up to his becoming the owner. */
         val startMember: SignedRoster
-        val startAdmin: SignedRoster
+        val startOwner: SignedRoster
 
         init {
             val list = mutableListOf<SignedRoster>()
+            val said = mutableListOf<SignedFact>()
             fun add(by: IdentityKeyPair, change: (Roster) -> Roster) {
                 val base = list.last()
-                list += GroupCrypto.signRoster(by.privateKey, RosterRules.successor(base, change(base.roster), id(by), 1000L + list.size))
+                list += GroupCrypto.signRoster(by.privateKey, RosterRules.successor(base, change(base.roster), id(by), 1000L + list.size, emptyList()))
+            }
+            fun fact(k: IdentityKeyPair, kind: String, since: Long) {
+                said += GroupCrypto.signFact(k.privateKey, Fact(g = gid, kind = kind, id = id(k), since = since, ts = 1000L + said.size))
             }
             fun role(r: Roster, k: IdentityKeyPair, role: String?) = r.copy(
-                members = if (role == null) r.members.filter { it.id != id(k) } else if (r.role(id(k)) == null) r.members + RosterMember(id(k), role)
+                members = if (role == null) r.members.filter { it.id != id(k) } else if (r.role(id(k)) == null) r.members + RosterMember(id(k), role, r.ver + 1)
                 else r.members.map { if (it.id == id(k)) it.copy(role = role) else it },
             )
             list += GroupCrypto.signRoster(
                 alice.privateKey,
                 Roster(
-                    g = gid, ver = 1, name = "Trip", members = listOf(RosterMember(id(alice), Role.ADMIN)) +
-                        listOf(bob, mallory, carol, dave).map { RosterMember(id(it), Role.INVITED) },
+                    g = gid, ver = 1, name = "Trip", members = listOf(RosterMember(id(alice), Role.OWNER, 1)) +
+                        listOf(bob, mallory, carol, dave).map { RosterMember(id(it), Role.INVITED, 1) },
                     by = id(alice), ts = 1000,
                 ),
             )
-            add(bob) { role(it, bob, Role.MEMBER) }
-            add(mallory) { role(it, mallory, Role.MEMBER) }
-            add(carol) { role(it, carol, Role.MEMBER) }
-            add(dave) { role(it, dave, Role.MEMBER) }
-            add(carol) { role(it, carol, null) }
+            for (k in listOf(bob, mallory, carol, dave)) {
+                fact(k, FactKind.ACCEPT, 1)
+            }
+            add(alice) { r -> listOf(bob, mallory, carol, dave).fold(r) { x, k -> role(x, k, Role.MEMBER) } }
+            fact(carol, FactKind.LEAVE, 1)
+            add(alice) { role(it, carol, null) }
             add(alice) { role(it, dave, null) }
             add(alice) { role(role(role(it, carol, Role.INVITED), dave, Role.INVITED), ivan, Role.INVITED) }
-            add(carol) { role(it, carol, Role.MEMBER) }
+            fact(carol, FactKind.ACCEPT, list.last().roster.ver)
+            add(alice) { role(it, carol, Role.MEMBER) }
             startMember = list.last()
-            add(alice) { role(it, bob, Role.ADMIN) }
-            startAdmin = list.last()
-            add(alice) { it.copy(name = "Trip 2") }
+            add(alice) { r -> role(role(r, bob, Role.OWNER), alice, Role.MEMBER) }
+            startOwner = list.last()
+            add(bob) { it.copy(name = "Trip 2") }
             honest = list
+            facts = said
         }
 
         val names = honest.map { it.roster.name }.toSet()
@@ -256,8 +290,8 @@ class GroupReceiveFuzzTest {
         }
 
         fun roleAllowed(id: String, role: String?): Boolean = when (id) {
-            id(alice) -> role == Role.ADMIN
-            id(bob) -> role == Role.ADMIN || role == Role.MEMBER
+            // Who owns it only changes by Alice's own roster (which the attacker may replay).
+            id(alice), id(bob) -> role == Role.OWNER || role == Role.MEMBER
             id(carol) -> role == Role.MEMBER
             id(dave) -> role == Role.INVITED
             // The attacker's own keys may leave, decline or accept, never more.
@@ -281,12 +315,12 @@ class GroupReceiveFuzzTest {
         override fun nowMillis(): Long = 2_000_000L
     }
 
-    private class Bob(admin: Boolean) {
+    private class Bob(owner: Boolean) {
         val store = MemoryGroupStore()
         val signal = W.store(W.bob)
         val sent = mutableListOf<Pair<String, Content>>()
         val texts = mutableListOf<String>()
-        val start = if (admin) W.startAdmin else W.startMember
+        val start = if (owner) W.startOwner else W.startMember
         val contacts = setOf(W.id(W.alice), W.id(W.mallory), W.id(W.carol))
 
         val engine = GroupEngine(store, signal, W.bob, object : GroupIo by NullIo {
@@ -304,7 +338,7 @@ class GroupReceiveFuzzTest {
             }
 
             override fun onText(m: GroupModel, from: String, t: Content.GText) {
-                check(m.roster!!.roster.isActive(from)) { "text from non-member ${W.name(from)}" }
+                check(m.view()!!.isActive(from)) { "text from non-member ${W.name(from)}" }
                 check(from == W.id(W.mallory) || from == W.id(W.ivan)) { "text claims to be from ${W.name(from)}" }
                 texts += t.body
             }
@@ -316,7 +350,7 @@ class GroupReceiveFuzzTest {
                 store.addHistory(W.gid, r)
             }
             val cards = listOf(W.alice, W.mallory, W.carol).associate { W.id(it) to W.cards.getValue(W.id(it)) }
-            store.save(GroupModel(W.gid, GroupModel.JOINED, start, cards.toMutableMap(), W.bobCard, W.id(W.alice), mutableListOf()))
+            store.save(GroupModel(W.gid, GroupModel.JOINED, start, cards.toMutableMap(), W.bobCard, W.id(W.alice), mutableListOf(), 1))
             signal.storeSession(GroupCrypto.address(W.id(W.mallory)), SessionRecord(W.bobFromMallory))
         }
 
@@ -385,14 +419,17 @@ class GroupReceiveFuzzTest {
             val m = store.load(W.gid)!!
             check(m.state == GroupModel.JOINED) { "Bob's state changed to ${m.state}" }
             val r = m.roster!!.roster
+            val v = m.view()!!
             check(RosterRules.wellFormed(r, W.gid)) { "roster not well formed" }
             for (k in W.all) {
-                check(W.roleAllowed(W.id(k), r.role(W.id(k)))) { "${W.name(W.id(k))} is ${r.role(W.id(k))} (by ${W.name(r.by)}, v${r.ver})" }
+                check(W.roleAllowed(W.id(k), v.role(W.id(k)))) { "${W.name(W.id(k))} is ${v.role(W.id(k))} (by ${W.name(r.by)}, v${r.ver})" }
             }
             check(r.members.all { mem -> W.all.any { W.id(it) == mem.id } }) { "unknown member" }
-            check(r.name in W.names && r.timer in W.timers && r.adminsOnly) { "settings changed by ${W.name(r.by)}" }
+            check(v.owner == W.id(W.alice) || v.owner == W.id(W.bob)) { "owner is ${v.owner?.let(W::name)}" }
+            check(r.name in W.names && r.timer in W.timers) { "settings changed by ${W.name(r.by)}" }
+            check(m.facts.size <= 2 * W.all.size + 2 * W.all.size) { "unbounded facts" }
             check(m.cards[W.id(W.alice)]?.bytes?.contentEquals(W.cards.getValue(W.id(W.alice)).bytes) == true) { "Alice's card replaced" }
-            check(m.cards.keys.all { r.role(it) != null }) { "card of a non-member" }
+            check(m.cards.keys.all { v.role(it) != null }) { "card of a non-member" }
             for (card in m.cards.values) {
                 ECPublicKey(B64.dec(card.card.bundle.signedPreKey))
                 KEMPublicKey(B64.dec(card.card.bundle.kyberPreKey))

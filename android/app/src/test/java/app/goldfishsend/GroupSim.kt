@@ -1,5 +1,6 @@
 package app.goldfishsend
 
+import app.goldfishsend.group.FactLines
 import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupEvent
 import app.goldfishsend.group.GroupIo
@@ -41,8 +42,8 @@ class MemoryGroupStore : GroupStore {
         var cards: Map<String, SignedCard>,
         var myCard: SignedCard?,
         var invitedBy: String?,
-        var pendingOp: String?,
-        var pendingHash: String?,
+        var facts: String?,
+        var since: Long,
     )
 
     private val rows = HashMap<String, Row>()
@@ -56,22 +57,18 @@ class MemoryGroupStore : GroupStore {
 
     override fun load(gid: String): GroupModel? {
         val r = rows[gid] ?: return null
-        return GroupModel(
-            gid, r.state, r.roster, r.cards.toMutableMap(), r.myCard, r.invitedBy,
-            app.goldfishsend.group.Pending.decode(r.pendingOp, r.pendingHash),
-        )
+        return GroupModel(gid, r.state, r.roster, r.cards.toMutableMap(), r.myCard, r.invitedBy, FactLines.decode(r.facts), r.since)
     }
 
     override fun save(m: GroupModel) {
-        val (ops, hashes) = app.goldfishsend.group.Pending.encode(m.pending)
-        rows[m.gid] = Row(m.state, m.roster, m.cards.toMap(), m.myCard, m.invitedBy, ops, hashes)
+        rows[m.gid] = Row(m.state, m.roster, m.cards.toMap(), m.myCard, m.invitedBy, FactLines.encode(m.facts), m.since)
         routes.getOrPut(m.gid) { HashMap() }.putAll(m.cards)
     }
 
-    /** Like RepoGroupStore.addHistory: siblings capped per version, nothing kept 200 versions behind the newest. */
-    override fun addHistory(gid: String, r: SignedRoster, sibling: Boolean) {
+    /** Like RepoGroupStore.addHistory: capped per version, nothing kept 200 versions behind the newest. */
+    override fun addHistory(gid: String, r: SignedRoster) {
         val rows = historyRows.getOrPut(gid) { LinkedHashMap() }
-        if (sibling && !GroupEngine.siblingFits(rows.values.filter { it.roster.ver == r.roster.ver }.map { it.roster }, r.roster)) {
+        if (r.hashB64 !in rows && !GroupEngine.fits(rows.values.filter { it.roster.ver == r.roster.ver }.map { it.roster }, r.roster)) {
             return
         }
         rows.putIfAbsent(r.hashB64, r)
@@ -134,7 +131,8 @@ class MemoryGroupStore : GroupStore {
  */
 class GroupNet {
     sealed class Envelope {
-        class ToInbox(val to: Peer, val sendSecret: String, val blob: ByteArray, val from: Peer) : Envelope()
+        /** [what]: the content's type, for tests that pick envelopes (the blob is encrypted). */
+        class ToInbox(val to: Peer, val sendSecret: String, val blob: ByteArray, val from: Peer, val what: String = "") : Envelope()
         class Direct(val to: Peer, val from: Peer, val content: Content) : Envelope()
     }
 
@@ -263,13 +261,18 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
 
     fun publish(gid: String, op: app.goldfishsend.proto.RosterOp) = engine.publish(model(gid), op)
 
+    fun leave(gid: String) = engine.leave(model(gid))
+
+    /** Our membership as we see it. */
+    fun view(gid: String) = model(gid).view()!!
+
     /** What the app does for a text: one gtext per member with a card. */
     /** Like the app: every active member gets it, and members whose card we don't have yet get it once it arrives. */
     fun say(gid: String, body: String, wireId: String = Content.newId()): List<String> {
         val m = model(gid)
         check(m.state == GroupModel.JOINED)
         val content = Content.GText(gid, wireId, body, System.currentTimeMillis())
-        val r = m.roster!!.roster
+        val r = m.view()!!
         val to = r.members.map { it.id }.filter { it != id && r.isActive(it) }
         for (t in to) {
             if (m.cards[t] != null) {
@@ -299,7 +302,7 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
         val to = net.peers.first { it.id == card.id }
         for (part in Chunker.splitContent(content, Padding.MAX_PREKEY_PLAINTEXT)) {
             val blob = engine.encryptTo(card.id, card, part.encode())
-            net.queue.addLast(GroupNet.Envelope.ToInbox(to, card.inbox.sendSecret, blob, this))
+            net.queue.addLast(GroupNet.Envelope.ToInbox(to, card.inbox.sendSecret, blob, this, content.javaClass.simpleName))
         }
     }
 
