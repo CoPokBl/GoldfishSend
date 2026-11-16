@@ -48,8 +48,9 @@ their card. Every member sends to it. The server sees one ordinary mailbox.
 ```
 - `sig = XEdDSA(identityPrivate, "gf/group-card/v1" ‖ canonicalCardBytes)`, carried next to the card.
   - "Canonical" means the exact UTF-8 JSON bytes as sent. The card travels as a b64u string, so nobody re-serialises it.
-- `seq` grows with every new card from that member. A receiver keeps the highest `seq` per member and ignores older
-  ones.
+- `seq` grows with every new card from that member, across stints: someone who joins again after being out uses a
+  higher `seq` than their last card, which others may still hold. A receiver keeps the highest `seq` per member and
+  ignores older ones.
 - `bundle` lets other members start a PQXDH session with this member.
   - Its prekeys belong to this group, and are kept until the member leaves or publishes a new card.
   - The Kyber prekey is a last-resort key, reused by every initiator.
@@ -87,8 +88,10 @@ their card. Every member sends to it. The server sees one ordinary mailbox.
   - `leave`: a member leaves, or an invitee declines.
 - **`since`** names the stint the fact is about. A fact about any other stint means nothing. A late or replayed fact
   about an old stint is therefore ignored, and a member who is invited again isn't affected by their old departure.
-- **`last`**, on a departure only, is the newest roster the leaver held. Whoever takes over from them builds on it, so
-  a roster the leaver signed just before leaving isn't forked around.
+- **`last`** (a list, oldest first, at most 8) only appears on a departure. It holds the newest roster the leaver
+  held, and before it the run of rosters they signed themselves that end there. Whoever takes over from them builds
+  on these. So rosters the leaver signed just before leaving aren't forked around, even if they had reached nobody
+  yet (an owner who took over before having anyone's card).
 - **`card`**, on an acceptance only, is the newcomer's card. Whoever learns they're in can reach them, including an
   owner who never got the card itself.
 
@@ -143,8 +146,8 @@ For a received roster R, with current roster C:
      the remaining members; the old mailbox is deleted after a 15-day drain.
 
 #### Accepting a fact
-- **Checks.** A fact must verify under its `id` and be for this group. If it carries `last`, that roster is taken
-  first (it may be news).
+- **Checks.** A fact must verify under its `id` and be for this group. If it carries `last`, those rosters are taken
+  first (they may be news).
 - **Before the invitation.** A fact over 1:1 for a group we don't know yet may have overtaken our invitation (the
   owner left right after inviting us). It's kept, the newest 16 in all, and applied once the invitation comes.
 - **Which facts are kept.**

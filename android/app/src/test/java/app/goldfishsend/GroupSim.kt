@@ -267,7 +267,7 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
 
     fun create(gid: String, name: String, vararg invitees: Peer) = engine.create(gid, name, invitees.map { it.id }, card(gid), 0)
 
-    fun join(gid: String) = check(engine.join(model(gid), card(gid))) { "$name couldn't join" }
+    fun join(gid: String) = check(engine.join(model(gid), card(gid, (model(gid).myCard?.card?.seq ?: 0) + 1))) { "$name couldn't join" }
 
     fun publish(gid: String, op: app.goldfishsend.proto.RosterOp) = engine.publish(model(gid), op)
 

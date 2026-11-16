@@ -369,7 +369,7 @@ class GroupScenario(private val seed: Long) {
         val content: Content = if (op.c % 3 == 0) {
             val f = GroupCrypto.signFact(
                 mallory.identity.privateKey,
-                Fact(g = gid, kind = FactKind.LEAVE, id = mallory.id, since = mine.since, ts = now / 1000 + Math.floorMod(op.b, 8), last = at.wire()),
+                Fact(g = gid, kind = FactKind.LEAVE, id = mallory.id, since = mine.since, ts = now / 1000 + Math.floorMod(op.b, 8), last = listOf(at.wire())),
             )
             if (model(mallory)?.roster?.roster?.member(mallory.id)?.since == mine.since) {
                 churned += mallory.id

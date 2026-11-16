@@ -281,8 +281,9 @@ class GroupEngine(
             identity.privateKey,
             Fact(
                 g = m.gid, kind = FactKind.LEAVE, id = me, since = m.since, ts = io.nowMillis() / 1000,
-                // Whoever takes over from us builds on the newest roster we know, which may be one we just signed.
-                last = head?.takeIf { m.state == GroupModel.JOINED }?.wire(),
+                // Whoever takes over from us builds on the newest rosters we know, which may be ones we just signed and that
+                // reached nobody yet.
+                last = if (m.state == GroupModel.JOINED) ownRun(m).map { it.wire() } else emptyList(),
             ),
         )
         if (m.state == GroupModel.JOINED) {
@@ -298,6 +299,17 @@ class GroupEngine(
         store.save(m)
         io.onEvents(m, listOf(GroupEvent.YouLeft))
         return true
+    }
+
+    /** The newest roster, and before it the run of rosters we signed ending there, oldest first ([Fact.last]). */
+    private fun ownRun(m: GroupModel): List<SignedRoster> {
+        val out = ArrayList<SignedRoster>()
+        var x = m.roster
+        while (x != null && out.size < GroupCrypto.MAX_LAST && (out.isEmpty() || x.roster.by == me)) {
+            out += x
+            x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver == x!!.roster.ver - 1 }
+        }
+        return out.reversed()
     }
 
     /** Replaces our card (new inbox or keys) and sends it to every member. */
@@ -599,8 +611,9 @@ class GroupEngine(
             return
         }
         // A departure carries the newest roster the leaver had: it may be one we haven't seen (they signed it just before).
-        f.last?.let { w ->
-            GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) }?.let { onSignedRoster(loaded, it, from, direct = false) }
+        for (w in f.last) {
+            val r = GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) } ?: continue
+            onSignedRoster(store.load(c.g) ?: return, r, from, direct = false)
         }
         val m = store.load(c.g) ?: return
         val r = m.roster?.roster ?: return

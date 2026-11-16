@@ -135,7 +135,8 @@ object Groups {
         val hintKey = Rand.bytes(GroupCrypto.HINT_KEY)
         val ok = withEngine(s) { e ->
             val fresh = model(s, cid) ?: return@withEngine false
-            val card = newCard(s, fresh.gid, mb, hintKey, serverKey, seq = 1, bundle = null)
+            // After an earlier stint, members may still hold our old card: this one must be newer.
+            val card = newCard(s, fresh.gid, mb, hintKey, serverKey, seq = (fresh.myCard?.card?.seq ?: 0) + 1, bundle = null)
             s.repo.bindGroupInbox(mb.id, cid, hintKey)
             e.join(fresh, card)
         }

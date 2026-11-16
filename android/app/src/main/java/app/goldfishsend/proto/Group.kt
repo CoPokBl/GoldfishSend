@@ -88,16 +88,21 @@ data class Fact(
     val id: String,
     val since: Long,
     val ts: Long,
-    /** On a departure: the newest roster the leaver held, so whoever takes over from them builds on it. */
-    val last: Signed? = null,
+    /**
+     * On a departure: the newest rosters the leaver held, oldest first (the run they signed themselves at the end of
+     * their chain, or else just the newest), so whoever takes over from them builds on them.
+     */
+    val last: List<Signed> = emptyList(),
     /** On an acceptance: the member's card, so whoever learns they're in can reach them. */
     val card: Signed? = null,
 ) {
-    /** [last]'s version (0 if none, -1 if unreadable). */
+    /** The newest of [last]'s versions (0 if none, -1 if any is unreadable). */
     val lastVer: Long by lazy {
-        val w = last ?: return@lazy 0L
+        if (last.isEmpty()) {
+            return@lazy 0L
+        }
         runCatching {
-            GroupJson.decodeFromString(Roster.serializer(), B64.dec(w.data).toString(Charsets.UTF_8)).ver
+            last.maxOf { w -> GroupJson.decodeFromString(Roster.serializer(), B64.dec(w.data).toString(Charsets.UTF_8)).ver }
         }.getOrDefault(-1L)
     }
 }
@@ -139,6 +144,9 @@ object GroupCrypto {
     const val HINT_NONCE = 16
     const val HINT_MAC = 16
     const val HINT_KEY = 32
+
+    /** Rosters a departure carries at most (see [Fact.last]). */
+    const val MAX_LAST = 8
 
     /** A b64u identity key in canonical form (33 bytes, DJB type 0x05), or null. */
     fun identityBytes(id: String): ByteArray? = try {
@@ -208,7 +216,7 @@ object GroupCrypto {
         if (f.v != 2 || f.since < 1 || (f.kind != FactKind.ACCEPT && f.kind != FactKind.LEAVE) || !verify(f.id, FACT_LABEL, bytes, sig)) {
             return null
         }
-        if ((f.last != null && (f.kind != FactKind.LEAVE || f.lastVer < 1)) || (f.card != null && f.kind != FactKind.ACCEPT)) {
+        if ((f.last.isNotEmpty() && (f.kind != FactKind.LEAVE || f.lastVer < 1 || f.last.size > MAX_LAST)) || (f.card != null && f.kind != FactKind.ACCEPT)) {
             return null
         }
         return SignedFact(bytes, sig, f)

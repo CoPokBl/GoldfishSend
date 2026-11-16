@@ -471,6 +471,28 @@ class GroupStatefulTest {
     fun departuresInAGroupNobodyOwns() =
         scenario(7L, listOf(Op(2, 0, 223, 0), Op(8, 71, 109, 0), Op(0, 8, 0, 0), Op(0, 1, 0, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0)))
 
+    /**
+     * Found by GroupScenarioFuzzTest (input old-stints-card-kept): Carol joined an invitation already withdrawn, then
+     * joined again when re-invited; Alice kept the first card (same `seq`) and wrote to its deleted inbox.
+     */
+    @Test
+    fun oldStintsCardKept() =
+        scenario(0L, listOf(Op(2, 0, 98, 0), Op(2, 0, 212, 0), Op(8, 2, 125, 0), Op(3, 0, 67, 0), Op(2, 0, 102, 0), Op(0, 82, 0, 0), Op(11, 0, 0, 0), Op(0, 82, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input owner-whose-rosters-reached-nobody): Bob took over, signed two rosters
+     * nobody could receive (he had no one's card yet), and left. His departure carried only the newest, so Dave could
+     * never place it. A departure now carries the run of rosters its author signed.
+     */
+    @Test
+    fun ownerWhoseRostersReachedNobody() = scenario(
+        7L,
+        listOf(
+            Op(2, 0, 28, 0), Op(2, 0, 202, 0), Op(8, 255, 164, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(12, 0, 0, 109), Op(1, 0, 0, 0),
+            Op(0, 138, 0, 0), Op(8, 138, 199, 0), Op(5, 66, 0, 0), Op(1, 31, 0, 0),
+        ),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

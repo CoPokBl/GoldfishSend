@@ -132,7 +132,7 @@ class GroupReceiveFuzzTest {
             id = if (data.consumeBoolean()) W.id(signer) else W.pickId(data),
             since = if (data.consumeBoolean()) data.consumeLong(0, 12) else data.consumeLong(),
             ts = data.consumeLong(),
-            last = if (data.consumeBoolean()) null else W.honest[data.consumeInt(0, W.honest.size - 1)].wire(),
+            last = List(data.consumeInt(0, 2)) { W.honest[data.consumeInt(0, W.honest.size - 1)].wire() },
         )
         return GroupCrypto.signFact(signer.privateKey, f)
     }
