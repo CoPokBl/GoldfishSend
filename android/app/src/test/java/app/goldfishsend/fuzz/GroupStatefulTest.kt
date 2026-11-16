@@ -1,6 +1,7 @@
 package app.goldfishsend.fuzz
 
 import org.junit.Assert.fail
+import org.junit.Ignore
 import org.junit.Test
 
 /**
@@ -337,6 +338,26 @@ class GroupStatefulTest {
     @Test
     fun adminsRemoveEachOther() =
         scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 211, 0, 0), Op(3, 0, 16, 0)))
+
+    /**
+     * Seed 2549 (and the forks fuzzer): Bob left before he heard Alice had made him an admin, then Alice left. Bob's
+     * departure lost the fork, and the only admin who could apply it is Bob, whose inbox is gone. Open: see
+     * docs/groups-redesign.md.
+     */
+    @Ignore("open: a departure that loses a fork can need its absent author (docs/groups-redesign.md)")
+    @Test
+    fun departureOfTheLastAdminLostAFork() = scenario(
+        7L,
+        listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 121, 0, 0), Op(11, 0, 0, 0), Op(4, 0, 186, 0), Op(1, 0, 0, 0), Op(0, 98, 0, 0), Op(1, 106, 0, 0)),
+    )
+
+    /**
+     * Bob removed Alice while she invited Dave. The removal won, and Dave, who only knows Alice, waited on an invitation
+     * nobody else knew of: Alice tells him it's off.
+     */
+    @Test
+    fun invitationLostToTheInvitersRemoval() =
+        scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 56, 0, 0), Op(2, 0, 98, 0)))
 
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 

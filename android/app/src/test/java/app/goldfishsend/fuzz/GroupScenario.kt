@@ -54,6 +54,7 @@ class GroupScenario(private val seed: Long) {
 
     // What honest actions and Mallory's own did, for the invariants.
     private val added = mutableSetOf<String>()
+    private val addedBy = mutableMapOf<String, String>()
     private val promoted = mutableSetOf(alice.id)
     private val churned = mutableSetOf<String>()
     private val joined = mutableSetOf<String>()
@@ -155,6 +156,7 @@ class GroupScenario(private val seed: Long) {
                 if (t.id in a.contacts && a.publish(gid, RosterOp.Add(listOf(t.id))) != null) {
                     log("${a.name} adds ${t.name}")
                     added += t.id
+                    addedBy[t.id] = a.id
                 }
             }
             3 -> admin(op) { a, t ->
@@ -412,7 +414,8 @@ class GroupScenario(private val seed: Long) {
             if (p.id in joined && p.id !in churned && !r.isActive(p.id)) {
                 return Failure("lost member: ${p.name} joined and never left, but is ${r.role(p.id)} in ${describe(r)}")
             }
-            if (p.id in added && p.id !in joined && p.id !in churned && r.role(p.id) != Role.INVITED) {
+            // An invitation by someone taken out meanwhile can lose to their removal (rule 3).
+            if (p.id in added && p.id !in joined && p.id !in churned && addedBy[p.id] !in churned && r.role(p.id) != Role.INVITED) {
                 return Failure("lost invitation: ${p.name} is ${r.role(p.id)} in ${describe(r)}")
             }
         }

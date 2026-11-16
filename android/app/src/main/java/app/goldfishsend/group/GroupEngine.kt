@@ -470,6 +470,14 @@ class GroupEngine(
         if (signed.hashB64 == cur.hashB64) {
             return
         }
+        if (m.state == GroupModel.INVITED && direct && from == m.invitedBy && r.role(me) == null && r.ver >= cur.roster.ver &&
+            cur.roster.isAdmin(r.by)
+        ) {
+            // Our inviter tells us the invitation is off (it lost a fork): we have none of the group's history to check it
+            // against, but they could withdraw it anyway.
+            accept(m, signed)
+            return
+        }
         if (m.state == GroupModel.LEFT && direct && r.by == from && cur.roster.role(from) == Role.INVITED &&
             askOnce("$me pass ${signed.hashB64}", io.nowMillis())
         ) {
@@ -823,6 +831,9 @@ class GroupEngine(
             io.onEvents(m, events)
         }
         reapplyLost(m, signed)
+        if (prior != null && !descends(m, signed, prior)) {
+            tellLostInvitees(m, prior, signed)
+        }
         // We joined, but this roster still has us invited (our acceptance was on a stint that's over, or got lost): again.
         if (m.state == GroupModel.JOINED && signed.roster.role(me) == Role.INVITED && signed.roster.by != me) {
             publish(m, RosterOp.Accept)
@@ -860,6 +871,25 @@ class GroupEngine(
             // All in one roster, so a member who keeps losing forks signs one per version, not one per change.
             dbg { "re-applying ${redo.size} lost on v${m.roster?.roster?.ver}" }
             publish(m, redo.singleOrNull() ?: RosterOp.Batch(redo))
+        }
+    }
+
+    /**
+     * We moved off a branch on which we invited someone, and the roster we're on now doesn't list them (and our change
+     * wasn't re-applied): they only know us, so we tell them, or they'd wait on an invitation nobody else knows of.
+     */
+    private fun tellLostInvitees(m: GroupModel, prior: SignedRoster, now: SignedRoster) {
+        val cur = m.roster ?: return
+        for (x in lostBranch(m, prior, now)) {
+            val parent = store.history(m.gid, x.roster.prev)?.roster ?: continue
+            if (x.roster.by != me) {
+                continue
+            }
+            for (mem in x.roster.members) {
+                if (mem.role == Role.INVITED && parent.role(mem.id) == null && cur.roster.role(mem.id) == null) {
+                    io.sendDirect(m.gid, mem.id, rosterContent(cur))
+                }
+            }
         }
     }
 

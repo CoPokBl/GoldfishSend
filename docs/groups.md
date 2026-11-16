@@ -136,6 +136,11 @@ admin forwarded when inviting them). Admins, who keep every card, close the gaps
 - **Invited members** have no inbox yet: rosters reach them only over 1:1, from an author who has them as a contact. An
   admin relaying a roster sends it to invitees over 1:1 too, so they don't build their acceptance on a stale roster.
   On joining they send `gsync` to their inviter, over 1:1 if they can, and their card the same way.
+- **An invitation that lost a fork** (the inviter was removed meanwhile, say): the invitee knows nobody else, so the
+  inviter, on moving off the branch that invited them, sends them the roster they're on now over 1:1, if it doesn't
+  list them. An invitee takes a roster from their inviter over 1:1 that leaves them out, at least as new as the
+  invitation and signed by one of its admins, as the invitation being off: they can't check it against the history,
+  but the inviter could withdraw the invitation anyway.
 - **The inviter who has left** may be the newcomer's only link to the group. A member who has left and then gets, over
   1:1, an invitee's answer (their acceptance or decline roster) sends it on over 1:1 to the admins who are their
   contacts; and a newcomer's first card, to their contacts in the group, with those contacts' cards to the newcomer.

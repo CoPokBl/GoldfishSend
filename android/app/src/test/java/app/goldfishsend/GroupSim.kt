@@ -356,7 +356,11 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
                 when (e) {
                     is GroupEvent.Removed -> waiting.removeAll { it.first == m.gid && it.second in e.ids }
                     is GroupEvent.Left -> waiting.removeAll { it.first == m.gid && it.second == e.id }
-                    is GroupEvent.YouWereRemoved, GroupEvent.YouLeft -> waiting.removeAll { it.first == m.gid }
+                    is GroupEvent.YouWereRemoved, GroupEvent.YouLeft -> {
+                        waiting.removeAll { it.first == m.gid }
+                        // Like Groups.afterDeparture: our group inbox goes (the engine ignores it once we're out anyway).
+                        inboxes.remove(m.gid)
+                    }
                     else -> Unit
                 }
             }
