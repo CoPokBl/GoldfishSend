@@ -158,6 +158,15 @@ class GroupStatefulTest {
     @Test
     fun declineDeeperInALostBranch() = scenario(5L, listOf(Op(11, 0, 0, 0), Op(0, 94, 0, 0), Op(1, 101, 0, 0), Op(1, 94, 0, 0)))
 
+    /** Found by GroupScenarioFuzzTest: Bob joined a withdrawn invitation, was invited again, and stayed "joined" but invited. */
+    @Test
+    fun joinedButStillInvited() =
+        scenario(7L, listOf(Op(11, 0, 0, 0), Op(3, 0, 81, 0), Op(5, 0, 0, 0), Op(8, 0, 118, 51), Op(2, 0, 11, 0), Op(0, 71, 0, 0)))
+
+    /** A roster a sync answer couldn't place made Mallory ask again, forever (a message storm). The generated scenario. */
+    @Test
+    fun syncRequestLoop() = scenario(1341L, GroupScenario.generate(1341L, length(1341L)))
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

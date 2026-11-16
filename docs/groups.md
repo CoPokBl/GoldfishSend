@@ -99,7 +99,8 @@ For a received roster R, with current roster C:
      X as invited): an old departure or acceptance, from before X was removed and added again, can be replayed by
      anyone who kept it.
    - A newer roster by a non-admin whose parent we don't have (we missed what came before), passed on by an admin:
-     ask that admin for the history with `gsync`.
+     ask that admin for the history with `gsync`, once per roster. Also, whenever we've joined but a roster we take
+     still lists us as invited (our acceptance was lost, or was for an earlier invitation), accept again.
 4. **Diff against the old roster:**
    - **Removed members:** stop sending to them. Their card is kept only until what's already queued to them (the roster
      that removed them) is delivered, then deleted, and so is their session once they're in no other group.

@@ -480,9 +480,9 @@ class GroupEngine(
                     store.addHistory(c.g, signed, sibling = true)
                 }
                 // A newer roster by a non-admin that we can't place (we missed what it builds on), passed on by an admin:
-                // ask that admin for the history. Once we have its parent, a sync wouldn't tell us more.
+                // ask that admin for the history. Once per roster: if the answer doesn't place it, asking again won't.
                 if (r.ver > cur.roster.ver && from != r.by && cur.roster.isAdmin(from) && m.state == GroupModel.JOINED &&
-                    store.history(c.g, r.prev) == null
+                    store.history(c.g, r.prev) == null && askedOnce("$me ${signed.hashB64}")
                 ) {
                     requestSync(m, from, cur.roster.ver)
                 }
@@ -691,6 +691,10 @@ class GroupEngine(
             io.onEvents(m, events)
         }
         reapplyLost(m, signed)
+        // We joined, but this roster still has us invited (our acceptance was on a stint that's over, or got lost): again.
+        if (m.state == GroupModel.JOINED && signed.roster.role(me) == Role.INVITED && signed.roster.by != me) {
+            publish(m, RosterOp.Accept)
+        }
         heldReady += m.gid
     }
 
@@ -869,6 +873,21 @@ class GroupEngine(
         /** Marks a held row as already-decrypted content from an invitee (a real hint key is 32 bytes). */
         private val HELD_CONTENT = byteArrayOf(0x43)
         private const val IDENTITY_LEN = 33
+
+        /** Rosters we asked for a sync about (see onRoster), newest last. Per process, which is enough to stop a loop. */
+        private val asked = LinkedHashSet<String>()
+
+        /** True the first time [key] is seen (of the last 256). */
+        @Synchronized
+        private fun askedOnce(key: String): Boolean {
+            if (!asked.add(key)) {
+                return false
+            }
+            if (asked.size > 256) {
+                asked.remove(asked.first())
+            }
+            return true
+        }
 
         /** Protocol decisions, for debugging. The app routes this to logcat in debug builds only; it never carries content. */
         @Volatile
