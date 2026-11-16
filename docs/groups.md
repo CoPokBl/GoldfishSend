@@ -92,7 +92,7 @@ For a received roster R, with current roster C:
      them in can still lose), until they're 16 versions old.
    - **Skipped versions.** A roster whose parent we don't have, from an admin of C and newer than C, is taken anyway
      (we missed versions), and we ask that admin for the history with `gsync`. Any other roster we can't place: if an
-     admin signed or passed it on, ask them for the history from 16 versions back, once per roster.
+     admin signed or passed it on, ask them for the history from 16 versions back, once per roster an hour.
    - **Departures can't be lost.** A roster signed by X that doesn't list X means "X is leaving" (or declining),
      whatever its version or branch. An admin who holds one while X is still in C publishes a roster removing X. Every
      roster in the tree counts, not only new ones: one can join the tree long after it arrived, or sit on a branch that
@@ -144,7 +144,7 @@ admin forwarded when inviting them). Admins, who keep every card, close the gaps
   copy of version `have` may be a concurrent sibling that lost, and they need the winner. To someone who isn't an
   active member (still invited, or invited again while out) they go over 1:1 where possible: such a member may not
   read their group inbox. A member who is out but listed as invited, and can't tell whether that's a new invitation
-  (a gap in their history), asks the admin who signed it, once per roster.
+  (a gap in their history), asks the admin who signed it, once per roster an hour.
 
 Duplicates are harmless: a roster already held is ignored, and a card with a `seq` already held is ignored.
 

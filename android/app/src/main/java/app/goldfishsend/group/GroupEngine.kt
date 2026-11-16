@@ -508,7 +508,7 @@ class GroupEngine(
         val admin = listOf(from, r.by).firstOrNull { it != me && cur.roster.isAdmin(it) }
         // Kept: once its parent comes, it's part of the picture (chooseHead, enforceAll).
         store.addHistory(m.gid, signed, sibling = true)
-        if (admin != null && m.state == GroupModel.JOINED && askedOnce("$me ${signed.hashB64}")) {
+        if (admin != null && m.state == GroupModel.JOINED && askOnce("$me ${signed.hashB64}", io.nowMillis())) {
             // From as far back as forks are decided: what it builds on may be a branch we never saw.
             requestSync(m, admin, (cur.roster.ver - FORK_DEPTH).coerceAtLeast(0))
         }
@@ -859,7 +859,7 @@ class GroupEngine(
         val by = line.by
         if (by == null) {
             // Out of the group, nobody sends us the history: ask the admin who signed it, once per roster.
-            if (line.gap && cur.roster.isAdmin(cur.roster.by) && cur.roster.by != me && askedOnce("$me line ${cur.hashB64}")) {
+            if (line.gap && cur.roster.isAdmin(cur.roster.by) && cur.roster.by != me && askOnce("$me line ${cur.hashB64}", io.nowMillis())) {
                 requestSync(m, cur.roster.by, (cur.roster.ver - FORK_DEPTH).coerceAtLeast(0))
             }
             return
@@ -1024,20 +1024,30 @@ class GroupEngine(
         private val HELD_CONTENT = byteArrayOf(0x43)
         private const val IDENTITY_LEN = 33
 
-        /** Rosters we asked for a sync about (see onRoster), newest last. Per process, which is enough to stop a loop. */
-        private val asked = LinkedHashSet<String>()
+        /** Syncs we asked for (see onRoster), by what about, and when; newest last. Per process: enough to stop a loop. */
+        private val asked = LinkedHashMap<String, Long>()
 
-        /** True the first time [key] is seen (of the last 256). */
+        /** A sync whose answer didn't help may be asked for again after this long (the answer may have been lost). */
+        private const val ASK_AGAIN_MS = 3600_000L
+
+        /** True if [key] wasn't asked about in the last hour (of the last 256 keys). */
         @Synchronized
-        private fun askedOnce(key: String): Boolean {
-            if (!asked.add(key)) {
+        private fun askOnce(key: String, now: Long): Boolean {
+            val last = asked[key]
+            if (last != null && now - last in 0 until ASK_AGAIN_MS) {
                 return false
             }
+            asked.remove(key)
+            asked[key] = now
             if (asked.size > 256) {
-                asked.remove(asked.first())
+                asked.remove(asked.keys.first())
             }
             return true
         }
+
+        /** For tests: each scenario starts with a fresh process, as far as this goes. */
+        @Synchronized
+        fun forgetAsked() = asked.clear()
 
         /** Protocol decisions, for debugging. The app routes this to logcat in debug builds only; it never carries content. */
         @Volatile

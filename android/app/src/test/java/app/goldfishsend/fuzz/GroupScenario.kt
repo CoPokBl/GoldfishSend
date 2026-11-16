@@ -65,6 +65,7 @@ class GroupScenario(private val seed: Long) {
     private val drops = mutableListOf<String>()
 
     init {
+        GroupEngine.forgetAsked()
         net.clock = { now }
         if (debug) {
             net.trace = { println(it) }
