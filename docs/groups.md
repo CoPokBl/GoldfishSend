@@ -162,10 +162,11 @@ For a received roster R, with current roster C:
   - **Duplicates:** one fact of each kind per stint.
 - **An acceptance of a withdrawn invitation,** over 1:1 from its author: the owner answers once per head of its own,
   over 1:1, with its chain from that invitation, which says how it ended.
-- **An acceptance that reaches an inviter who has left.** The invitee only knows the inviter. They answer once, over
-  1:1, with their chain from the invitation, the facts they hold (which say who owns the group now) and the new owner's
-  card if they have it. The invitee then sends their acceptance on to the new owner. If nobody is left to own the
-  group, the answer says so.
+- **An acceptance that reaches an inviter who has left.** The invitee only knows the inviter. They answer over 1:1,
+  at most once an hour, with their chain from the invitation, the facts they hold (which say who owns the group now)
+  and the new owner's card if they have it. The invitee then sends their acceptance on to the new owner. If nobody is
+  left to own the group, the answer says so. The same goes for an acceptance the inviter took in before leaving: what
+  they sent the newcomer since may have been lost.
 
 #### Heads
 Every `gtext`, `greceipt`, `gdelete` and `gstate` carries the sender's **head** `h`, inside the E2E payload:
@@ -215,6 +216,14 @@ or a head we know changes, for every active member of our view:
   `gdelete` or an ask arrives from them at least an hour after we last sent them anything, and still shows they lack
   something, it's owed again. Sooner than that, it's most likely still on its way: answering it again would have two
   members keep answering each other's states in flight.
+- **Rosters that don't connect.** A state whose rosters are all further on than ours, with a gap, comes from someone
+  whose chain starts after ours ends (they joined later). So does a message from someone our roster doesn't list,
+  whose head is further on. Only an owner of ours can fill the gap, so what we owe it is owed again (at most once an
+  hour); if it has left, its answer says who owns the group now.
+- **Senders our roster doesn't list.** The first message from someone our roster doesn't list yet (a newcomer, or an
+  owner who came after our roster) is read if its hint matches the identity in it (a PreKey message). A state is
+  merged, since it checks itself; anything else waits, like an early message, for a roster that lists them. The newest
+  8 such senders are remembered, so the rest of a chunked state is read too.
 
 Besides members:
 - **Joined, not taken in yet:** we owe the owner our state (our acceptance in it), once per head of ours: through
@@ -259,7 +268,8 @@ Each inbox uses its own hint key: a rotated inbox keeps its old one while it dra
   same sender.
 - **No match.** A blob with no matching member is dropped.
 - **Newcomers.** A PreKey message whose hint matches the identity inside it, but from someone who isn't a member yet,
-  is held for up to 7 days, waiting for a roster that adds them. Then it's dropped.
+  is read (see "What's owed"): a state is merged, anything else is held for up to 7 days, waiting for a roster that
+  adds them. Then it's dropped.
 - **Early messages.** Pushes aren't ordered, so a newcomer's first messages can arrive before their acceptance. A
   `gtext`, `greceipt` or `gdelete` from someone the view still lists as `invited` is kept, already decrypted, in the
   encrypted database, for at most 7 days. It's replayed once the view makes them a member.

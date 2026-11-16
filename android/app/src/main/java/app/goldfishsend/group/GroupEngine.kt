@@ -85,6 +85,8 @@ data class PeerSync(
     val sentN: Int = 0,
     val sentTs: Long = 0,
     val out: Boolean = false,
+    /** Not in our roster, but their first message proved who they are: a member we haven't heard is one yet. */
+    val unlisted: Boolean = false,
     val outFrom: Long = 0,
 ) {
     companion object {
@@ -596,10 +598,10 @@ class GroupEngine(
         if (m.state != GroupModel.JOINED) {
             return
         }
-        val sender = r.ids().firstOrNull { id ->
+        val sender = (r.ids() + m.peers.filter { it.value.unlisted }.keys).firstOrNull { id ->
             id != me && GroupCrypto.hint(inboxHintKey, blob.nonce, B64.dec(id)).contentEquals(blob.mac)
         }
-        dbg { "receive g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
+        dbg { "${who(me)} receives g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
         if (sender == null) {
             // Someone we took out, still writing to the group: they didn't hear (it was lost). Their message isn't
             // read; the rosters that say so are owed again, at most once per [RESEND_AFTER].
@@ -614,12 +616,22 @@ class GroupEngine(
                 }
                 return
             }
-            // A newcomer whose admission hasn't reached us yet: keep it (bounded, 7 days) if the hint really is theirs.
+            // Someone our roster doesn't list yet (a newcomer, or an owner who came after it): if the hint really is the
+            // identity inside, read it. State checks itself; anything else waits for a roster that lists them.
             if (blob.type == PREKEY) {
                 val id = runCatching { PreKeySignalMessage(blob.body).identityKey.serialize() }.getOrNull() ?: return
-                if (GroupCrypto.hint(inboxHintKey, blob.nonce, id).contentEquals(blob.mac)) {
-                    store.hold(gid, inboxHintKey, raw)
+                if (!GroupCrypto.hint(inboxHintKey, blob.nonce, id).contentEquals(blob.mac)) {
+                    return
                 }
+                val from = B64.enc(id)
+                val content = decrypt(from, blob) ?: return
+                val unlisted = m.peers.filter { it.value.unlisted }.keys
+                if (unlisted.size >= MAX_UNLISTED) {
+                    m.peers.remove(unlisted.first())
+                }
+                m.peers[from] = (m.peers[from] ?: PeerSync()).copy(unlisted = true)
+                store.save(m)
+                onContent(m.gid, from, content, direct = false)
             }
             return
         }
@@ -678,7 +690,7 @@ class GroupEngine(
         if (content.groupId != gid) {
             return
         }
-        dbg { "content ${content.javaClass.simpleName} g=${gid.take(6)} from=${who(from)} direct=$direct" }
+        dbg { "${who(me)} content ${content.javaClass.simpleName} g=${gid.take(6)} from=${who(from)} direct=$direct" }
         when (content) {
             is Content.GState -> onState(from, content, direct)
             is Content.GText -> active(gid, from, content.h)?.let { io.onText(it, from, content) } ?: holdFromInvitee(gid, from, content)
@@ -696,8 +708,13 @@ class GroupEngine(
      */
     private fun holdFromInvitee(gid: String, from: String, content: Content) {
         val m = store.load(gid) ?: return
-        if (m.state != GroupModel.JOINED || m.view()?.role(from) != Role.INVITED) {
+        val role = m.view()?.role(from)
+        if (m.state != GroupModel.JOINED || (role != Role.INVITED && !(role == null && m.peers[from]?.unlisted == true))) {
             return
+        }
+        if (role == null && (content.head?.v ?: 0) > (m.roster?.roster?.ver ?: 0) + 1) {
+            // Someone our roster doesn't list, writing from further on: we missed what lists them.
+            behindAGap(m)
         }
         dbg { "holding ${content.javaClass.simpleName} from invitee ${who(from)}" }
         store.hold(gid, HELD_CONTENT, B64.dec(from) + content.encode())
@@ -738,9 +755,11 @@ class GroupEngine(
             val first = rosters.firstOrNull() ?: return
             invitation(from, first, direct) ?: return
         }
+        val was = store.load(c.g)?.roster?.roster?.ver ?: return
         for (sr in rosters) {
             onSignedRoster(store.load(c.g) ?: return, sr)
         }
+        store.load(c.g)?.let { m -> if (m.roster?.roster?.ver == was && rosters.any { it.roster.ver > was + 1 }) behindAGap(m) }
         val before = store.load(c.g)?.view() ?: return
         var changed = false
         var by = from
@@ -763,6 +782,20 @@ class GroupEngine(
             observe(m, from, c.h, renew = c.rosters.isEmpty() && c.facts.isEmpty() && c.cards.isEmpty())
         }
         store.save(m)
+    }
+
+    /**
+     * Someone sent us rosters further on than ours that don't connect: their chain starts after ours ends (they came
+     * later). Only an owner of ours can fill that, and what it sent us may have been lost: what we owe it is owed again
+     * (at most once per [RESEND_AFTER]). If it has left since, its answer names who owns the group now.
+     */
+    private fun behindAGap(m: GroupModel) {
+        val owner = m.view()?.owner?.takeIf { it != me } ?: return
+        val ps = m.peers[owner] ?: return
+        if (io.nowMillis() - ps.sentTs >= RESEND_AFTER) {
+            m.peers[owner] = ps.copy(sent = null, sentN = 0)
+            store.save(m)
+        }
     }
 
     /** A roster for a group we don't know: an invitation if it came over 1:1, signed by its owner, listing us invited. */
@@ -838,8 +871,16 @@ class GroupEngine(
         }
         val m = store.load(m0.gid) ?: return false
         val r = m.roster?.roster ?: return false
+        val out = m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
+        if (out) {
+            // Out of the group: an invitee's acceptance or decline that reached us, the inviter, is answered from our
+            // records, and so is one we took in before we left (what we sent them since may have been lost).
+            redirect(m, from, sf, direct)
+        }
         if (Membership.stale(r, f)) {
-            answerStale(m, from, sf, direct)
+            if (!out) {
+                answerStale(m, from, sf, direct)
+            }
             return false
         }
         if (m.facts.any { it.key == sf.key }) {
@@ -849,13 +890,9 @@ class GroupEngine(
         if (!applies && m.facts.count { it.fact.id == f.id && !Membership.applies(r, it.fact) } >= MAX_AHEAD) {
             return false
         }
-        if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
-            // Out of the group: an invitee's acceptance that reached us, the inviter, is answered from our records.
-            redirect(m, from, sf, direct)
-            if (applies || !Membership.stale(r, f)) {
-                m.facts += sf
-                store.save(m)
-            }
+        if (out) {
+            m.facts += sf
+            store.save(m)
             return false
         }
         m.facts += sf
@@ -879,11 +916,11 @@ class GroupEngine(
         val mine = head(m) ?: return
         val ps = m.peers[from] ?: PeerSync()
         val key = "stale>${mine.key}"
-        if (ps.sent == key || chain(m, 0).none { it.roster.member(f.id)?.since == f.since }) {
+        if ((ps.sent == key && io.nowMillis() - ps.sentTs < RESEND_AFTER) || chain(m, 0).none { it.roster.member(f.id)?.since == f.since }) {
             return
         }
         if (states(m, mine, f.since - 1, withCards = false, withFacts = false).all { io.sendDirect(m.gid, from, it) }) {
-            m.peers[from] = ps.copy(sent = key)
+            m.peers[from] = ps.copy(sent = key, sentTs = io.nowMillis())
             store.save(m)
         }
     }
@@ -905,14 +942,14 @@ class GroupEngine(
         val mine = head(m) ?: return
         val ps = m.peers[from] ?: PeerSync()
         val key = "redirect>${mine.key}"
-        if (ps.sent == key) {
+        if (ps.sent == key && io.nowMillis() - ps.sentTs < RESEND_AFTER) {
             return
         }
         val base = states(m, mine, f.since - 1, withCards = false).first()
         val ownerCard = owner?.let { m.cards[it] ?: m.departed[it] }
         val content = base.copy(cards = listOfNotNull(ownerCard?.let { Signed(B64.enc(it.bytes), B64.enc(it.sig)) }))
         if (io.sendDirect(m.gid, from, content)) {
-            m.peers[from] = ps.copy(sent = key)
+            m.peers[from] = ps.copy(sent = key, sentTs = io.nowMillis())
             store.save(m)
         }
     }
@@ -988,7 +1025,10 @@ class GroupEngine(
         m.departed.clear()
         m.cards.filterKeys { it !in ids }.let { m.departed.putAll(it) }
         m.cards.keys.retainAll(ids)
-        m.peers.keys.retainAll { it in ids || m.peers[it]?.out == true }
+        m.peers.keys.retainAll { it in ids || m.peers[it]?.out == true || m.peers[it]?.unlisted == true }
+        for (id in ids) {
+            m.peers[id]?.takeIf { it.unlisted }?.let { m.peers[id] = it.copy(unlisted = false) }
+        }
         store.save(m)
         if (events.isNotEmpty()) {
             io.onEvents(m, events)
@@ -1084,6 +1124,9 @@ class GroupEngine(
 
         /** Facts looked at per state message (two per member is all there can be). */
         private const val MAX_FACTS = 2 * RosterRules.MAX_MEMBERS
+
+        /** Senders not in our roster whose messages we read ([PeerSync.unlisted]), the newest. */
+        private const val MAX_UNLISTED = 8
 
         /** State messages sent to one peer per head of ours, whatever heads they show (inventing heads gets no more). */
         const val MAX_STATES = 3
