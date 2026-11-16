@@ -27,6 +27,15 @@ public sealed class IntegrationFactAttribute : FactAttribute {
     }
 }
 
+public sealed class IntegrationTheoryAttribute : TheoryAttribute {
+    public IntegrationTheoryAttribute() {
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GF_TEST_MYSQL"))
+            || string.IsNullOrEmpty(Environment.GetEnvironmentVariable("GF_TEST_REDIS"))) {
+            Skip = "Set GF_TEST_MYSQL and GF_TEST_REDIS to run integration tests.";
+        }
+    }
+}
+
 [CollectionDefinition(Name)]
 public sealed class GoldfishCollection : ICollectionFixture<GoldfishFixture> {
     public const string Name = "goldfish";

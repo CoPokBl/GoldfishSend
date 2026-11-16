@@ -49,6 +49,9 @@ builder.WebHost.ConfigureKestrel(kestrel => {
 builder.Services.ConfigureHttpJsonOptions(json => {
     json.SerializerOptions.TypeInfoResolverChain.Insert(0, ApiJsonContext.Default);
 });
+// Unreadable request bodies are a client error in every environment. Development would otherwise throw, and the gateway
+// would turn that into a 500.
+builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(handlers => handlers.ThrowOnBadRequest = false);
 
 // Trusted reverse proxies (Caddy, Traefik, a cloud load balancer). Blank entries are ignored, so compose files can leave
 // optional slots empty. Anything else that doesn't parse is a hard startup error, never a silent "trust nobody".
