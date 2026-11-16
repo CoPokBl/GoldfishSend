@@ -290,7 +290,9 @@ class GroupEngine(
             throw NoCardException(to)
         }
         val addr = GroupCrypto.address(to)
-        if (!signal.containsSession(addr)) {
+        // A stored session can have no current state to send with (its last one archived): start a new one then too,
+        // or every message to this member would fail from now on.
+        if (!signal.containsSession(addr) || !signal.loadSession(addr).hasSenderChain()) {
             val b = card.bundle
             val bundle = PreKeyBundle(
                 b.registrationId,
