@@ -117,8 +117,10 @@ For a received roster R, with current roster C:
    - **Removed members:** stop sending to them. Their card is kept only until what's already queued to them (the roster
      that removed them) is delivered, then deleted, and so is their session once they're in no other group.
    - **If we were removed:** mark the group "You were removed" and stop sending.
-   - **Once out** (removed, left or declined), only a roster on whose line we were out at some point invites us again.
-     A branch that listed us all along (it lost to our departure or removal elsewhere) isn't an invitation.
+   - **Once out** (removed, left or declined), only a roster on whose line we were taken out at some point (a step from
+     a roster listing us to one that doesn't) invites us again. A branch on which that never happened (it lost to our
+     departure or removal elsewhere) isn't an invitation. Where we don't hold the line that far back, it's checked
+     again as the rosters we were missing arrive.
    - **If anyone was removed:** rotate our group inbox (a new mailbox and a new card with a new `hintKey`), send the
      new card to the remaining members, and delete the old mailbox after a 15-day drain.
 

@@ -467,6 +467,7 @@ class GroupEngine(
             if (valid) {
                 enforceAll(m)
             }
+            recheckInvitation(m)
             return
         }
         val cardsBefore = m.cards.toMap()
@@ -485,6 +486,7 @@ class GroupEngine(
             }
         }
         enforceAll(m)
+        recheckInvitation(m)
     }
 
     /** A roster whose parent we don't have: we missed versions, or it builds on a branch we never saw. */
@@ -498,6 +500,7 @@ class GroupEngine(
             accept(m, signed)
             relay(m, signed, cardsBefore)
             requestSync(m, r.by, cur.roster.ver)
+            recheckInvitation(m)
             return
         }
         // Otherwise it can only be placed once we have its parent. Ask an admin who sent or signed it, once per roster:
@@ -764,7 +767,7 @@ class GroupEngine(
         val old = prior?.roster
         m.roster = signed
         store.addHistory(m.gid, signed)
-        val events = diff(m, old, signed.roster, reinvite = prior == null || reinvited(m, signed))
+        val events = diff(m, old, signed.roster) { prior == null || reinvited(m, signed) }
         store.save(m)
         if (events.isNotEmpty()) {
             io.onEvents(m, events)
@@ -810,15 +813,43 @@ class GroupEngine(
     }
 
     /**
-     * Out of the group, whether [r] (which lists us) invites us again: somewhere down its line we were out. A branch that
-     * listed us all along (it lost to our departure or removal elsewhere) isn't an invitation. A gap counts as yes.
+     * Out of the group, whether [r] (which lists us) invites us again: somewhere down its line we were taken out (a step
+     * from a roster listing us to one that doesn't). A branch on which that never happened (it lost to our departure or
+     * removal elsewhere) isn't an invitation.
      */
-    private fun reinvited(m: GroupModel, r: SignedRoster): Boolean {
+    private fun reinvited(m: GroupModel, r: SignedRoster): Boolean = reinviter(m, r) != null
+
+    /** For [reinvited]: who invited us again (the author of the first roster listing us after we were out), or null. */
+    private fun reinviter(m: GroupModel, r: SignedRoster): String? {
         var x = r
-        while (x.roster.role(me) != null) {
-            x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver < x.roster.ver } ?: return x.roster.prev.isNotEmpty()
+        var listing = r
+        while (true) {
+            if (x.roster.role(me) != null) {
+                listing = x
+            }
+            // Where our history of the line stops we can't tell (yet): recheckInvitation looks again as it fills.
+            val parent = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver < x.roster.ver } ?: return null
+            if (x.roster.role(me) == null && parent.roster.role(me) != null) {
+                return listing.roster.by
+            }
+            x = parent
         }
-        return true
+    }
+
+    /**
+     * Out of the group, with our roster listing us as invited but not counted as an invitation (see [reinvited]): what we
+     * were missing to tell may have come since.
+     */
+    private fun recheckInvitation(m: GroupModel) {
+        val cur = m.roster ?: return
+        if ((m.state != GroupModel.LEFT && m.state != GroupModel.REMOVED) || cur.roster.role(me) != Role.INVITED) {
+            return
+        }
+        val by = reinviter(m, cur) ?: return
+        m.state = GroupModel.INVITED
+        m.invitedBy = by
+        store.save(m)
+        io.onEvents(m, listOf(GroupEvent.Invited(by)))
     }
 
     /** Whether [r] is [base] or built on it, as far as our history tells. A gap in it counts as yes. */
@@ -830,7 +861,7 @@ class GroupEngine(
         return cur.hashB64 == base.hashB64
     }
 
-    private fun diff(m: GroupModel, old: Roster?, new: Roster, reinvite: Boolean): List<GroupEvent> {
+    private fun diff(m: GroupModel, old: Roster?, new: Roster, reinvite: () -> Boolean): List<GroupEvent> {
         val by = new.by
         val events = mutableListOf<GroupEvent>()
         val oldIds = old?.ids().orEmpty().toSet()
@@ -850,7 +881,7 @@ class GroupEngine(
                 m.state = GroupModel.REMOVED
                 events += GroupEvent.YouWereRemoved(by)
             }
-        } else if (new.role(me) == Role.INVITED && (m.state == GroupModel.REMOVED || m.state == GroupModel.LEFT) && reinvite) {
+        } else if (new.role(me) == Role.INVITED && (m.state == GroupModel.REMOVED || m.state == GroupModel.LEFT) && reinvite()) {
             m.state = GroupModel.INVITED
             m.invitedBy = by
             events += GroupEvent.Invited(by)

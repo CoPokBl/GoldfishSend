@@ -241,6 +241,34 @@ class GroupStatefulTest {
         listOf(Op(11, 0, 0, 0), Op(2, 0, 252, 0), Op(12, 0, 0, 0), Op(0, 1, 0, 0), Op(5, 0, 0, 0), Op(8, 0, 85, 0), Op(1, 222, 0, 0), Op(1, 181, 0, 0), Op(8, 255, 255, 0)),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest.forks: Dave declined; Mallory's fork from before that, which still listed him invited,
+     * won the tie at Dave, and the original invitation further down its line looked like a new one.
+     */
+    @Test
+    fun declinedThenInvitedByAFork() =
+        scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 45, 0, 0), Op(1, 28, 0, 0), Op(8, 0, 79, 0), Op(8, 0, 0, 0), Op(12, 51, 0, 0), Op(12, 0, 0, 0)))
+
+    /**
+     * Bob declined, was added again, and the roster re-adding him reached him with a gap before it: whether it was an
+     * invitation couldn't be told then, and wasn't looked at again once the gap filled.
+     */
+    @Test
+    fun reinvitationBehindAGap() = scenario(
+        122L,
+        listOf(Op(11, 0, 0, 0), Op(1, 151, 0, 0), Op(8, 29, 0, 0), Op(1, 184, 0, 0), Op(12, 0, 0, 0), Op(2, 0, 146, 0), Op(10, 13, 0, 25), Op(8, 230, 109, 0)),
+    )
+
+    /** Carol left; Mallory's fork from before won at Carol, and her original invitation down its line counted as a new one. */
+    @Test
+    fun leftThenInvitedByTheOriginalInvitation() = scenario(
+        2740L,
+        listOf(
+            Op(8, 108, 41, 117), Op(2, 0, 47, 0), Op(8, 172, 0, 0), Op(0, 12, 0, 0), Op(10, 0, 0, 0), Op(7, 147, 0, 0), Op(12, 0, 0, 0),
+            Op(1, 37, 0, 0), Op(12, 0, 36, 0), Op(8, 246, 10, 0),
+        ),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {
