@@ -562,8 +562,9 @@ class GroupScenario(private val seed: Long) {
                 // owner, like anything sent to them), and they find out if they accept again.
                 role == Role.INVITED -> m.state == GroupModel.INVITED || ((pending(p, m) || m.state == GroupModel.LEFT) && p.id in lostFrom) || unreachable(p, h)
                 // Out: they know it, or nobody still in can reach them. Invitees are out of delivery: one whose invitation
-                // was withdrawn hears once over 1:1, and if that was lost, finds out when they accept (the owner answers).
-                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || (m.state == GroupModel.INVITED && p.id in lostTo) ||
+                // was withdrawn hears once over 1:1 (or, if they had accepted, the owner answers once): if that was lost, they
+                // find out when they accept, or stay waiting to be let in.
+                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || ((m.state == GroupModel.INVITED || pending(p, m)) && p.id in lostTo) ||
                     unreachable(p, h)
             }
             if (!ok) {

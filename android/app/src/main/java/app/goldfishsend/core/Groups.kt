@@ -125,7 +125,7 @@ object Groups {
         return cid
     }
 
-    /** Accepts an invitation: our inbox, keys and card go to every member. */
+    /** Accepts an invitation: our inbox, keys and card go to the owner, who lets us in. */
     suspend fun join(s: Session, cid: Long) {
         val m = model(s, cid) ?: return
         if (m.state != GroupModel.INVITED) {

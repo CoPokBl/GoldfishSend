@@ -323,6 +323,9 @@ class GroupEngine(
             for (id in targets.toSet() - me) {
                 send(m, id, content)
             }
+            if (m.state == GroupModel.INVITED) {
+                v.owner?.let { m.peers[it] = PeerSync(sent = DECLINED) }
+            }
         }
         m.state = GroupModel.LEFT
         // The cards stay until what's queued above is delivered; nothing new is sent once we've left.
@@ -376,6 +379,10 @@ class GroupEngine(
         if (m.state == GroupModel.JOINED && m.roster!!.roster.role(me) == Role.INVITED) {
             oweAcceptance(m, v, mine)
             store.save(m)
+            return
+        }
+        if (m.state == GroupModel.LEFT && m.roster!!.roster.role(me) == Role.INVITED) {
+            oweDecline(m, v, mine)
             return
         }
         if (m.state != GroupModel.JOINED) {
@@ -440,6 +447,22 @@ class GroupEngine(
         val content = if (ahead) Content.GState(m.gid, mine) else Content.GState(m.gid, mine, facts = listOf(acc.wire()))
         if (send(m, owner, content)) {
             m.peers[owner] = ps.copy(sent = key, sentAt = mine.key, sentN = 1, sentTs = io.nowMillis())
+        }
+    }
+
+    /**
+     * Declined: our departure is owed to the owner, once each. It went to the one we knew when we declined; if they had
+     * left, their answer ([redirect]) names the one after them.
+     */
+    private fun oweDecline(m: GroupModel, v: View, mine: Head) {
+        val owner = v.owner?.takeIf { it != me } ?: return
+        val dep = m.facts.lastOrNull { it.fact.id == me && it.fact.kind == FactKind.LEAVE && it.fact.since == m.since } ?: return
+        if (m.peers[owner]?.sent == DECLINED) {
+            return
+        }
+        if (io.sendDirect(m.gid, owner, Content.GState(m.gid, mine, facts = listOf(dep.wire())))) {
+            m.peers[owner] = PeerSync(sent = DECLINED)
+            store.save(m)
         }
     }
 
@@ -825,13 +848,14 @@ class GroupEngine(
     }
 
     /**
-     * We invited them, then left: their acceptance reached only us. They get, over 1:1, our chain from the invitation, the
+     * We invited them, then left: their acceptance (or decline) reached only us. They get, over 1:1, our chain from the invitation, the
      * facts we hold (which say who owns the group now) and that owner's card, and can send it on themselves.
      */
     private fun redirect(m: GroupModel, from: String, sf: SignedFact, direct: Boolean) {
         val f = sf.fact
         val r = m.roster?.roster ?: return
-        if (!direct || from != f.id || f.kind != FactKind.ACCEPT || r.member(f.id)?.since != f.since) {
+        val mem = r.member(f.id)
+        if (!direct || from != f.id || mem?.since != f.since || (f.kind != FactKind.ACCEPT && mem.role != Role.INVITED)) {
             return
         }
         val v = m.view() ?: return
@@ -1019,6 +1043,9 @@ class GroupEngine(
 
         /** State messages sent to one peer per head of ours, whatever heads they show (inventing heads gets no more). */
         const val MAX_STATES = 3
+
+        /** [PeerSync.sent] for an owner our decline went to. */
+        private const val DECLINED = "declined"
 
         /** How long what we sent a peer counts as on its way: after that, a message showing they still lack it renews it. */
         const val RESEND_AFTER = 60 * 60 * 1000L

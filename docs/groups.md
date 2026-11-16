@@ -236,7 +236,9 @@ Invitees are outside delivery: they have no inbox in the group, and nobody but t
 - **Being let in.** The owner's next roster admits them and carries their card. Then the owner owes them its state, like
   any member who has shown no head.
 - **A withdrawn invitation** goes to them once, over 1:1. If that's lost, they find out when they accept: the owner
-  answers (see "Accepting a fact").
+  answers (see "Accepting a fact"). If that answer is lost too, they stay waiting to be let in, until they leave.
+- **A decline that reaches an inviter who has left** is answered like an acceptance; the invitee then sends it on to
+  the owner that answer names, once.
 
 ## Message format
 
