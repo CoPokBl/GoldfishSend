@@ -53,7 +53,7 @@ class GroupStatefulTest {
         app.goldfishsend.group.GroupEngine.debugLog = { println("    $it") }
         try {
             // Just a seed: the scenario randomScenarios generates for it.
-            scenario(seed, ops.ifEmpty { GroupScenario.generate(seed, length(seed)) })
+            scenario(seed, ops.ifEmpty { GroupScenario.generate(seed, length(seed)).also { println("ops: ${it.joinToString(", ")}") } })
         } finally {
             GroupScenario.debug = false
             app.goldfishsend.group.GroupEngine.debugLog = null
@@ -163,9 +163,73 @@ class GroupStatefulTest {
     fun joinedButStillInvited() =
         scenario(7L, listOf(Op(11, 0, 0, 0), Op(3, 0, 81, 0), Op(5, 0, 0, 0), Op(8, 0, 118, 51), Op(2, 0, 11, 0), Op(0, 71, 0, 0)))
 
-    /** A roster a sync answer couldn't place made Mallory ask again, forever (a message storm). The generated scenario. */
+    /** A roster a sync answer couldn't place made Mallory ask again, forever (a message storm). Seed 1341's steps. */
     @Test
-    fun syncRequestLoop() = scenario(1341L, GroupScenario.generate(1341L, length(1341L)))
+    fun syncRequestLoop() = scenario(
+        1341L,
+        listOf(
+            Op(0, 64, 94, 20), Op(8, 224, 7, 250), Op(8, 91, 162, 133), Op(10, 53, 35, 69), Op(11, 167, 158, 33),
+            Op(6, 84, 94, 21), Op(10, 198, 43, 223), Op(8, 114, 98, 211), Op(7, 106, 79, 121), Op(4, 108, 114, 82),
+            Op(3, 253, 237, 49), Op(7, 105, 89, 234), Op(8, 178, 111, 18), Op(2, 94, 35, 215), Op(1, 92, 50, 98),
+            Op(6, 82, 55, 219), Op(8, 155, 89, 167), Op(8, 63, 32, 17), Op(1, 238, 67, 234), Op(4, 63, 97, 217),
+            Op(2, 110, 177, 30), Op(7, 220, 18, 95), Op(7, 2, 0, 117), Op(0, 94, 245, 215), Op(10, 33, 120, 35),
+            Op(8, 228, 242, 133), Op(7, 94, 232, 172), Op(10, 104, 145, 0), Op(7, 72, 34, 239), Op(8, 179, 34, 144),
+            Op(4, 82, 2, 101), Op(8, 163, 190, 124), Op(0, 242, 199, 187), Op(10, 55, 63, 15), Op(5, 67, 114, 172),
+            Op(7, 28, 120, 172), Op(10, 21, 212, 85), Op(10, 183, 220, 210), Op(8, 121, 168, 105), Op(6, 243, 175, 2),
+            Op(2, 135, 211, 200), Op(8, 107, 139, 145), Op(8, 78, 123, 135), Op(11, 222, 203, 32), Op(3, 173, 42, 37),
+            Op(8, 68, 232, 35), Op(3, 252, 148, 244), Op(0, 71, 115, 238), Op(2, 87, 235, 198), Op(8, 70, 140, 61),
+            Op(3, 171, 246, 215), Op(8, 156, 61, 182), Op(6, 113, 21, 167), Op(10, 73, 31, 199), Op(1, 140, 163, 190),
+            Op(7, 191, 250, 159), Op(2, 134, 224, 180), Op(7, 27, 236, 76), Op(7, 7, 138, 200), Op(7, 170, 188, 246),
+            Op(6, 56, 250, 17), Op(0, 70, 166, 27), Op(0, 99, 78, 243), Op(9, 181, 218, 31), Op(9, 47, 189, 208),
+            Op(1, 247, 85, 9), Op(2, 96, 146, 20), Op(8, 18, 139, 56), Op(8, 34, 216, 152), Op(6, 205, 136, 2),
+            Op(9, 168, 218, 37),
+        ),
+    )
+
+    /**
+     * Bob renamed on top of his v5, which lost a tie to Alice's v5 that hadn't reached him yet. Alice couldn't take Bob's
+     * v6 (it builds on the loser), and Bob found Alice's v5 too old: split until an admin's next change. (Also the
+     * committed input built-on-a-sibling-that-lost.)
+     */
+    @Test
+    fun builtOnASiblingThatLost() = scenario(
+        0L,
+        listOf(
+            Op(5, 0, 254, 59), Op(8, 0, 0, 0), Op(8, 229, 229, 229), Op(0, 0, 0, 0), Op(5, 0, 0, 254), Op(0, 1, 0, 0), Op(2, 0, 0, 0),
+            Op(8, 0, 136, 229), Op(1, 229, 0, 0), Op(1, 0, 0, 0), Op(0, 0, 0, 0), Op(10, 0, 0, 0), Op(5, 6, 0, 0),
+        ),
+    )
+
+    /** The same split, the other way round (the committed input open-sibling-branch-2). */
+    @Test
+    fun openSiblingBranch2() = scenario(
+        3L,
+        listOf(Op(5, 0, 254, 59), Op(8, 0, 0, 0), Op(8, 229, 0, 0), Op(5, 0, 0, 0), Op(0, 1, 0, 0), Op(5, 6, 0, 0), Op(3, 0, 0, 0), Op(5, 236, 0, 118)),
+    )
+
+    /**
+     * Seed 1226's steps. Bob, not an admin yet, saw Carol's departure before he could place it (he hadn't got what it
+     * built on) and dropped it. Once he was an admin he admitted her from an older acceptance, and her departure was
+     * never applied: Carol had left, but was a member for everyone else.
+     */
+    @Test
+    fun seed1226LostDeparture() = scenario(
+        1226L,
+        listOf(
+            Op(5, 183, 5, 118), Op(7, 197, 59, 141), Op(1, 100, 90, 157), Op(9, 146, 137, 208), Op(8, 180, 234, 181),
+            Op(2, 231, 81, 211), Op(8, 246, 214, 187), Op(7, 5, 155, 69), Op(7, 211, 38, 225), Op(7, 90, 222, 218),
+            Op(10, 195, 171, 96), Op(5, 170, 219, 137), Op(8, 174, 170, 227), Op(8, 115, 46, 158), Op(2, 115, 202, 69),
+            Op(8, 154, 90, 170), Op(8, 67, 92, 33), Op(8, 74, 177, 195), Op(8, 105, 219, 225), Op(0, 171, 236, 251),
+            Op(8, 36, 200, 233), Op(8, 182, 76, 153), Op(7, 179, 81, 34), Op(8, 230, 58, 95), Op(8, 128, 247, 89),
+            Op(0, 21, 233, 47), Op(7, 180, 103, 214), Op(7, 14, 27, 121), Op(5, 24, 245, 24), Op(10, 179, 105, 253),
+            Op(0, 59, 172, 218), Op(2, 179, 115, 24), Op(7, 112, 221, 118), Op(6, 238, 79, 36), Op(0, 237, 3, 32),
+            Op(5, 130, 16, 85), Op(4, 200, 96, 196), Op(6, 125, 190, 98), Op(1, 60, 76, 28), Op(10, 224, 61, 46),
+            Op(9, 163, 35, 255), Op(0, 101, 155, 23), Op(8, 73, 19, 67), Op(8, 251, 254, 164), Op(2, 243, 105, 26),
+            Op(8, 140, 245, 12), Op(7, 109, 241, 139), Op(1, 227, 58, 156), Op(10, 50, 234, 138), Op(0, 0, 16, 210),
+            Op(5, 66, 143, 47), Op(8, 78, 72, 18), Op(0, 247, 198, 216), Op(9, 67, 156, 241), Op(8, 115, 106, 30),
+            Op(0, 33, 137, 87),
+        ),
+    )
 
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 

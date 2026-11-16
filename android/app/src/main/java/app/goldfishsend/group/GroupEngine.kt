@@ -55,7 +55,7 @@ class GroupModel(
 class Pending(val op: RosterOp, val hash: String) {
     companion object {
         /** At most this many are kept. An admin's own change and the ones it makes for others (admit, remove) can overlap. */
-        const val MAX = 4
+        const val MAX = 8
 
         /** In the store's two text columns, one per line. */
         fun encode(list: List<Pending>): Pair<String?, String?> =
@@ -97,7 +97,8 @@ interface GroupStore {
 
     /**
      * Stores a roster we accepted, or (with [sibling]) a valid one we didn't take, so that rosters built on it can be
-     * checked. Siblings are capped per version ([GroupEngine.MAX_SIBLINGS]): any member can sign as many as they like.
+     * checked. Siblings are capped per version, and per author ([GroupEngine.siblingFits]): any member can sign as many
+     * as they like, but an honest one signs at most a couple per version (a change, and its re-application).
      */
     fun addHistory(gid: String, r: SignedRoster, sibling: Boolean = false)
 
@@ -444,54 +445,134 @@ class GroupEngine(
             return
         }
         val cur = m.roster ?: return
-        val decision = RosterRules.decide(cur, signed) { h -> store.history(c.g, h)?.roster }
-        dbg { "roster v${r.ver} by=${who(r.by)} vs cur v${cur.roster.ver} by=${who(cur.roster.by)} -> $decision" }
-        when (val d = decision) {
-            is RosterRules.Decision.Accept -> {
-                val had = cur.roster.ver
-                val cardsBefore = m.cards.toMap()
-                accept(m, signed)
-                relay(m, signed, cardsBefore)
-                if (d.needSync) {
-                    requestSync(m, r.by, had)
-                }
+        if (signed.hashB64 == cur.hashB64) {
+            return
+        }
+        val parent = store.history(c.g, r.prev)
+        if (parent == null) {
+            onOrphan(m, cur, signed, from)
+            return
+        }
+        val valid = RosterRules.validChild(parent.roster, r)
+        if (valid) {
+            store.addHistory(c.g, signed, sibling = true)
+        }
+        val head = if (valid) chooseHead(m) else cur
+        dbg { "roster v${r.ver} by=${who(r.by)} on cur v${cur.roster.ver} by=${who(cur.roster.by)}: valid=$valid head=v${head.roster.ver} by=${who(head.roster.by)}" }
+        if (head.hashB64 == cur.hashB64) {
+            // Not taken (it lost a fork, is too old, or isn't allowed): what it says about its author, or us, still counts.
+            enforceOwnRemoval(m, signed)
+            enforceDeparture(m, r)
+            enforceAcceptance(m, r)
+            if (valid) {
+                enforceAll(m)
             }
-            RosterRules.Decision.Replace -> {
-                // A concurrent roster beat ours: take it. If the loser was our own change, accept() re-applies it on top.
-                val cardsBefore = m.cards.toMap()
-                accept(m, signed)
-                relay(m, signed, cardsBefore)
-                // The branch that lost may hold someone's departure or acceptance, or our removal: none can be lost.
-                for (lost in lostBranch(m, cur, signed)) {
-                    enforceOwnRemoval(m, lost)
-                    enforceDeparture(m, lost.roster)
-                    enforceAcceptance(m, lost.roster)
-                }
+            return
+        }
+        val cardsBefore = m.cards.toMap()
+        val extends = descends(m, head, cur)
+        val won = if (extends) listOf(head) else lostBranch(m, head, cur)
+        accept(m, head)
+        // Members' rosters on the branch we take may not have reached everyone (relay() only passes them on once).
+        for (x in won.reversed()) {
+            relay(m, x, cardsBefore)
+        }
+        if (!extends) {
+            // We were on a branch that lost. accept() re-applies our own changes from it on top of the winner; if it
+            // removed us, that stands (enforceAll covers others' departures and acceptances on it).
+            for (lost in lostBranch(m, cur, head)) {
+                enforceOwnRemoval(m, lost)
             }
-            RosterRules.Decision.Keep -> {
-                store.addHistory(c.g, signed, sibling = true)
-                enforceOwnRemoval(m, signed)
-                enforceDeparture(m, r)
-                enforceAcceptance(m, r)
+        }
+        enforceAll(m)
+    }
+
+    /** A roster whose parent we don't have: we missed versions, or it builds on a branch we never saw. */
+    private fun onOrphan(m: GroupModel, cur: SignedRoster, signed: SignedRoster, from: String) {
+        val r = signed.roster
+        if (r.ver > cur.roster.ver && cur.roster.isAdmin(r.by)) {
+            // An admin of ours moved on: take it, and ask that admin for what's in between.
+            dbg { "orphan v${r.ver} by=${who(r.by)} on cur v${cur.roster.ver}: taken" }
+            val cardsBefore = m.cards.toMap()
+            store.addHistory(m.gid, signed)
+            accept(m, signed)
+            relay(m, signed, cardsBefore)
+            requestSync(m, r.by, cur.roster.ver)
+            return
+        }
+        // Otherwise it can only be placed once we have its parent. Ask an admin who sent or signed it, once per roster:
+        // if the answer doesn't place it, asking again won't.
+        val admin = listOf(from, r.by).firstOrNull { it != me && cur.roster.isAdmin(it) }
+        // Kept: once its parent comes, it's part of the picture (chooseHead, enforceAll).
+        store.addHistory(m.gid, signed, sibling = true)
+        if (admin != null && m.state == GroupModel.JOINED && askedOnce("$me ${signed.hashB64}")) {
+            // From as far back as forks are decided: what it builds on may be a branch we never saw.
+            requestSync(m, admin, (cur.roster.ver - FORK_DEPTH).coerceAtLeast(0))
+        }
+        enforceOwnRemoval(m, signed)
+        enforceDeparture(m, r)
+        enforceAcceptance(m, r)
+    }
+
+    /**
+     * Fork choice (docs/groups.md, rule 3): the roster to be on, given every roster we hold from [FORK_DEPTH] versions
+     * below ours. From there, at each fork, the branch that [RosterRules.beats] the other; the tip of that branch is it.
+     * Depends only on the rosters held, not on the order they came in, so members who hold the same ones agree.
+     */
+    private fun chooseHead(m: GroupModel, t: Tree = tree(m)): SignedRoster {
+        val path = HashMap<String, List<SignedRoster>>()
+        // The branch from n down to its tip, n first.
+        fun branch(n: SignedRoster): List<SignedRoster> = path.getOrPut(n.hashB64) {
+            val cs = t.kids[n.hashB64]?.distinctBy { it.hashB64 }?.sortedWith { a, b -> RosterRules.compareUnsigned(a.hash, b.hash) }
+            if (cs.isNullOrEmpty()) {
+                listOf(n)
+            } else {
+                val best = cs.reduce { a, b -> if (RosterRules.beats(n.roster, branch(a), branch(b))) a else b }
+                listOf(n) + branch(best)
             }
-            is RosterRules.Decision.Ignore -> if (d.reason != "same") {
-                // Too old to take, but others may have taken it and build on it: keep it if it was a valid change.
-                if (d.reason == "old" && store.history(c.g, r.prev)?.let { RosterRules.authorized(it.roster, r) } == true) {
-                    store.addHistory(c.g, signed, sibling = true)
+        }
+        return branch(t.root).last()
+    }
+
+    /** The rosters we hold that connect, by valid steps, to ours from [FORK_DEPTH] versions below it. */
+    private class Tree(val root: SignedRoster, val nodes: Map<String, SignedRoster>, val kids: Map<String, List<SignedRoster>>)
+
+    private fun tree(m: GroupModel): Tree {
+        val cur = m.roster!!
+        val ours = mutableListOf(cur)
+        while (ours.size <= FORK_DEPTH) {
+            val last = ours.last()
+            ours += store.history(m.gid, last.roster.prev)?.takeIf { it.roster.ver == last.roster.ver - 1 } ?: break
+        }
+        val root = ours.last()
+        // Our own line counts as valid as it is: we took each of its rosters.
+        val nodes = HashMap<String, SignedRoster>()
+        ours.forEach { nodes[it.hashB64] = it }
+        val kids = HashMap<String, MutableList<SignedRoster>>()
+        for (r in store.historySince(m.gid, root.roster.ver)) {
+            val p = nodes[r.roster.prev] ?: continue
+            if (r.hashB64 !in nodes) {
+                if (!RosterRules.validChild(p.roster, r.roster)) {
+                    continue
                 }
-                // A newer roster by a non-admin that we can't place (we missed what it builds on), passed on by an admin:
-                // ask that admin for the history. Once per roster: if the answer doesn't place it, asking again won't.
-                if (r.ver > cur.roster.ver && from != r.by && cur.roster.isAdmin(from) && m.state == GroupModel.JOINED &&
-                    store.history(c.g, r.prev) == null && askedOnce("$me ${signed.hashB64}")
-                ) {
-                    requestSync(m, from, cur.roster.ver)
-                }
-                if (d.reason == "old") {
-                    enforceOwnRemoval(m, signed)
-                }
-                enforceDeparture(m, r)
-                enforceAcceptance(m, r)
+                nodes[r.hashB64] = r
             }
+            kids.getOrPut(p.hashB64) { mutableListOf() } += r
+        }
+        return Tree(root, nodes, kids)
+    }
+
+    /**
+     * Departures and acceptances anywhere in the rosters we hold that ours doesn't reflect (rule 3). A roster can connect
+     * long after it arrived (its parent came later), or sit on a branch that lost: it's still its author's decision.
+     */
+    private fun enforceAll(m: GroupModel) {
+        if (m.state != GroupModel.JOINED || m.roster?.roster?.isAdmin(me) != true) {
+            return
+        }
+        for (r in tree(m).nodes.values.sortedBy { it.roster.ver }) {
+            enforceDeparture(m, r.roster)
+            enforceAcceptance(m, r.roster)
         }
     }
 
@@ -694,6 +775,8 @@ class GroupEngine(
         // We joined, but this roster still has us invited (our acceptance was on a stint that's over, or got lost): again.
         if (m.state == GroupModel.JOINED && signed.roster.role(me) == Role.INVITED && signed.roster.by != me) {
             publish(m, RosterOp.Accept)
+            // If we were taken out and invited again meanwhile, the others dropped our card.
+            m.myCard?.let { card -> m.cards.keys.forEach { io.sendGroup(m.gid, it, cardContent(card)) } }
         }
         heldReady += m.gid
     }
@@ -861,14 +944,22 @@ class GroupEngine(
         val LOCAL = SignalProtocolAddress("self", 1)
         private const val PREKEY = 3
 
+        /** Forks at most this many versions below ours are decided (rule 3); older ones are final. */
+        const val FORK_DEPTH = 16
+
         /** Versions after which our own change, built on by others, no longer needs watching. */
-        private const val SETTLED = 10
+        private const val SETTLED = FORK_DEPTH
 
         /** How far back a lost branch is checked for departures and acceptances. */
         private const val BRANCH = 16
 
         /** Rosters we didn't take, kept per version (see [GroupStore.addHistory]). */
-        const val MAX_SIBLINGS = 16
+        const val MAX_SIBLINGS = 64
+        const val MAX_SIBLINGS_PER_AUTHOR = 3
+
+        /** Whether [r] may join [held], the rosters already kept at its version. */
+        fun siblingFits(held: List<Roster>, r: Roster): Boolean =
+            held.size < MAX_SIBLINGS && held.count { it.by == r.by } < MAX_SIBLINGS_PER_AUTHOR
 
         /** Marks a held row as already-decrypted content from an invitee (a real hint key is 32 bytes). */
         private val HELD_CONTENT = byteArrayOf(0x43)

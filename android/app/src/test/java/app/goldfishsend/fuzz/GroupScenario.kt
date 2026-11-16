@@ -129,7 +129,7 @@ class GroupScenario(private val seed: Long) {
     private fun joinedModel(p: Peer): GroupModel? = model(p)?.takeIf { it.state == GroupModel.JOINED }
 
     fun apply(op: Op) {
-        when (Math.floorMod(op.kind, 12)) {
+        when (Math.floorMod(op.kind, 13)) {
             0 -> {
                 val p = peer(op.a)
                 val m = model(p) ?: return
@@ -206,6 +206,7 @@ class GroupScenario(private val seed: Long) {
                 limbo.clear()
             }
             10 -> hostile(op)
+            12 -> forkAttack(op)
             else -> net.deliverAll()
         }
         for (p in peers) {
@@ -334,6 +335,34 @@ class GroupScenario(private val seed: Long) {
         toTarget(target, GroupEngine.rosterContent(GroupCrypto.signRoster(mallory.identity.privateKey, stamped)))
     }
 
+    /**
+     * Mallory signs a change of her own on a roster some versions back (a rename, or her own departure), grinding its
+     * hash, and sends it to everyone: a fork she'd like to win.
+     */
+    private fun forkAttack(op: Op) {
+        model(mallory) ?: return
+        var at = mallory.store.load(gid)?.roster ?: return
+        repeat(1 + Math.floorMod(op.a, 4)) {
+            at = mallory.store.history(gid, at.roster.prev) ?: return@repeat
+        }
+        val base = at.roster
+        if (base.role(mallory.id) == null) {
+            return
+        }
+        val leave = base.adminsOnly || op.c % 3 == 0
+        val change = if (leave) base.copy(members = base.members.filter { it.id != mallory.id }) else base.copy(name = "Fork ${msg++}")
+        val best = (0 until 1 + Math.floorMod(op.b, 8)).map { i ->
+            GroupCrypto.signRoster(mallory.identity.privateKey, RosterRules.successor(at, change, mallory.id, now / 1000 + i))
+        }.maxWithOrNull { x, y -> RosterRules.compareUnsigned(x.hash, y.hash) } ?: return
+        if (leave) {
+            churned += mallory.id
+        }
+        log("mallory forks at v${base.ver} (${if (leave) "leave" else "rename"})")
+        for (t in honest) {
+            toTarget(t, GroupEngine.rosterContent(best))
+        }
+    }
+
     private fun toTarget(target: Peer, content: Content) {
         val card = mallory.store.routes[gid]?.get(target.id)?.card
         if (card != null && target != mallory) {
@@ -458,7 +487,7 @@ class GroupScenario(private val seed: Long) {
         fun generate(seed: Long, length: Int): List<Op> {
             val rnd = java.util.Random(seed)
             // kind to weight
-            val weights = listOf(0 to 8, 1 to 3, 2 to 7, 3 to 5, 4 to 5, 5 to 5, 6 to 3, 7 to 14, 8 to 24, 9 to 4, 10 to 12, 11 to 3)
+            val weights = listOf(0 to 8, 1 to 3, 2 to 7, 3 to 5, 4 to 5, 5 to 5, 6 to 3, 7 to 14, 8 to 24, 9 to 4, 10 to 12, 11 to 3, 12 to 4)
             val total = weights.sumOf { it.second }
             return List(length) {
                 var x = rnd.nextInt(total)

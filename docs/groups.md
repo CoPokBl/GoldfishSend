@@ -69,38 +69,50 @@ For a received roster R, with current roster C:
    one admin.
 2. **Authority:** `R.by` must be an admin in C. A member may also publish a roster whose only change is removing
    themselves (leaving), or turning their own `invited` into `member` (accepting).
-3. **Order:**
-   - If `R.ver == C.ver + 1` and `R.prev == hash(C)`, accept.
-   - If `R.ver == C.ver` and `hash(R) != hash(C)` (two admins changed it at once), keep the one with the larger hash,
-     except that a roster removing the other's author wins (an invitee's acceptance loses to the invitation being
-     withdrawn). If both remove each other's author, the larger hash wins.
-   - **Our own changes aren't lost.** Whenever we accept someone else's roster while a change of ours is still pending
-     and that roster neither contains it nor builds on it, through any number of versions (our change lost a tie,
-     possibly to a sibling we never saw), we re-apply it on top as the next version. A roster that builds on our change
-     and lacks it was changed back on purpose. A change stays pending even once it's in, since the roster that took it
-     in can still lose a tie, until it's 10 versions old. Our last 4 changes are pending (an admin's own change and the
-     admits and removals it makes for others below can overlap).
-   - Rosters we don't take (a lost tie, or an older version that's a valid change on its parent) are kept, at most 16
-     per version, so that rosters others build on them can still be checked.
-   - If `R.ver > C.ver` but it doesn't chain onto C (we missed some versions, or it builds on a concurrent sibling we
-     never saw), accept only if `R.by` is an admin in C, then ask that admin for the missing history with `gsync`.
-   - Otherwise ignore it.
+3. **Order (fork choice).** Concurrent changes make the rosters a tree: every roster names its parent (`prev`), and two
+   members can build on the same parent, or on each other's siblings, before they hear of each other. Every member
+   takes the same branch of that tree, given the same rosters, whatever order they arrived in:
+   - **The tree.** A roster R joins it if its parent P is held and R is a valid step from P: `R.ver == P.ver + 1` and
+     R passes rule 2 against P (not against C). Rosters that don't join it are still kept (at most 64 per version, 3 per
+     author), so they count once what they build on arrives.
+   - **The window.** Forks are decided from the roster 16 versions below C (or the oldest one we hold of C's line, if
+     we skipped versions). Anything forking further back is final: an old branch can never be brought back.
+   - **The choice.** From there, at each fork take the child whose branch (followed down by the same rule to its tip)
+     wins; the tip of that walk is the current roster. Between two branches A and B growing from fork F, in order:
+     1. If A ends without the author of B's first roster, who is in F (they were removed, or they left), and B doesn't
+        do the same to A's, A wins. A removal beats the removed member's own concurrent change (an invitee's
+        acceptance loses to the invitation being withdrawn), and a departure stands.
+     2. The branch with more changes made by an admin (of the roster each builds on) wins. A member who isn't one can't
+        outweigh an admin's change, however many rosters they sign or however long their branch is.
+     3. The branch with more distinct authors wins: one member can't outweigh several.
+     4. The larger hash of the first roster wins.
+   - **Rebasing.** When the choice moves us off our branch, our own changes on it that the new branch neither has nor
+     builds on are re-applied on top of it and re-signed as the next version. A roster that builds on our change and
+     lacks it was changed back on purpose. Our last 8 changes stay pending, even once they're in (the roster that took
+     them in can still lose), until they're 16 versions old.
+   - **Skipped versions.** A roster whose parent we don't have, from an admin of C and newer than C, is taken anyway
+     (we missed versions), and we ask that admin for the history with `gsync`. Any other roster we can't place: if an
+     admin signed or passed it on, ask them for the history from 16 versions back, once per roster.
    - **Departures can't be lost.** A roster signed by X that doesn't list X means "X is leaving" (or declining),
-     whatever its version. If it lost a tie or arrived too late to apply, the leaver won't try again, so an admin who
-     sees it while X is still in C publishes a roster removing X. The same when a roster we had taken loses a tie
-     later: the losing branch (back to where it meets the winner) may hold someone's departure (or acceptance).
-   - **Removals can't be lost on the removed member's side.** A roster by an admin (of its parent) that leaves us out
-     and that we can't keep (it lost a tie here, now or later, or we had moved on) still means we're out: nothing
-     the others take after it reaches us, since we're not in it.
+     whatever its version or branch. An admin who holds one while X is still in C publishes a roster removing X. Every
+     roster in the tree counts, not only new ones: one can join the tree long after it arrived, or sit on a branch that
+     lost.
    - **Acceptances can't be lost either.** Likewise, a roster signed by X that makes X a `member` while C still lists X
-     as `invited` is X's acceptance: an admin who sees it but can't apply it publishes a roster making X a member.
-     (Found on a real device: two invitees who join at about the same time produce concurrent rosters.)
+     as `invited` is X's acceptance: an admin publishes a roster making X a member. And when we've joined but take a
+     roster that still lists us as invited (our acceptance was lost, or was for an earlier invitation), we accept again
+     and send our card again.
    - Both only count if they're newer than X's current stint (the run of our rosters back from C that list X, or list
      X as invited): an old departure or acceptance, from before X was removed and added again, can be replayed by
      anyone who kept it.
-   - A newer roster by a non-admin whose parent we don't have (we missed what came before), passed on by an admin:
-     ask that admin for the history with `gsync`, once per roster. Also, whenever we've joined but a roster we take
-     still lists us as invited (our acceptance was lost, or was for an earlier invitation), accept again.
+   - **Removals can't be lost on the removed member's side.** A roster by an admin (of its parent) that leaves us out
+     and that we don't take (it's on a branch that lost, or too old) still means we're out, if it's from our current
+     stint: nothing the others take after it reaches us, since we're not in it.
+   - **Cost.** Duplicates change nothing: the choice depends only on the rosters held. A roster that moves a member to
+     another branch costs at most: their rebased changes (at most 8, one roster each), the departures and acceptances
+     on the losing branch (one roster each, from each admin), and the losing branch passed on by admins; each roster
+     goes to every member once, so O(members) per change involved. A member who isn't an admin can only win a fork
+     against other non-admins' changes, one author against one, and only by hash, so each roster they sign moves
+     others at most once.
 4. **Diff against the old roster:**
    - **Removed members:** stop sending to them. Their card is kept only until what's already queued to them (the roster
      that removed them) is delivered, then deleted, and so is their session once they're in no other group.

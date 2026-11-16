@@ -71,7 +71,7 @@ class MemoryGroupStore : GroupStore {
     /** Like RepoGroupStore.addHistory: siblings capped per version, nothing kept 200 versions behind the newest. */
     override fun addHistory(gid: String, r: SignedRoster, sibling: Boolean) {
         val rows = historyRows.getOrPut(gid) { LinkedHashMap() }
-        if (sibling && rows.values.count { it.roster.ver == r.roster.ver } >= GroupEngine.MAX_SIBLINGS) {
+        if (sibling && !GroupEngine.siblingFits(rows.values.filter { it.roster.ver == r.roster.ver }.map { it.roster }, r.roster)) {
             return
         }
         rows.putIfAbsent(r.hashB64, r)
@@ -158,7 +158,10 @@ class GroupNet {
     fun peer(name: String, identity: IdentityKeyPair = IdentityKeyPair.generate()): Peer = Peer(name, this, identity).also { peers += it }
 
     /** Delivers one envelope, then runs what each member does after a call (held messages, inbox rotation, waiting texts). */
+    var delivered = 0
+
     fun deliver(e: Envelope) {
+        delivered++
         trace?.invoke(
             when (e) {
                 is Envelope.ToInbox -> "  ${e.from.name} -> ${e.to.name} (group)"
