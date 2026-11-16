@@ -148,6 +148,21 @@ public sealed class GatewayMiddleware {
             await features.Get<IHttpResponseBodyFeature>()!.CompleteAsync();
             features.Set(originalBody);
         }
+        if (status is (400 or 413 or 415) && buffer.Length == 0) {
+            // Parameter binding answers unreadable JSON or a wrong content type with an empty body. Clients get the
+            // documented {"error": …} body for those too. An unknown route stays a bare 404: clients detect missing
+            // endpoints by it (docs/groups.md, "Fallback").
+            await using var writer = new Utf8JsonWriter(buffer);
+            writer.WriteStartObject();
+            writer.WriteString("error", status switch {
+                400 => "invalid_request",
+                413 => "too_large",
+                _ => "unsupported_media_type",
+            });
+            writer.WriteEndObject();
+            await writer.FlushAsync();
+            context.Response.ContentType = "application/json; charset=utf-8";
+        }
 
         var innerHeaders = new List<KeyValuePair<string, string>>();
         foreach (var (name, values) in context.Response.Headers) {

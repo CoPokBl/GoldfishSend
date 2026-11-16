@@ -11,7 +11,7 @@ namespace GoldfishSend.Core.Net;
 public sealed class EndpointValidator {
     private static readonly string[] ForbiddenSuffixes = [
         ".localhost", ".local", ".localdomain", ".internal", ".intranet", ".lan", ".home", ".corp",
-        ".home.arpa", ".in-addr.arpa", ".ip6.arpa", ".onion", ".test", ".invalid", ".example",
+        ".arpa", ".onion", ".test", ".invalid", ".example", ".alt",
     ];
 
     private readonly PushOptions _options;
@@ -55,6 +55,10 @@ public sealed class EndpointValidator {
                 if (!_options.AllowIpLiterals && !insecureAllowed) {
                     return false;
                 }
+                // Uri.Host drops an IPv6 zone id, but HttpClient connects with it ("%2525" is scope 2525).
+                if (parsed.IdnHost.Contains('%')) {
+                    return false;
+                }
                 if (!IPAddress.TryParse(parsed.Host.Trim('[', ']'), out var literal) || !_ipFilter.IsAllowed(literal)) {
                     return false;
                 }
@@ -76,6 +80,11 @@ public sealed class EndpointValidator {
         if (insecureAllowed && host == "localhost") {
             return true;
         }
+        // Uri types "127.0.0.1." and "127。0。0。1" (IDNA maps U+3002 to a dot) as DNS names, but HttpClient and resolvers
+        // read them as addresses. No real name ends in a numeric label, so these never get the more lenient name rules.
+        if (EndsInNumber(host)) {
+            return false;
+        }
         // Single-label names (intranet hosts, "localhost") aren't public push services.
         if (!host.Contains('.') || host == "localhost") {
             return false;
@@ -95,5 +104,14 @@ public sealed class EndpointValidator {
             }
         }
         return true;
+    }
+
+    /// <summary>WHATWG URL's "ends in a number": the last label is decimal digits, or 0x and hex digits.</summary>
+    private static bool EndsInNumber(string host) {
+        var last = host[(host.LastIndexOf('.') + 1)..];
+        if (last.StartsWith("0x", StringComparison.Ordinal)) {
+            return last[2..].All(char.IsAsciiHexDigit);
+        }
+        return last.Length > 0 && last.All(char.IsAsciiDigit);
     }
 }

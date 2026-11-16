@@ -183,16 +183,21 @@ public sealed class PushClient : IDisposable {
         return v > TimeSpan.FromHours(6) ? TimeSpan.FromHours(6) : v;
     }
 
+    /// <summary>
+    /// The addresses a connection to <paramref name="host"/> may use: the address itself for an IP literal, otherwise what
+    /// <paramref name="resolve"/> returns, keeping only those the filter allows.
+    /// </summary>
+    /// <exception cref="ForbiddenDestinationException">None is allowed.</exception>
+    internal static async Task<IPAddress[]> AllowedAddressesAsync(
+        string host, IpRangeFilter filter, Func<string, CancellationToken, Task<IPAddress[]>> resolve, CancellationToken ct) {
+        IPAddress[] addresses = IPAddress.TryParse(host, out var literal) ? [literal] : await resolve(host, ct);
+        var allowed = addresses.Where(filter.IsAllowed).ToArray();
+        return allowed.Length > 0 ? allowed : throw new ForbiddenDestinationException();
+    }
+
     private async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, CancellationToken ct) {
         var endpoint = context.DnsEndPoint;
-        IPAddress[] addresses = IPAddress.TryParse(endpoint.Host, out var literal)
-            ? [literal]
-            : await Dns.GetHostAddressesAsync(endpoint.Host, ct);
-
-        var allowed = addresses.Where(_ipFilter.IsAllowed).ToArray();
-        if (allowed.Length == 0) {
-            throw new ForbiddenDestinationException();
-        }
+        var allowed = await AllowedAddressesAsync(endpoint.Host, _ipFilter, Dns.GetHostAddressesAsync, ct);
 
         Exception? last = null;
         foreach (var address in allowed) {
