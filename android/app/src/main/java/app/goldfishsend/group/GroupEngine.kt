@@ -530,7 +530,11 @@ class GroupEngine(
             if (cs.isNullOrEmpty()) {
                 listOf(n)
             } else {
-                val best = cs.reduce { a, b -> if (RosterRules.beats(n.roster, branch(a), branch(b))) a else b }
+                val best = cs.reduce { a, b ->
+                    val aWins = RosterRules.beats(n.roster, branch(a), branch(b))
+                    dbg { "fork at v${n.roster.ver}: ${who(a.roster.by)} (${branch(a).size}) vs ${who(b.roster.by)} (${branch(b).size}): ${if (aWins) "first" else "second"}" }
+                    if (aWins) a else b
+                }
                 listOf(n) + branch(best)
             }
         }
@@ -724,10 +728,11 @@ class GroupEngine(
         if (rosters.none { it.hashB64 == cur.hashB64 }) {
             rosters += cur
         }
-        val send: (Content) -> Unit = if (m.cards[from] != null) {
+        // Someone still invited (or invited again) may not take what comes to their group inbox: 1:1 for them.
+        val send: (Content) -> Unit = if (m.cards[from] != null && cur.roster.isActive(from)) {
             { content -> io.sendGroup(c.g, from, content) }
         } else {
-            { content -> io.sendDirect(c.g, from, content) }
+            { content -> if (!io.sendDirect(c.g, from, content) && m.cards[from] != null) io.sendGroup(c.g, from, content) }
         }
         for (r in rosters) {
             send(rosterContent(r))
@@ -806,9 +811,10 @@ class GroupEngine(
         if (m.pending.size != before) {
             store.save(m)
         }
-        for (op in redo) {
-            dbg { "re-applying lost ${op.javaClass.simpleName} on v${m.roster?.roster?.ver}" }
-            publish(m, op)
+        if (redo.isNotEmpty()) {
+            // All in one roster, so a member who keeps losing forks signs one per version, not one per change.
+            dbg { "re-applying ${redo.size} lost on v${m.roster?.roster?.ver}" }
+            publish(m, redo.singleOrNull() ?: RosterOp.Batch(redo))
         }
     }
 
@@ -817,10 +823,13 @@ class GroupEngine(
      * from a roster listing us to one that doesn't). A branch on which that never happened (it lost to our departure or
      * removal elsewhere) isn't an invitation.
      */
-    private fun reinvited(m: GroupModel, r: SignedRoster): Boolean = reinviter(m, r) != null
+    private fun reinvited(m: GroupModel, r: SignedRoster): Boolean = reinviter(m, r).by != null
 
-    /** For [reinvited]: who invited us again (the author of the first roster listing us after we were out), or null. */
-    private fun reinviter(m: GroupModel, r: SignedRoster): String? {
+    /** [reinviter]'s answer: who invited us again, or null; [gap]: our history of the line stopped before an answer. */
+    private class Reinvite(val by: String?, val gap: Boolean)
+
+    /** For [reinvited]: who invited us again (the author of the first roster listing us after we were out), if anyone. */
+    private fun reinviter(m: GroupModel, r: SignedRoster): Reinvite {
         var x = r
         var listing = r
         while (true) {
@@ -828,9 +837,10 @@ class GroupEngine(
                 listing = x
             }
             // Where our history of the line stops we can't tell (yet): recheckInvitation looks again as it fills.
-            val parent = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver < x.roster.ver } ?: return null
+            val parent = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver < x.roster.ver }
+                ?: return Reinvite(null, x.roster.prev.isNotEmpty())
             if (x.roster.role(me) == null && parent.roster.role(me) != null) {
-                return listing.roster.by
+                return Reinvite(listing.roster.by, false)
             }
             x = parent
         }
@@ -845,7 +855,15 @@ class GroupEngine(
         if ((m.state != GroupModel.LEFT && m.state != GroupModel.REMOVED) || cur.roster.role(me) != Role.INVITED) {
             return
         }
-        val by = reinviter(m, cur) ?: return
+        val line = reinviter(m, cur)
+        val by = line.by
+        if (by == null) {
+            // Out of the group, nobody sends us the history: ask the admin who signed it, once per roster.
+            if (line.gap && cur.roster.isAdmin(cur.roster.by) && cur.roster.by != me && askedOnce("$me line ${cur.hashB64}")) {
+                requestSync(m, cur.roster.by, (cur.roster.ver - FORK_DEPTH).coerceAtLeast(0))
+            }
+            return
+        }
         m.state = GroupModel.INVITED
         m.invitedBy = by
         store.save(m)
@@ -996,7 +1014,7 @@ class GroupEngine(
 
         /** Rosters we didn't take, kept per version (see [GroupStore.addHistory]). */
         const val MAX_SIBLINGS = 64
-        const val MAX_SIBLINGS_PER_AUTHOR = 3
+        const val MAX_SIBLINGS_PER_AUTHOR = 8
 
         /** Whether [r] may join [held], the rosters already kept at its version. */
         fun siblingFits(held: List<Roster>, r: Roster): Boolean =

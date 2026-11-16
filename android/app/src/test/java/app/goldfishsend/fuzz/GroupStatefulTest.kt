@@ -269,6 +269,21 @@ class GroupStatefulTest {
         ),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest: Bob, removed, took his re-invitation past a gap and asked for the history, but the
+     * answer went to his group inbox, which a member who's out doesn't read. (Also the input reinvited-while-out-past-a-gap.)
+     */
+    @Test
+    fun reinvitedWhileOutPastAGap() =
+        scenario(7L, listOf(Op(11, 0, 0, 0), Op(3, 0, 81, 0), Op(5, 0, 0, 0), Op(2, 0, 11, 0), Op(0, 71, 0, 0)))
+
+    /** Found by GroupScenarioFuzzTest.forks (the input fork-split-2): Alice and Bob on different branches for good. */
+    @Test
+    fun forkSplit2() = scenario(
+        7L,
+        listOf(Op(3, 0, 44, 0), Op(5, 0, 44, 185), Op(8, 0, 63, 0), Op(2, 0, 42, 0), Op(5, 0, 0, 0), Op(0, 21, 0, 0), Op(5, 96, 0, 0), Op(5, 96, 0, 96), Op(5, 71, 0, 0)),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

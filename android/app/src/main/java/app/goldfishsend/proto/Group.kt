@@ -289,6 +289,23 @@ sealed class RosterOp {
             if (base.role(me) != Role.INVITED) null else base.copy(members = base.members.map { if (it.id == me) it.copy(role = Role.MEMBER) else it })
     }
 
+    /** Several changes in one roster: what a member re-applies after losing a fork. */
+    @Serializable
+    @SerialName("batch")
+    data class Batch(val ops: List<RosterOp>) : RosterOp() {
+        override fun apply(base: Roster, me: String): Roster? {
+            var r = base
+            var changed = false
+            for (op in ops) {
+                op.apply(r, me)?.let {
+                    r = it
+                    changed = true
+                }
+            }
+            return r.takeIf { changed }
+        }
+    }
+
     fun encode(): String = OpJson.encodeToString(serializer(), this)
 
     companion object {

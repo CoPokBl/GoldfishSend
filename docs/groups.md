@@ -73,7 +73,7 @@ For a received roster R, with current roster C:
    members can build on the same parent, or on each other's siblings, before they hear of each other. Every member
    takes the same branch of that tree, given the same rosters, whatever order they arrived in:
    - **The tree.** A roster R joins it if its parent P is held and R is a valid step from P: `R.ver == P.ver + 1` and
-     R passes rule 2 against P (not against C). Rosters that don't join it are still kept (at most 64 per version, 3 per
+     R passes rule 2 against P (not against C). Rosters that don't join it are still kept (at most 64 per version, 8 per
      author), so they count once what they build on arrives.
    - **The window.** Forks are decided from the roster 16 versions below C (or the oldest one we hold of C's line, if
      we skipped versions). Anything forking further back is final: an old branch can never be brought back.
@@ -87,7 +87,7 @@ For a received roster R, with current roster C:
      3. The branch with more distinct authors wins: one member can't outweigh several.
      4. The larger hash of the first roster wins.
    - **Rebasing.** When the choice moves us off our branch, our own changes on it that the new branch neither has nor
-     builds on are re-applied on top of it and re-signed as the next version. A roster that builds on our change and
+     builds on are re-applied on top of it and re-signed, all in one roster. A roster that builds on our change and
      lacks it was changed back on purpose. Our last 8 changes stay pending, even once they're in (the roster that took
      them in can still lose), until they're 16 versions old.
    - **Skipped versions.** A roster whose parent we don't have, from an admin of C and newer than C, is taken anyway
@@ -141,7 +141,10 @@ admin forwarded when inviting them). Admins, who keep every card, close the gaps
 - **`gsync` from someone who's out** (the roster removing them never reached them, for example it arrived before the
   invitation, and they joined): an admin answers over 1:1 with the roster that removed them, and nothing newer.
 - **`gsync` answers start one version early:** the rosters from `have` onwards (not just after it), because the asker's
-  copy of version `have` may be a concurrent sibling that lost, and they need the winner.
+  copy of version `have` may be a concurrent sibling that lost, and they need the winner. To someone who isn't an
+  active member (still invited, or invited again while out) they go over 1:1 where possible: such a member may not
+  read their group inbox. A member who is out but listed as invited, and can't tell whether that's a new invitation
+  (a gap in their history), asks the admin who signed it, once per roster.
 
 Duplicates are harmless: a roster already held is ignored, and a card with a `seq` already held is ignored.
 
