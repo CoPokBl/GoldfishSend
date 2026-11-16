@@ -134,7 +134,7 @@ public sealed class SsrfFuzzTests {
                     _ => [b[0], b[1], b[2], b[3]],
                 };
                 var text = values.Select((v, i) => radix[i] switch {
-                    0 => new string('0', zeros[i] == 2 ? 0 : 0) + v.ToString(CultureInfo.InvariantCulture),
+                    0 => v.ToString(CultureInfo.InvariantCulture),
                     1 => "0" + new string('0', zeros[i]) + Convert.ToString((long)v, 8),
                     _ => (zeros[i] == 1 ? "0X" : "0x") + new string('0', zeros[i]) + v.ToString(zeros[i] == 2 ? "X" : "x", CultureInfo.InvariantCulture),
                 });

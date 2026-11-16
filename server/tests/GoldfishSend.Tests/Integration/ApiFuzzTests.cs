@@ -143,6 +143,10 @@ public sealed class ApiFuzzTests {
         await Fuzz.Fuzz.RunAsync(InnerPlaintext, async inner => {
             var (outer, respSecret) = key.Seal(inner);
             using var response = await _f.RawClient.PostAsync("/v1/gw", Octets(outer));
+            if (inner.Length > GatewayCodec.MaxInnerRequest) {
+                Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+                return;
+            }
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var sealedBody = await response.Content.ReadAsByteArrayAsync();
             var plaintext = GatewayCrypto.OpenResponse(respSecret, sealedBody);

@@ -10,12 +10,23 @@ namespace GoldfishSend.Tests.Fuzz;
 /// Runs property checks over generated inputs. By default every run replays the same cases (case i of a property uses
 /// PCG stream hash(property name), seed i), so CI is deterministic. For a longer local run, set <c>GF_FUZZ_SECONDS</c>:
 /// each property then runs that long on random seeds (CsCheck, with shrinking), on <c>GF_FUZZ_THREADS</c> threads
-/// (default 4). A failure prints the case's seed; <c>GF_FUZZ_SEED=&lt;seed&gt;</c> replays exactly that case.
+/// (default 4), and <c>GF_FUZZ_LOG=&lt;file&gt;</c> collects how many cases each one ran. A failure prints the case's
+/// seed; <c>GF_FUZZ_SEED=&lt;seed&gt;</c> replays exactly that case.
 /// </summary>
 public static class Fuzz {
     public static int Seconds => int.TryParse(Environment.GetEnvironmentVariable("GF_FUZZ_SECONDS"), out var s) ? s : 0;
     private static int Threads => int.TryParse(Environment.GetEnvironmentVariable("GF_FUZZ_THREADS"), out var t) ? t : 4;
     private static string? ReplaySeed => Environment.GetEnvironmentVariable("GF_FUZZ_SEED") is { Length: > 0 } s ? s : null;
+
+    private static readonly Lock LogLock = new();
+
+    private static void Log(string name, string line) {
+        if (Environment.GetEnvironmentVariable("GF_FUZZ_LOG") is { Length: > 0 } path) {
+            lock (LogLock) {
+                File.AppendAllText(path, $"{DateTime.Now:HH:mm:ss} {name}: {line}\n");
+            }
+        }
+    }
 
     public static void Run<T>(Gen<T> gen, Action<T> property, int iterations, Func<T, string>? print = null,
         [CallerMemberName] string name = "") {
@@ -25,7 +36,7 @@ public static class Fuzz {
             return;
         }
         if (Seconds > 0) {
-            gen.Sample(property, time: Seconds, threads: Threads, print: print, writeLine: Console.WriteLine);
+            gen.Sample(property, time: Seconds, threads: Threads, print: print, writeLine: line => Log(name, line));
             return;
         }
         var stream = Stream(name);
@@ -47,7 +58,8 @@ public static class Fuzz {
         var deadline = Seconds > 0 ? DateTime.UtcNow.AddSeconds(Seconds) : (DateTime?)null;
         var stream = Stream(name);
         var rng = PCG.ThreadPCG;
-        for (var i = 0; deadline is null ? i < iterations : DateTime.UtcNow < deadline; i++) {
+        var i = 0;
+        for (; deadline is null ? i < iterations : DateTime.UtcNow < deadline; i++) {
             var pcg = ReplaySeed is { } replay ? PCG.Parse(replay) : deadline is null ? new PCG(stream, (ulong)i) : new PCG(rng.Next(), rng.Next64());
             var seed = pcg.ToString();
             var value = gen.Generate(pcg, null!, out _);
@@ -59,6 +71,9 @@ public static class Fuzz {
             if (ReplaySeed is not null) {
                 return;
             }
+        }
+        if (deadline is not null) {
+            Log(name, $"Passed {i:N0} iterations");
         }
     }
 

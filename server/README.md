@@ -154,6 +154,34 @@ Linux provides out of the box.
   limits, verification pushes and the new-host budget, the per-host circuit breaker, the gateway flood guard, replay
   cache and size limits, and SSRF checks at registration and at connect time.
 
+### Fuzzing
+
+The tests in `tests/GoldfishSend.Tests/Fuzz` and `Integration/ApiFuzzTests.cs` are property-based fuzz tests
+([CsCheck](https://github.com/AnthonyLloyd/CsCheck)). They feed generated, mostly hostile input to everything a client
+can reach, and compare the answers with independent references rather than with the code under test:
+
+| Tests | Input | Property |
+|---|---|---|
+| `GatewayFuzzTests` | Outer gateway requests (garbage, truncated, oversized, foreign key ids, bad P-256 points, bit flips), sealed responses, inner requests and responses, padding | Only an intact request opens, and every other one is `Malformed` or `UnknownKey` without an exception. The inner codec agrees with `SpecCodec`, a separate reading of docs/protocol.md, and whatever it accepts re-encodes to the same bytes. |
+| `CodecFuzzTests` | Batch send bodies, proof-of-work solutions, Web Push `p256dh`/`auth` and encryption, endpoint records, push envelopes | Each matches a re-implementation from the spec (the batch grammar, SHA-256 and leading zero bits, the P-256 curve equation with `BigInteger`). |
+| `SsrfFuzzTests` | Push endpoint URLs (decimal, octal, hex and short IPv4, IDNA dots, fullwidth digits, IPv4-mapped, compatible, NAT64, 6to4, Teredo and ISATAP IPv6, zone ids, userinfo, backslashes, ports, special-use names), addresses, hostile DNS answers | A URL the validator accepts makes HttpClient connect only to a name that may be resolved, or to an address that `SsrfOracle` (the IANA special-purpose registries and glibc's `inet_aton`, written out separately) says is globally reachable. `IpRangeFilter` and the connect-time check allow only such addresses. |
+| `ApiFuzzTests` (integration) | Outer bodies, sealed inner requests with fuzzed paths, headers and bodies, and malformed JSON for every JSON endpoint, through the real pipeline | Outer answers are only the documented `400`/`413`/`421`. Every decrypted request gets an encrypted answer that decodes, with a JSON `{"error": …}` body, and never a `500`. |
+| `GatewayCodecVectorTests` | Writes `docs/test-vectors/gateway-codec-fuzz.json` | The app's `GatewayCodecFuzzVectorsTest` must reach the server's verdict on every case. |
+
+A normal `dotnet test` replays the same seeded cases every time (a few seconds in all), so CI is deterministic. For a
+longer local run, give each property a time budget. It then runs on random seeds, and CsCheck shrinks any failure to a
+small input:
+
+```bash
+export GF_FUZZ_SECONDS=120 GF_FUZZ_THREADS=4 GF_FUZZ_LOG=$PWD/fuzz.log   # per property; the log counts the cases run
+nice dotnet test -c Release --filter "FullyQualifiedName~Fuzz"          # ApiFuzzTests also need GF_TEST_MYSQL/REDIS
+```
+
+A failure prints its seed. `GF_FUZZ_SEED=<seed> dotnet test --filter <test name>` replays exactly that case. Add what
+it found as a regression case (`InlineData` on a theory next to the property), so normal runs keep checking it. After
+changing the codec generators or verdicts, regenerate the vectors with
+`GF_WRITE_VECTORS=1 dotnet test --filter GatewayCodecVectorTests` and run the app's unit tests.
+
 ### Load testing
 
 `tools/LoadTest` drives a running server the way the app does: every call goes through the encrypted gateway, and it
