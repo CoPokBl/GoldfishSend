@@ -516,6 +516,29 @@ class GroupStatefulTest {
         scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(3, 81, 118, 0), Op(0, 3, 0, 0)))
     }
 
+    /**
+     * Found by GroupScenarioFuzzTest (input owner-by-succession-after-a-handover): Alice made Dave the owner just as he
+     * left, then left herself; Bob, next in line, took over. Correct: the harness hadn't counted that as a succession.
+     */
+    @Test
+    fun ownerBySuccessionAfterAHandover() =
+        scenario(0L, listOf(Op(2, 0, 98, 0), Op(8, 21, 0, 0), Op(0, 71, 0, 0), Op(0, 83, 0, 0), Op(11, 0, 0, 0), Op(1, 78, 0, 0), Op(4, 0, 48, 0), Op(1, 0, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input old-card-after-joining-again): Dave, removed and invited again, joined;
+     * he only had Bob's card from before Bob's inbox moved, and Bob, holding a card of Dave's already, sent him nothing.
+     * Every member who learns of an acceptance now sends the newcomer its card.
+     */
+    @Test
+    fun oldCardAfterJoiningAgain() = scenario(
+        7L,
+        listOf(
+            Op(8, 223, 0, 0), Op(2, 0, 128, 0), Op(2, 0, 127, 0), Op(5, 0, 0, 0), Op(0, 1, 0, 0), Op(11, 0, 0, 0), Op(3, 0, 28, 0),
+            Op(10, 0, 0, 0), Op(2, 0, 28, 0), Op(0, 3, 0, 0), Op(8, 255, 255, 0), Op(10, 37, 0, 111), Op(7, 0, 0, 0), Op(8, 255, 255, 0),
+            Op(0, 103, 0, 0),
+        ),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

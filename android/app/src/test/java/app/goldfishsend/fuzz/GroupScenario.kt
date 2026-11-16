@@ -495,7 +495,8 @@ class GroupScenario(private val seed: Long) {
             if (mem.id != alice.id && mem.id !in added) {
                 return Failure("authority: ${who(mem.id)} is in the roster but nobody added them: ${describe(r)}")
             }
-            if (mem.role == Role.OWNER && mem.id !in promoted && !ownerLeft) {
+            // Someone made owner (or Alice) who left hands it to the next member: then anyone may be the owner by now.
+            if (mem.role == Role.OWNER && mem.id !in promoted && !ownerLeft && promoted.none { it in churned }) {
                 return Failure("authority: ${who(mem.id)} is the owner but nobody made them one: ${describe(r)}")
             }
         }

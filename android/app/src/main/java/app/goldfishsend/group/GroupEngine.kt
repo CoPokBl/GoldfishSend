@@ -627,10 +627,12 @@ class GroupEngine(
         val applies = Membership.applies(r, f)
         if (Membership.stale(r, f)) {
             // An acceptance of an invitation that was withdrawn, from someone we may have no other way to tell (their
-            // inviter left): the owner answers with how they got out, through the card it carries, once.
+            // inviter left): the owner answers with how they got out, through the card it carries. Only for a stint our
+            // chain really had, and once per member an hour: the card's inbox is theirs to choose.
             val card = f.card?.let { runCatching { GroupCrypto.openCard(B64.dec(it.data), B64.dec(it.sig), io::validServer) }.getOrNull() }
             if (f.kind == FactKind.ACCEPT && card != null && card.card.id == f.id && card.card.g == c.g && m.state == GroupModel.JOINED &&
-                m.view()?.isOwner(me) == true && r.member(f.id)?.since != f.since && askOnce("$me out ${sf.key}", io.nowMillis())
+                m.view()?.isOwner(me) == true && r.member(f.id) == null &&
+                chain(m, 0).any { it.roster.member(f.id)?.since == f.since } && askOnce("$me out ${f.id}", io.nowMillis())
             ) {
                 tellOut(m, f.id, f.since, card)
             }
@@ -649,8 +651,12 @@ class GroupEngine(
             return
         }
         settle(m, before, f.id)
-        // An acceptance carries the newcomer's card: whoever learns they're in can reach them.
+        // An acceptance carries the newcomer's card: whoever learns they're in can reach them, and sends them its own (the
+        // copy they have may be from before an inbox moved, or from an earlier stint).
         f.card?.let { onCard(Content.GCard(c.g, it.data, it.sig)) }
+        if (f.kind == FactKind.ACCEPT) {
+            store.load(c.g)?.takeIf { it.state == GroupModel.JOINED && it.cards[f.id] != null }?.myCard?.let { io.sendGroup(c.g, f.id, cardContent(it)) }
+        }
         // The owner takes facts in, and may not be reachable by their author (no card, not a contact): whoever got it
         // from the author passes it on. (If it made someone else the owner, settle has passed it on already.)
         val after = store.load(c.g) ?: return

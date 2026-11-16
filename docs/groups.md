@@ -93,7 +93,8 @@ their card. Every member sends to it. The server sees one ordinary mailbox.
   on these. So rosters the leaver signed just before leaving aren't forked around, even if they had reached nobody
   yet (an owner who took over before having anyone's card).
 - **`card`**, on an acceptance only, is the newcomer's card. Whoever learns they're in can reach them, including an
-  owner who never got the card itself.
+  owner who never got the card itself. Every member who takes an acceptance in sends the newcomer its own card (the
+  copy the newcomer has may predate an inbox move, or an earlier stint).
 
 #### The view
 Everything a member does with the group acts on the **view**: the newest roster, with the facts held for its stints
