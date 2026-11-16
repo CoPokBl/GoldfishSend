@@ -120,7 +120,8 @@ server.
   - add anyone, including someone impersonating a person (an identity key the owner vouches for);
   - remove people, or rename the group;
   - **equivocate:** sign two different rosters at the same version and show each to different members. Members would
-    disagree about who's in until the owner's next roster; this isn't detected.
+    disagree about who's in until the owner's next roster; this isn't detected. A member next in line can do the same
+    once the owner leaves, by sending their own departure to some members while signing as the owner for the rest.
 
   Everyone sees the owner's changes as signed system lines, and the added person's safety number can be compared. The
   owner can't read anything sent before a new member joined, and can't forge messages or facts from other members.

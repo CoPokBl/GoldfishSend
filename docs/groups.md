@@ -102,8 +102,9 @@ applied.
   - Only departures move ownership, never acceptances. So of two honest members, at most one can believe they're the
     next owner: everyone ahead of them must have left.
 - **Nobody left to own it.** If no member is left to take over, nothing can change any more, and nobody can join.
-  Acceptances nobody took in don't count either, so everyone still listed as invited stays invited. A member who
-  sees this may only be behind, though: a newer roster, with an owner, still counts.
+  Acceptances nobody took in don't count either, so everyone still listed as invited stays invited. Nobody passes facts
+  on then, so who's still listed may differ between members; nothing anyone can do depends on it. A member who sees
+  this may only be behind, though: a newer roster, with an owner, still counts.
 - **A departure carrying a newer roster** (`last`) only applies once our roster has caught up with it.
 - **Applying the view.** The view is a pure function of the roster and the facts. It's applied the moment it changes:
   - who receives our messages;
@@ -125,11 +126,11 @@ For a received roster R, with current roster C:
    - None of the proof's members are still listed.
    - Every member in both rosters keeps their `since`. A new entry is `invited`, with `since == R.ver`.
 3. **Order.**
-   - **Older rosters.** One at or below our version is old news (a second one at a version we hold is the owner
-     equivocating) and is ignored.
+   - **Older rosters.** One at or below our version is old news and is ignored. A second roster at a version we hold
+     means the owner equivocated. That includes a successor who sent a departure and went on signing.
    - **Rosters with a gap.** One further on is kept (at most 16 per version, 2 per signer), and we ask for what's in
      between with `gsync`: from whoever sent it, and from the owner, once per gap an hour. Kept rosters that follow on
-     are taken as the gap fills.
+     are taken as the gap fills. One kept like that is looked at again if it comes once more (as an invitation, say).
 4. **Diff the view before and after:**
    - **Members who went:** stop sending to them. A departure shows as "left", a removal as "removed".
      - Their card is kept only until what's already queued to them (the roster that took them out) is delivered. Then
@@ -265,8 +266,9 @@ The invitee sees "Alice added you to <name>", with Join or Decline.
 2. Delete the group inbox (no drain needed) and this group's prekeys.
 
 The chat stays, read-only, until the user deletes it.
-- **Anyone can leave, the owner too.** The next member in the roster becomes the owner, and the UI says who that will
-  be. An owner who wants someone else to take over makes them owner first.
+- **Anyone can leave, the owner too.** An owner first folds the acceptances it holds, so that whoever has joined can
+  take over. The next member in the roster becomes the owner, and the UI says who that will be. An owner who wants
+  someone else to take over makes them owner first.
 - **If the owner's app is gone** (lost phone, wipe), with no departure: the roster can't change any more. Members still
   talk, and accept, decline and leave, since those are facts; nobody can be added or removed. To carry on, a member
   starts a new group with the members who are their contacts. That limitation is stated in the UI.

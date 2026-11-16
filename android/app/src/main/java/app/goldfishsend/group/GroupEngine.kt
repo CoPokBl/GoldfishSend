@@ -274,6 +274,8 @@ class GroupEngine(
         if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
             return true
         }
+        // As the owner: first take in the acceptances we hold, so whoever joined can take over.
+        publish(m, null)
         val head = m.roster
         val fact = GroupCrypto.signFact(
             identity.privateKey,
@@ -518,7 +520,8 @@ class GroupEngine(
     private fun onSignedRoster(m: GroupModel, signed: SignedRoster, from: String, direct: Boolean) {
         val cur = m.roster ?: return
         val r = signed.roster
-        if (r.ver <= cur.roster.ver || store.history(m.gid, signed.hashB64) != null) {
+        // (One we kept from beyond a gap may come again, now as something we can use: it's looked at again.)
+        if (r.ver <= cur.roster.ver) {
             return
         }
         val mine = r.member(me)
@@ -542,9 +545,10 @@ class GroupEngine(
         }
         store.addHistory(m.gid, signed)
         dbg { "gap: v${r.ver} on v${cur.roster.ver}" }
-        if (askOnce("$me ${m.gid} ${cur.hashB64}", io.nowMillis())) {
-            // Whoever sent it, and the owner: the sender may only be passing on a departure, from a leaver who's gone.
-            for (id in setOfNotNull(from, m.view()?.owner) - me) {
+        // Whoever sent it, and the owner: the sender may only be passing on a departure, from a leaver who's gone. Once
+        // per gap and member an hour.
+        for (id in setOfNotNull(from, m.view()?.owner) - me) {
+            if (askOnce("$me ${m.gid} ${cur.hashB64} $id", io.nowMillis())) {
                 requestSync(m, id, cur.roster.ver)
             }
         }

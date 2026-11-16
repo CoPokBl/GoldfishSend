@@ -61,6 +61,9 @@ class GroupScenario(private val seed: Long) {
 
     /** An owner left at some point: someone took over by succession. */
     private var ownerLeft = false
+
+    /** The newest roster Mallory claimed to hold when she sent a departure of hers (her client carried on regardless). */
+    private var malloryLeftAt: Long? = null
     private val churned = mutableSetOf<String>()
     private val joined = mutableSetOf<String>()
 
@@ -371,6 +374,7 @@ class GroupScenario(private val seed: Long) {
             if (model(mallory)?.roster?.roster?.member(mallory.id)?.since == mine.since) {
                 churned += mallory.id
             }
+            malloryLeftAt = minOf(malloryLeftAt ?: base.ver, base.ver)
             log("mallory leaves from v${base.ver} (stint ${mine.since})")
             GroupEngine.factContent(f)
         } else {
@@ -411,6 +415,16 @@ class GroupScenario(private val seed: Long) {
             return null
         }
         val views = inGroup.map { it.view(gid) }
+        if (equivocated()) {
+            // Mallory became the owner (next in line once others left) and signed rosters after her own departure: an
+            // owner equivocating, which members can't prevent (docs/threat-model.md). Only safety is checked.
+            return safety(views.first())
+        }
+        if (views.all { it.owner == null }) {
+            // Nobody left to manage it, for everyone: nobody can join, talk or change anything any more, and who's still
+            // listed isn't kept in step (there's no owner to pass facts on). Only safety is checked.
+            return safety(views.first())
+        }
         if (inGroup.map { it.roster(gid).hashB64 + " " + describe(it.view(gid)) }.toSet().size != 1) {
             return Failure("diverged: ${inGroup.map { p -> "${p.name} ${describe(p.view(gid))}" }}")
         }
@@ -418,6 +432,11 @@ class GroupScenario(private val seed: Long) {
         // Nobody left to manage it (the owner left, and no member to take over): nobody can join, nothing changes, and
         // acceptances don't count (Membership.view). Then only agreement and safety are checked.
         return (if (r.owner == null) null else liveness(r)) ?: safety(r)
+    }
+
+    private fun equivocated(): Boolean {
+        val at = malloryLeftAt ?: return false
+        return honest.any { p -> p.store.historySince(gid, at).any { it.roster.by == mallory.id } }
     }
 
     private fun liveness(r: View): Failure? {

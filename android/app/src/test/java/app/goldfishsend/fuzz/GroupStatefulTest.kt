@@ -439,6 +439,38 @@ class GroupStatefulTest {
         ),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest (input reinvitation-kept-from-a-departure): Carol kept Alice's re-invitation as a
+     * roster beyond a gap (it came inside Alice's departure), and so ignored it when it came again as her invitation.
+     */
+    @Test
+    fun reinvitationKeptFromADeparture() = scenario(
+        2L,
+        listOf(
+            Op(2, 0, 238, 0), Op(2, 0, 212, 0), Op(8, 91, 128, 0), Op(8, 2, 49, 212), Op(3, 0, 67, 0), Op(0, 94, 0, 0), Op(8, 13, 13, 0),
+            Op(8, 100, 0, 0), Op(2, 0, 22, 0), Op(1, 13, 0, 0), Op(1, 0, 0, 0), Op(9, 0, 0, 0), Op(8, 0, 31, 0), Op(0, 1, 0, 0),
+        ),
+    )
+
+    /**
+     * Seed 1367: Mallory, next in line once Alice left, sent a departure carrying an old roster and went on signing as the
+     * owner: an owner equivocating. Members can't prevent that; the harness checks only safety then. (Before, a sync
+     * request was also suppressed for a gap whose first ask had gone to someone else.)
+     */
+    @Test
+    fun nextOwnerEquivocates() = scenario(
+        1367L,
+        listOf(
+            Op(8, 43, 0, 0), Op(0, 204, 0, 0), Op(8, 59, 38, 0), Op(8, 27, 30, 70), Op(2, 0, 113, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0),
+            Op(9, 0, 0, 0), Op(8, 209, 0, 0), Op(8, 0, 88, 0), Op(0, 253, 0, 0), Op(0, 11, 0, 0),
+        ),
+    )
+
+    /** Found by GroupScenarioFuzzTest.forks (input departures-in-a-group-nobody-owns): members of a dead group disagreed. */
+    @Test
+    fun departuresInAGroupNobodyOwns() =
+        scenario(7L, listOf(Op(2, 0, 223, 0), Op(8, 71, 109, 0), Op(0, 8, 0, 0), Op(0, 1, 0, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0)))
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {
