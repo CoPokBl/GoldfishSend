@@ -163,7 +163,9 @@ The E2E blob to a group member is `type ‖ hint ‖ ciphertext`:
 
 The recipient computes the HMAC for every member of the group whose inbox this is (with that inbox's own hint key: a
 rotated inbox keeps its old one while it drains), to find the sender. That's cheap, and the server can't link two
-messages from the same sender, because the nonce is random. A blob with no matching member is dropped. A PreKey message
+messages from the same sender, because the nonce is random. Members of the rosters below ours (16 versions down) are
+tried too, but only their rosters and cards count: someone we've just taken out may be on the branch that wins (two
+admins removing each other at once). A blob with no matching member is dropped. A PreKey message
 whose hint matches the identity inside it, but who isn't a member yet, is held for up to 7 days waiting for a roster
 that adds them, then dropped.
 

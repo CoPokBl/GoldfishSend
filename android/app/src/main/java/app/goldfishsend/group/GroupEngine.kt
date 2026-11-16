@@ -323,7 +323,10 @@ class GroupEngine(
         if (m.state != GroupModel.JOINED) {
             return
         }
-        val sender = r.ids().firstOrNull { id ->
+        // Also members of the rosters our current one builds on: someone we just took out may be on the branch that wins
+        // (two admins removing each other at once). Only their rosters and cards count: texts need a current member.
+        val candidates = (r.ids() + recentIds(m)).distinct()
+        val sender = candidates.firstOrNull { id ->
             id != me && GroupCrypto.hint(inboxHintKey, blob.nonce, B64.dec(id)).contentEquals(blob.mac)
         }
         dbg { "receive g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
@@ -339,6 +342,17 @@ class GroupEngine(
         }
         val content = decrypt(sender, blob) ?: return
         onContent(m.gid, sender, content, direct = false)
+    }
+
+    /** The members of the rosters below ours, [FORK_DEPTH] versions down. */
+    private fun recentIds(m: GroupModel): List<String> {
+        val ids = LinkedHashSet<String>()
+        var x = m.roster ?: return emptyList()
+        repeat(FORK_DEPTH) {
+            x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver < x.roster.ver } ?: return ids.toList()
+            ids += x.roster.ids()
+        }
+        return ids.toList()
     }
 
     private fun decrypt(sender: String, blob: GroupBlob): Content? = try {

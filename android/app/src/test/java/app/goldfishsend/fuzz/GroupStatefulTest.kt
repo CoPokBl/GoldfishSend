@@ -329,6 +329,15 @@ class GroupStatefulTest {
         ),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest (input admins-remove-each-other): Alice and Bob, both admins, removed each other at
+     * once. Each then dropped the other's roster unread (the sender wasn't in their roster any more), so neither learnt
+     * which removal won.
+     */
+    @Test
+    fun adminsRemoveEachOther() =
+        scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 211, 0, 0), Op(3, 0, 16, 0)))
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {
