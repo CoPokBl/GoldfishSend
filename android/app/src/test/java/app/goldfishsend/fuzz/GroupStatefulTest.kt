@@ -175,6 +175,11 @@ class GroupStatefulTest {
     fun withdrawnWhileAcceptingAndTheAnswerLost() =
         scenario(1262L, listOf(Op(8, 137, 0, 0), Op(12, 0, 0, 0), Op(12, 0, 0, 0), Op(0, 106, 0, 0), Op(3, 0, 176, 0), Op(8, 211, 113, 187)))
 
+        /** Carol declines, and Alice invites her again; the new invitation is lost. Seed 4012's steps. */
+    @Test
+    fun reinvitationLostAfterADecline() =
+        scenario(4012L, listOf(Op(2, 0, 77, 0), Op(11, 0, 0, 0), Op(1, 27, 0, 0), Op(8, 0, 0, 0), Op(2, 0, 207, 0), Op(8, 0, 157, 203)))
+
         /** A roster a sync answer couldn't place made Mallory ask again, forever (a message storm). Seed 1341's steps. */
     @Test
     fun syncRequestLoop() = scenario(

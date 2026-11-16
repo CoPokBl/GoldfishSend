@@ -532,7 +532,13 @@ class GroupScenario(private val seed: Long) {
         return out
     }
 
-    /** [p] joined, but their roster still lists them invited: their acceptance hasn't been taken in. */
+    /** The owner of [r] is Mallory or nobody, or has no route to [p]. */
+    private fun ownerCantReach(p: Peer, r: View): Boolean {
+        val o = honest.firstOrNull { it.id == r.owner } ?: return true
+        return !route(o, p)
+    }
+
+        /** [p] joined, but their roster still lists them invited: their acceptance hasn't been taken in. */
     private fun pending(p: Peer, m: GroupModel): Boolean = m.state == GroupModel.JOINED && m.roster?.roster?.role(p.id) == Role.INVITED
 
     /** [p] is out of [r] or invited, and nobody honest still in it can reach them. */
@@ -556,18 +562,17 @@ class GroupScenario(private val seed: Long) {
         for (p in honest) {
             val m = model(p)
             val role = r.role(p.id)
+            // Invitees are out of delivery: the owner and they exchange invitations, acceptances, declines and withdrawals
+            // once, over 1:1 (or the card an acceptance brings). If one of those was lost, or the owner has no route to
+            // them, they may not agree: they find out when they act (the owner answers an acceptance), or stay waiting.
+            val inviteeCut = p.id in lostTo || p.id in lostFrom || ownerCantReach(p, r)
             val ok = when {
-                // An invitation can be lost (retention expiry), and nobody owes an invitee anything.
-                m == null -> role == null || (role == Role.INVITED && p.id in lostTo) || unreachable(p, h)
+                m == null -> role == null || (role == Role.INVITED && inviteeCut) || unreachable(p, h)
                 // Someone who left knows they're out, whether or not their departure reached anyone (it can be lost).
                 role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED || m.state == GroupModel.LEFT
-                // Joined and waiting to be admitted, or declined, is fine if that was lost: it's sent once (it waits for the
-                // owner, like anything sent to them), and they find out if they accept again.
-                role == Role.INVITED -> m.state == GroupModel.INVITED || ((pending(p, m) || m.state == GroupModel.LEFT) && p.id in lostFrom) || unreachable(p, h)
-                // Out: they know it, or nobody still in can reach them. Invitees are out of delivery: one whose invitation
-                // was withdrawn hears once over 1:1 (or, if they had accepted, the owner answers once): if that was lost, they
-                // find out when they accept, or stay waiting to be let in.
-                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || ((m.state == GroupModel.INVITED || pending(p, m)) && p.id in lostTo) ||
+                role == Role.INVITED -> m.state == GroupModel.INVITED || inviteeCut || unreachable(p, h)
+                // Out: they know it, or nobody still in can reach them.
+                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || ((m.state == GroupModel.INVITED || pending(p, m)) && inviteeCut) ||
                     unreachable(p, h)
             }
             if (!ok) {

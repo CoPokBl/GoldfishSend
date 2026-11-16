@@ -134,7 +134,8 @@ server.
   - **Made-up heads.** Every group message carries the sender's head (docs/groups.md, "Heads"), and a head that differs
     from ours makes us send our state. A member who invents heads gets at most 3 state messages per head of ours, plus
     one each time they send something an hour or more after the last: no more than an honest member who is behind.
-    A head only steers what we send them, never what we accept: rosters, facts and cards check themselves.
+    A head only steers what we send them, never what we accept: rosters, facts and cards check themselves. Likewise,
+    a blob whose hint names someone the owner removed makes it send them their removal again, once an hour at most.
 - **Removed members** stop receiving at once (nobody encrypts to them any more), and every remaining member moves to a
   new inbox, so they can't even send noise for long. What they received before stays with them. Their old sessions
   carry nothing new.

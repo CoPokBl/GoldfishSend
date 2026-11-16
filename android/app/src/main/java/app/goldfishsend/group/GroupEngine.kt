@@ -268,6 +268,8 @@ class GroupEngine(
     private fun invite(m: GroupModel, signed: SignedRoster, ids: List<String>) {
         val h = head(m) ?: return
         for (id in ids) {
+            // Invited again: whatever we owed them from before is over.
+            m.peers.remove(id)
             io.sendDirect(m.gid, id, Content.GState(m.gid, h, rosters = listOf(signed.wire())))
         }
     }
@@ -420,14 +422,15 @@ class GroupEngine(
                 m.peers[id] = ps.copy(sent = key, sentAt = mine.key, sentN = n + 1, sentTs = io.nowMillis())
             }
         }
-        // Who was taken out is owed the rosters that say so (through their old card, or over 1:1).
-        for ((id, ps) in m.peers.filter { it.value.out }) {
+        // Who was taken out is owed the rosters that say so (through their old card, or over 1:1), again if they still
+        // write to the group ([receive]).
+        for ((id, ps) in m.peers.filter { it.value.out && it.value.sent == null }) {
             val from = ps.acked?.v ?: (ps.outFrom - 1)
             val ok = states(m, mine, from, withCards = false, withFacts = false, newest = true).all { s ->
                 io.sendDirect(m.gid, id, s) || sendGroupTo(m, id, s)
             }
             if (ok) {
-                m.peers.remove(id)
+                m.peers[id] = ps.copy(sent = OUT, sentTs = io.nowMillis())
             }
         }
         store.save(m)
@@ -598,6 +601,19 @@ class GroupEngine(
         }
         dbg { "receive g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
         if (sender == null) {
+            // Someone we took out, still writing to the group: they didn't hear (it was lost). Their message isn't
+            // read; the rosters that say so are owed again, at most once per [RESEND_AFTER].
+            val out = m.peers.entries.firstOrNull { (id, ps) ->
+                ps.out && GroupCrypto.hint(inboxHintKey, blob.nonce, B64.dec(id)).contentEquals(blob.mac)
+            }
+            if (out != null) {
+                if (io.nowMillis() - out.value.sentTs >= RESEND_AFTER) {
+                    m.peers[out.key] = out.value.copy(sent = null)
+                    store.save(m)
+                    flush(m)
+                }
+                return
+            }
             // A newcomer whose admission hasn't reached us yet: keep it (bounded, 7 days) if the hint really is theirs.
             if (blob.type == PREKEY) {
                 val id = runCatching { PreKeySignalMessage(blob.body).identityKey.serialize() }.getOrNull() ?: return
@@ -1071,6 +1087,9 @@ class GroupEngine(
 
         /** State messages sent to one peer per head of ours, whatever heads they show (inventing heads gets no more). */
         const val MAX_STATES = 3
+
+        /** [PeerSync.sent] for someone taken out, once the rosters that say so went to them. */
+        private const val OUT = "out"
 
         /** [PeerSync.sent] for an owner our decline went to. */
         private const val DECLINED = "declined"
