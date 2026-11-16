@@ -225,7 +225,13 @@ class GroupEngine(
             io.sendGroup(m.gid, id, cardContent(myCard))
         }
         // Over 1:1 where possible: if the invitation was withdrawn meanwhile, the inviter can still tell us (see onSync).
-        m.invitedBy?.let { if (!io.sendDirect(m.gid, it, Content.GSync(m.gid, 0))) requestSync(m, it, 0) }
+        // Our card goes that way too: if the inviter has left meanwhile, it's how they can still pass it on (onCard).
+        m.invitedBy?.let {
+            io.sendDirect(m.gid, it, cardContent(myCard))
+            if (!io.sendDirect(m.gid, it, Content.GSync(m.gid, 0))) {
+                requestSync(m, it, 0)
+            }
+        }
         return true
     }
 
@@ -447,6 +453,17 @@ class GroupEngine(
         val cur = m.roster ?: return
         if (signed.hashB64 == cur.hashB64) {
             return
+        }
+        if (m.state == GroupModel.LEFT && direct && r.by == from && cur.roster.role(from) == Role.INVITED &&
+            askOnce("$me pass ${signed.hashB64}", io.nowMillis())
+        ) {
+            // An invitee reaches the group only through contacts, and we were theirs: we left before their answer (accept
+            // or decline) came, so it goes on to the admins who are our contacts (we're out: they'd drop it from our
+            // group session), or nobody would hear it.
+            val content = rosterContent(signed)
+            for (id in cur.roster.members.filter { it.role == Role.ADMIN }.map { it.id }) {
+                io.sendDirect(c.g, id, content)
+            }
         }
         val parent = store.history(c.g, r.prev)
         if (parent == null) {
@@ -679,7 +696,19 @@ class GroupEngine(
         val m = store.load(c.g) ?: return
         val card = runCatching { GroupCrypto.openCard(B64.dec(c.card), B64.dec(c.sig), io::validServer) }.getOrNull() ?: return
         val id = card.card.id
-        if (card.card.g != c.g || id == me || m.roster?.roster?.role(id) == null || m.state == GroupModel.LEFT) {
+        if (card.card.g != c.g || id == me || m.roster?.roster?.role(id) == null) {
+            return
+        }
+        if (m.state == GroupModel.LEFT) {
+            // We left before a newcomer's first card reached us, and we may have been the only one who'd pass it on: it
+            // goes to our contacts in the group over 1:1 (we're out, so not from our group session), and theirs to it.
+            if (m.cards[id] == null && askOnce("$me card ${card.card.id} ${card.card.seq}", io.nowMillis())) {
+                val r = m.roster!!.roster
+                for (other in r.ids().filter { it != id && it != me && r.isActive(it) }) {
+                    io.sendDirect(c.g, other, cardContent(card))
+                    m.cards[other]?.let { io.sendDirect(c.g, id, cardContent(it)) }
+                }
+            }
             return
         }
         val existing = m.cards[id]

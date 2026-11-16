@@ -284,6 +284,24 @@ class GroupStatefulTest {
         listOf(Op(3, 0, 44, 0), Op(5, 0, 44, 185), Op(8, 0, 63, 0), Op(2, 0, 42, 0), Op(5, 0, 0, 0), Op(0, 21, 0, 0), Op(5, 96, 0, 0), Op(5, 96, 0, 96), Op(5, 71, 0, 0)),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input decline-after-the-inviter-left): Dave's decline reached only Alice, his
+     * one contact in the group, after she had left; nobody else ever heard it.
+     */
+    @Test
+    fun declineAfterTheInviterLeft() =
+        scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 121, 0, 0), Op(11, 0, 0, 0), Op(4, 0, 186, 0), Op(1, 0, 0, 0), Op(1, 48, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest (input card-after-the-inviter-left): Mallory's first card reached only Alice, who had
+     * left by then, so Bob and Mallory never got each other's cards.
+     */
+    @Test
+    fun cardAfterTheInviterLeft() = scenario(
+        0L,
+        listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(11, 0, 0, 0), Op(0, 24, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(1, 0, 0, 0), Op(7, 119, 0, 0)),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

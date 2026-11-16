@@ -135,7 +135,11 @@ admin forwarded when inviting them). Admins, who keep every card, close the gaps
   reached didn't reach them).
 - **Invited members** have no inbox yet: rosters reach them only over 1:1, from an author who has them as a contact. An
   admin relaying a roster sends it to invitees over 1:1 too, so they don't build their acceptance on a stale roster.
-  On joining they send `gsync` to their inviter, over 1:1 if they can. A roster that arrives over 1:1 from an admin of
+  On joining they send `gsync` to their inviter, over 1:1 if they can, and their card the same way.
+- **The inviter who has left** may be the newcomer's only link to the group. A member who has left and then gets, over
+  1:1, an invitee's answer (their acceptance or decline roster) sends it on over 1:1 to the admins who are their
+  contacts; and a newcomer's first card, to their contacts in the group, with those contacts' cards to the newcomer.
+  Once each. A roster that arrives over 1:1 from an admin of
   it, for a group we don't know, and leaves us out, voids an older invitation from that admin arriving after it (1:1
   messages aren't ordered either). The newest 32 are remembered.
 - **`gsync` from someone who's out** (the roster removing them never reached them, for example it arrived before the
