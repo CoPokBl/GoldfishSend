@@ -355,3 +355,55 @@ equivocation: two different rosters at one version. Members can detect it but no
   - a roster: one push per member;
   - a fact: one push per member it reaches, plus the owner;
   - a succession: the heir's one roster, plus at most one forward of the deciding facts per member.
+
+## Results under the owner design (rounds since cb881ed)
+
+The rounds are on this branch. Each round ran seeds 1–600 and 1000–4999, then up to 15 minutes per fuzz target,
+stopping at the first finding. Times are time to first finding.
+
+| Round | Seeds | `scenario` | `forks` |
+|---|---|---|---|
+| 1 | 233, 1108 | 27 s | 51 s |
+| 2 | 1236 | 42 s | 46 s |
+| 3 | 1367 | 76 s | 54 s |
+| 4 | clean | 81 s | 335 s |
+| 5 | clean | 295 s | 196 s |
+| 6 | clean | 677 s (oracle) | 573 s |
+| 7 | 3839 (oracle) | 126 s | 366 s |
+| 8 | clean | 247 s | 609 s |
+| 9 | clean | 15 min clean | 721 s (open, not fixed) |
+
+That is about 90 minutes of fuzzing and 23 findings. About 15 of them were protocol bugs, and since round 4 the rate has
+been flat at roughly 5 to 10 an hour.
+
+**The membership semantics held.** After round 3, no finding was about the view or the chain. The roster stays linear,
+facts can't be lost or replayed, and succession never forked between honest members. The equivocation and
+ownerless cases are limits of the design, now stated in the spec.
+
+**What remains is delivery.**
+- **Who can reach whom.** Members reach each other through 1:1 contacts, through cards, or through relays by others.
+  Invitees have no inbox. After an ownership change or a new stint, someone can be left without a route.
+- **Catch-up.** Catching up after a gap means rebuilding the chain from whoever answers.
+- **Each fix was a relay rule:**
+  - forward facts to the owner, and again to a new owner;
+  - a leaver passes facts on;
+  - keep facts that arrive early;
+  - answer a stale acceptance;
+  - reach invitees over 1:1 first;
+  - keep a roster seen past a gap, and look at it again;
+  - don't count a sync ask that couldn't go out.
+
+  That is structural in the transport and catch-up layer, though not in the membership rules.
+
+**Proposed next step (not implemented): owner snapshots.**
+- **Catch-up.** Members stop rebuilding history. Anyone behind or unsure asks the owner, and gets back one snapshot:
+  - the current roster;
+  - the rosters where ownership changed since the asker's version (usually none or one), so it can be checked from
+    the owner the asker knew;
+  - every member's current card.
+- **Cards in the roster.** Each roster entry records the member's card `seq` and hash. A stale card can then be seen
+  by comparing against the roster, and is fetched from the owner; the peer-to-peer card hand-offs go away.
+- **When members ask.** On a gap, on joining, on an owner change, and once a day if their version is behind what
+  they've seen.
+- **A simpler oracle.** After quiescence plus one snapshot round, all honest views and card sets are equal.
+
