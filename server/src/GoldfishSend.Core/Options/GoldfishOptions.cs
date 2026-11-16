@@ -167,6 +167,14 @@ public sealed class NetworkOptions {
     /// </summary>
     public double GatewayRequestsPerSecond { get; set; } = 50;
     public int GatewayBurst { get; set; } = 200;
+
+    /// <summary>
+    /// How many clients the gateway flood guard tracks on each API node (about 200 bytes each). One IPv6 allocation holds
+    /// many /64s, so without a cap a client could add an entry per request. Clients seen once the table is full share
+    /// one overflow bucket, <see cref="GatewayOverflowFactor"/> times the size of a client's, until idle entries expire.
+    /// </summary>
+    public int GatewayMaxClients { get; set; } = 100_000;
+    public int GatewayOverflowFactor { get; set; } = 20;
 }
 
 /// <summary>GCRA policy: <see cref="Limit"/> events per <see cref="PeriodSeconds"/>, with up to <see cref="Burst"/> at once.</summary>
