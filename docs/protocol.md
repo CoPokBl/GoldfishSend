@@ -180,6 +180,12 @@ Each side checks the other's file: the same `blob` and `fp` from `serverKey`, th
 `innerRequest`, and that `outerResponse` decrypts, under the `respSecret` of that request, to `innerResponse`. The app
 does this with a test-only decapsulator. The files are regenerated only when the format changes.
 
+`docs/test-vectors/gateway-codec-fuzz.json` is written by the server's `GatewayCodecVectorTests` from a fixed seed:
+generated, mostly hostile inputs with the server's verdict on each (inner requests and responses to decode, inner
+requests to encode, padding sizes, key blobs with their fingerprints, sealed responses, proof-of-work solutions). Both
+sides check every case, so the app's codec is exactly as strict as the server's. Byte strings are `{ "hex", "len" }`:
+the hex bytes, then zeros up to `len`.
+
 ### Operator notes
 - `keygen` prints `ServerKey` with the other keys, and the fingerprint on stderr. `fingerprint` prints the fingerprint
   of the configured key. The server logs it at startup.

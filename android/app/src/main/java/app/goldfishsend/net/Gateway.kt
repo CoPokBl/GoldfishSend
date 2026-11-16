@@ -269,10 +269,19 @@ object Hkdf {
     }
 }
 
-/** The plaintext inside the gateway (docs/protocol.md "Inner request" / "Inner response"), big-endian, zero-padded. */
+/**
+ * The plaintext inside the gateway (docs/protocol.md "Inner request" / "Inner response"), big-endian, zero-padded.
+ * Both directions are as strict as the server: the encoder refuses anything the server would reject, and the decoders
+ * accept only the one canonical encoding (valid fields, zero padding to exactly the right bucket).
+ */
 object GatewayCodec {
     val BUCKETS = intArrayOf(512, 1024, 2048, 4096, 8192, 17408)
     const val MAX_INNER_REQUEST = 17408
+    const val MAX_REQUEST_BODY = 16 * 1024
+    const val MAX_PATH = 2048
+    const val MAX_HEADERS = 32
+    const val MAX_HEADER_NAME = 64
+    const val MAX_HEADER_VALUE = 4096
 
     const val GET = 1
     const val POST = 2
@@ -311,14 +320,44 @@ object GatewayCodec {
         return (n + 4095) / 4096 * 4096
     }
 
+    /**
+     * An API path: "/v1/..." in printable ASCII without `#` or `\`, the route part (before `?`) without `%`, `//` or
+     * `.`/`..` segments, and never the gateway's own `/v1/gw` or `/v1/key`.
+     */
+    fun isAllowedPath(path: String): Boolean {
+        if (path.length > MAX_PATH || !path.startsWith("/v1/") || path.any { it < '!' || it > '~' || it == '#' || it == '\\' }) {
+            return false
+        }
+        val route = path.substringBefore('?')
+        if ("//" in route || '%' in route || route.split('/').any { it == "." || it == ".." }) {
+            return false
+        }
+        val bare = route.trimEnd('/')
+        return !bare.equals("/v1/gw", ignoreCase = true) && !bare.equals("/v1/key", ignoreCase = true)
+    }
+
+    fun isValidHeaderName(name: String): Boolean =
+        name.length in 1..MAX_HEADER_NAME && name.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }
+
+    fun isValidHeaderValue(value: String): Boolean = value.length <= MAX_HEADER_VALUE && value.all { it in ' '..'~' }
+
+    /**
+     * Encodes and pads [r], lowercasing header names. Throws [IllegalArgumentException] for a request the server would
+     * refuse (method, negative timestamp, path, header names or values, duplicates), and [FormatException] if it's too large.
+     */
     fun encodeRequest(r: InnerRequest): ByteArray {
-        require(r.path.startsWith("/v1/") && r.path != "/v1/gw" && r.path != "/v1/key" && !r.path.startsWith("/v1/gw?") &&
-            !r.path.startsWith("/v1/key?")) { "bad inner path" }
+        require(r.method in GET..DELETE) { "bad method" }
+        require(r.timestamp >= 0) { "negative timestamp" }
+        require(isAllowedPath(r.path)) { "bad inner path" }
+        val headers = canonicalHeaders(r.headers)
+        if (r.body.size > MAX_REQUEST_BODY) {
+            throw FormatException("inner request body too large")
+        }
         val out = ByteArrayOutputStream()
         out.write(r.method)
         out.write(ByteBuffer.allocate(8).putLong(r.timestamp).array())
-        writeU16Bytes(out, r.path.utf8())
-        writeHeaders(out, r.headers)
+        writeU16Bytes(out, r.path.toByteArray(Charsets.US_ASCII))
+        writeHeaders(out, headers)
         writeU32Bytes(out, r.body)
         val raw = out.toByteArray()
         if (raw.size > MAX_INNER_REQUEST) {
@@ -328,23 +367,42 @@ object GatewayCodec {
     }
 
     fun decodeRequest(b: ByteArray): InnerRequest {
+        if (b.size > MAX_INNER_REQUEST) {
+            throw FormatException("inner request too large")
+        }
         val r = Reader(b)
         val method = r.u8()
         if (method !in GET..DELETE) {
             throw FormatException("bad method")
         }
         val ts = r.u64()
-        val path = r.bytes(r.u16()).toString(Charsets.UTF_8)
+        val pathBytes = r.bytes(r.u16())
+        if (pathBytes.isEmpty() || pathBytes.any { it < 0x21 || it > 0x7e }) {
+            throw FormatException("bad path")
+        }
+        val path = pathBytes.toString(Charsets.US_ASCII)
+        if (!isAllowedPath(path)) {
+            throw FormatException("path not allowed")
+        }
+        if (ts < 0) {
+            throw FormatException("timestamp out of range")
+        }
         val headers = readHeaders(r)
-        val body = r.bytes(r.u32())
+        val bodyLength = r.u32()
+        if (bodyLength > MAX_REQUEST_BODY) {
+            throw FormatException("body too large")
+        }
+        val body = r.bytes(bodyLength)
+        r.endPadding(paddedSize(r.position))
         return InnerRequest(method, ts, path, headers, body)
     }
 
     fun encodeResponse(r: InnerResponse): ByteArray {
+        require(r.status in 100..599) { "bad status" }
         val out = ByteArrayOutputStream()
         out.write(r.status ushr 8)
         out.write(r.status and 0xff)
-        writeHeaders(out, r.headers)
+        writeHeaders(out, canonicalHeaders(r.headers))
         writeU32Bytes(out, r.body)
         val raw = out.toByteArray()
         return raw.copyOf(paddedSize(raw.size))
@@ -358,16 +416,26 @@ object GatewayCodec {
         }
         val headers = readHeaders(r)
         val body = r.bytes(r.u32())
+        r.endPadding(paddedSize(r.position))
         return InnerResponse(status, headers, body)
     }
 
+    private fun canonicalHeaders(headers: List<Pair<String, String>>): List<Pair<String, String>> {
+        require(headers.size <= MAX_HEADERS) { "too many headers" }
+        val seen = HashSet<String>()
+        return headers.map { (name, value) ->
+            val n = name.lowercase()
+            require(isValidHeaderName(n) && seen.add(n)) { "bad or duplicate header name" }
+            require(isValidHeaderValue(value)) { "bad header value" }
+            n to value
+        }
+    }
+
     private fun writeHeaders(out: ByteArrayOutputStream, headers: List<Pair<String, String>>) {
-        require(headers.size <= 255)
         out.write(headers.size)
         for ((name, value) in headers) {
-            val n = name.lowercase().toByteArray(Charsets.US_ASCII)
+            val n = name.toByteArray(Charsets.US_ASCII)
             val v = value.toByteArray(Charsets.US_ASCII)
-            require(n.isNotEmpty() && n.size <= 255 && v.size <= 0xffff)
             out.write(n.size)
             out.write(n)
             out.write(v.size ushr 8)
@@ -378,11 +446,25 @@ object GatewayCodec {
 
     private fun readHeaders(r: Reader): List<Pair<String, String>> {
         val count = r.u8()
+        if (count > MAX_HEADERS) {
+            throw FormatException("too many headers")
+        }
         val out = ArrayList<Pair<String, String>>(count)
         repeat(count) {
-            val name = r.bytes(r.u8()).toString(Charsets.US_ASCII)
-            val value = r.bytes(r.u16()).toString(Charsets.US_ASCII)
-            out += name to value
+            val name = r.bytes(r.u8())
+            val valueLength = r.u16()
+            if (valueLength > MAX_HEADER_VALUE) {
+                throw FormatException("header value too long")
+            }
+            val value = r.bytes(valueLength)
+            val n = name.toString(Charsets.US_ASCII)
+            if (name.any { it < 0 } || !isValidHeaderName(n) || out.any { it.first == n }) {
+                throw FormatException("bad or duplicate header name")
+            }
+            if (value.any { it < 0x20 || it > 0x7e }) {
+                throw FormatException("bad header value")
+            }
+            out += n to value.toString(Charsets.US_ASCII)
         }
         return out
     }
@@ -400,25 +482,26 @@ object GatewayCodec {
     }
 
     private class Reader(private val b: ByteArray) {
-        private var pos = 0
+        var position = 0
+            private set
 
         private fun need(n: Int) {
-            if (n < 0 || n > b.size - pos) {
+            if (n < 0 || n > b.size - position) {
                 throw FormatException("truncated")
             }
         }
 
         fun u8(): Int {
             need(1)
-            return b[pos++].toInt() and 0xff
+            return b[position++].toInt() and 0xff
         }
 
         fun u16(): Int = (u8() shl 8) or u8()
 
         fun u32(): Int {
             need(4)
-            val v = ByteBuffer.wrap(b, pos, 4).int
-            pos += 4
+            val v = ByteBuffer.wrap(b, position, 4).int
+            position += 4
             if (v < 0) {
                 throw FormatException("length out of range")
             }
@@ -427,16 +510,23 @@ object GatewayCodec {
 
         fun u64(): Long {
             need(8)
-            val v = ByteBuffer.wrap(b, pos, 8).long
-            pos += 8
+            val v = ByteBuffer.wrap(b, position, 8).long
+            position += 8
             return v
         }
 
         fun bytes(n: Int): ByteArray {
             need(n)
-            val out = b.copyOfRange(pos, pos + n)
-            pos += n
+            val out = b.copyOfRange(position, position + n)
+            position += n
             return out
+        }
+
+        /** The rest must be zeros, and the whole message exactly [total] bytes. */
+        fun endPadding(total: Int) {
+            if (b.size != total || (position until b.size).any { b[it] != 0.toByte() }) {
+                throw FormatException("bad padding")
+            }
         }
     }
 }
