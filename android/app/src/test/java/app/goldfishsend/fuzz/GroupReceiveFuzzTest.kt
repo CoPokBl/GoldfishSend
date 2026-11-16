@@ -2,6 +2,9 @@ package app.goldfishsend.fuzz
 
 import app.goldfishsend.LastResortStore
 import app.goldfishsend.MemoryGroupStore
+import app.goldfishsend.cardState
+import app.goldfishsend.factState
+import app.goldfishsend.rosterState
 import app.goldfishsend.fuzz.FuzzKit.content
 import app.goldfishsend.fuzz.FuzzKit.str
 import app.goldfishsend.group.GroupEngine
@@ -64,8 +67,8 @@ class GroupReceiveFuzzTest {
                 6 -> ParserFuzzTest.rejectsOnly(IllegalArgumentException::class.java) { Content.decode(data.consumeBytes(400)) }
                     ?.let { bob.engine.onDirect(W.id(W.mallory), it) }
                 else -> bob.fromMallory(
-                    if (data.consumeBoolean()) GroupEngine.rosterContent(W.honest[data.consumeInt(0, W.honest.size - 1)])
-                    else GroupEngine.factContent(W.facts[data.consumeInt(0, W.facts.size - 1)]),
+                    if (data.consumeBoolean()) rosterState(W.honest[data.consumeInt(0, W.honest.size - 1)])
+                    else factState(W.facts[data.consumeInt(0, W.facts.size - 1)]),
                 )
             }
             bob.replayHeld()
@@ -76,13 +79,13 @@ class GroupReceiveFuzzTest {
     /** Content the attacker can make: anything, but mostly group content for this group, signed with keys it holds. */
     private fun content(data: FuzzedDataProvider): Content = when (data.consumeInt(0, 11)) {
         0 -> data.content()
-        1, 2, 3 -> GroupEngine.rosterContent(forgeRoster(data))
-        4 -> GroupEngine.rosterContent(W.honest[data.consumeInt(0, W.honest.size - 1)])
-        10 -> GroupEngine.factContent(forgeFact(data))
-        11 -> GroupEngine.factContent(W.facts[data.consumeInt(0, W.facts.size - 1)])
+        1, 2, 3 -> rosterState(forgeRoster(data))
+        4 -> rosterState(W.honest[data.consumeInt(0, W.honest.size - 1)])
+        10 -> factState(forgeFact(data))
+        11 -> factState(W.facts[data.consumeInt(0, W.facts.size - 1)])
         5, 6 -> forgeCard(data)
-        7 -> Content.GSync(W.gid, data.consumeLong())
-        8 -> Content.GLeave(W.gid)
+        7 -> Content.GState(W.gid, app.goldfishsend.proto.Head(data.consumeLong(), data.str(16), data.str(32)))
+        8 -> Content.GState(W.gid, W.honest[data.consumeInt(0, W.honest.size - 1)].let { app.goldfishsend.proto.Head(it.roster.ver, B64.enc(it.hash.copyOf(12)), data.str(32)) })
         else -> Content.GText(W.gid, data.str(20), data.str(40), data.consumeLong(), if (data.consumeBoolean()) data.consumeLong() else null)
     }
 
@@ -132,12 +135,12 @@ class GroupReceiveFuzzTest {
             id = if (data.consumeBoolean()) W.id(signer) else W.pickId(data),
             since = if (data.consumeBoolean()) data.consumeLong(0, 12) else data.consumeLong(),
             ts = data.consumeLong(),
-            last = List(data.consumeInt(0, 2)) { W.honest[data.consumeInt(0, W.honest.size - 1)].wire() },
+            last = data.consumeLong(-2, 12),
         )
         return GroupCrypto.signFact(signer.privateKey, f)
     }
 
-    private fun forgeCard(data: FuzzedDataProvider): Content.GCard {
+    private fun forgeCard(data: FuzzedDataProvider): Content.GState {
         val signer = W.attackers[data.consumeInt(0, W.attackers.size - 1)]
         val signerId = W.id(signer)
         val bundle = if (data.consumeBoolean()) W.bundles.getValue(signerId) else {
@@ -161,7 +164,7 @@ class GroupReceiveFuzzTest {
             seq = data.consumeLong(),
         )
         val signed = GroupCrypto.signCard(signer.privateKey, card)
-        return GroupEngine.cardContent(signed)
+        return cardState(signed)
     }
 
     /** The attacker's world: fixed identities, the honest history (signed by its real authors) and Bob's starting state. */
@@ -281,7 +284,7 @@ class GroupReceiveFuzzTest {
             val m = store(mallory)
             val b = store(bob)
             val me = GroupEngine(MemoryGroupStore(), m, mallory, NullIo)
-            val blob = me.encryptTo(id(bob), bobCard.card, Content.GLeave("x").encode())
+            val blob = me.encryptTo(id(bob), bobCard.card, Content.GState("x", app.goldfishsend.NO_HEAD).encode())
             val raw = GroupBlob.decode(blob)!!
             org.signal.libsignal.protocol.SessionCipher(b, GroupEngine.LOCAL, GroupCrypto.address(id(mallory)))
                 .decrypt(org.signal.libsignal.protocol.message.PreKeySignalMessage(raw.body))
@@ -345,7 +348,6 @@ class GroupReceiveFuzzTest {
         })
 
         init {
-            GroupEngine.forgetAsked()
             for (r in W.honest.filter { it.roster.ver <= start.roster.ver }) {
                 store.addHistory(W.gid, r)
             }

@@ -10,6 +10,7 @@ import app.goldfishsend.proto.Role
 import app.goldfishsend.proto.RosterOp
 import app.goldfishsend.proto.SignedFact
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -52,7 +53,7 @@ class GroupFindingsTest {
         alice.publish(gid, RosterOp.MakeOwner(bob.id))
         net.deliverAll()
         // Anyone who kept it (a member, a removed member) sends it to Bob again.
-        bob.engine.onDirect(alice.id, GroupEngine.factContent(oldAcceptance))
+        bob.engine.onDirect(alice.id, factState(oldAcceptance))
         net.deliverAll()
         everyone(alice, bob) { assertEquals(it.name, Role.INVITED, it.view(gid).role(dave.id)) }
         assertEquals(GroupModel.INVITED, dave.model(gid).state)
@@ -77,7 +78,7 @@ class GroupFindingsTest {
         net.deliverAll()
         carol.join(gid)
         net.deliverAll()
-        bob.engine.onDirect(alice.id, GroupEngine.factContent(oldDeparture))
+        bob.engine.onDirect(alice.id, factState(oldDeparture))
         net.deliverAll()
         everyone(alice, bob, carol) { assertEquals(it.name, Role.MEMBER, it.view(gid).role(carol.id)) }
     }
@@ -86,7 +87,7 @@ class GroupFindingsTest {
     @Test
     fun aCardWithSignedGarbagePrekeysIsRejected() {
         val good = bob.card(gid).card
-        val junk = Rand.bytes(33)
+        val junk = Rand.bytes(33).also { it[0] = 0 }
         val bad = good.copy(bundle = good.bundle.copy(signedPreKey = B64.enc(junk), signedPreKeySig = B64.enc(bob.identity.privateKey.calculateSignature(junk))))
         val signed = GroupCrypto.signCard(bob.identity.privateKey, bad)
         assertNull(GroupCrypto.openCard(signed.bytes, signed.sig) { true })
@@ -100,7 +101,7 @@ class GroupFindingsTest {
         alice.create(gid, "Trip", bob)
         // Bob has the invitation but not Alice's card yet when he joins.
         val late = mutableListOf<GroupNet.Envelope>()
-        net.filter = { e -> !(e is GroupNet.Envelope.Direct && e.content is app.goldfishsend.proto.Content.GCard).also { if (it) late += e } }
+        net.filter = { e -> !(e is GroupNet.Envelope.Direct && (e.content as? app.goldfishsend.proto.Content.GState)?.cards?.isNotEmpty() == true).also { if (it) late += e } }
         net.deliverAll()
         assertTrue(bob.model(gid).cards.isEmpty())
         bob.join(gid)
@@ -116,7 +117,8 @@ class GroupFindingsTest {
     /**
      * Alice invites Bob and takes it back at once, and the withdrawal reaches Bob first (1:1 messages aren't ordered). Bob
      * saw an invitation to a group he wasn't in; joining it, he was "in" for good: nobody told him otherwise, and his
-     * messages were dropped.
+     * messages were dropped. The withdrawal carries the rosters from his invitation on, so he learns both at once, and
+     * the invitation arriving after changes nothing.
      */
     @Test
     fun aWithdrawalThatOvertakesTheInvitationVoidsIt() {
@@ -124,7 +126,8 @@ class GroupFindingsTest {
         alice.publish(gid, RosterOp.Remove(listOf(bob.id)))
         net.reorder = { batch -> batch.reversed() }
         net.deliverAll()
-        assertNull(bob.store.load(gid))
+        assertEquals(GroupModel.REMOVED, bob.model(gid).state)
+        assertFalse(bob.engine.join(bob.model(gid), bob.card(gid, 1)))
     }
 
     /**
@@ -214,16 +217,18 @@ class GroupFindingsTest {
         val sent = net.delivered
         for (r in chain) {
             for ((_, card) in routes) {
-                mallory.sendWithCard(card.card, GroupEngine.rosterContent(r))
+                mallory.sendWithCard(card.card, rosterState(r))
             }
         }
+        // Her rosters copy the one that admitted her and Bob, cards and all, so each goes in several chunks.
+        val hers = net.queue.size
         net.deliverAll()
         everyone(alice, bob) { p ->
             assertNull(p.name, p.view(gid).role(mallory.id))
             assertEquals(alice.roster(gid).hashB64, p.roster(gid).hashB64)
         }
         // Mallory's own sends, and nothing much in reply.
-        assertTrue("${net.delivered - sent} deliveries", net.delivered - sent <= chain.size * routes.size + 10)
+        assertTrue("${net.delivered - sent} deliveries for $hers of hers", net.delivered - sent <= hers + 10)
     }
 
     private fun GroupNet.Envelope.to(): Peer = when (this) {

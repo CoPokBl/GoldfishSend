@@ -1,11 +1,10 @@
 package app.goldfishsend.db
 
-import app.goldfishsend.group.GroupEngine
+import app.goldfishsend.group.FactLines
 import app.goldfishsend.group.GroupModel
 import app.goldfishsend.group.GroupStore
 import app.goldfishsend.group.HeldBlob
-import app.goldfishsend.group.FactLines
-import app.goldfishsend.proto.Content
+import app.goldfishsend.group.PeerSync
 import app.goldfishsend.proto.GroupCard
 import app.goldfishsend.proto.GroupCrypto
 import app.goldfishsend.proto.GroupJson
@@ -20,7 +19,7 @@ data class GroupRef(val cid: Long, val gid: String, val state: Int)
 data class MemberDelivery(val member: String, val pendingServerKey: String?, val unreachable: Boolean)
 
 /**
- * [GroupStore] over the SQLCipher tables (schema v5). Signatures were checked before anything was stored, and stored
+ * [GroupStore] over the SQLCipher tables (schema v7). Signatures were checked before anything was stored, and stored
  * bytes are trusted on load (the database is encrypted and authenticated).
  */
 class RepoGroupStore(private val repo: Repo) : GroupStore {
@@ -28,14 +27,14 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
 
     override fun load(gid: String): GroupModel? {
         val row = db.queryOne(
-            "SELECT cid, state, roster, roster_sig, my_card, my_card_sig, invited_by, facts, since FROM groups WHERE gid = ?", gid,
+            "SELECT cid, state, roster, roster_sig, my_card, my_card_sig, invited_by, facts, since, peers, head_seq, head_key FROM groups WHERE gid = ?", gid,
         ) { c ->
             arrayOf<Any?>(
                 c.getLong(0), c.getInt(1),
                 if (c.isNull(2)) null else c.getBlob(2), if (c.isNull(3)) null else c.getBlob(3),
                 if (c.isNull(4)) null else c.getBlob(4), if (c.isNull(5)) null else c.getBlob(5),
                 if (c.isNull(6)) null else c.getString(6), if (c.isNull(7)) null else c.getString(7),
-                c.getLong(8),
+                c.getLong(8), if (c.isNull(9)) null else c.getString(9), c.getLong(10), if (c.isNull(11)) null else c.getString(11),
             )
         } ?: return null
         val cid = row[0] as Long
@@ -54,6 +53,9 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
             invitedBy = row[6] as String?,
             facts = FactLines.decode(row[7] as String?),
             since = row[8] as Long,
+            peers = PeerSync.decode(row[9] as String?),
+            headSeq = row[10] as Long,
+            headKey = row[11] as String?,
         )
     }
 
@@ -66,9 +68,10 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
                 db.exec("INSERT INTO groups (cid, gid, state, created_at) VALUES (?, ?, ?, ?)", cid, m.gid, m.state, System.currentTimeMillis())
             }
             db.exec(
-                "UPDATE groups SET state = ?, roster = ?, roster_sig = ?, my_card = ?, my_card_sig = ?, invited_by = ?, facts = ?, since = ? " +
+                "UPDATE groups SET state = ?, roster = ?, roster_sig = ?, my_card = ?, my_card_sig = ?, invited_by = ?, facts = ?, since = ?, peers = ?, head_seq = ?, head_key = ? " +
                     "WHERE cid = ?",
-                m.state, m.roster?.bytes, m.roster?.sig, m.myCard?.bytes, m.myCard?.sig, m.invitedBy, FactLines.encode(m.facts), m.since, cid,
+                m.state, m.roster?.bytes, m.roster?.sig, m.myCard?.bytes, m.myCard?.sig, m.invitedBy, FactLines.encode(m.facts), m.since,
+                PeerSync.encode(m.peers), m.headSeq, m.headKey, cid,
             )
             val stored = db.query("SELECT member, seq, gone FROM group_cards WHERE cid = ?", cid) {
                 it.getString(0) to (it.getLong(1) to (it.getInt(2) != 0))
@@ -100,17 +103,11 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
 
     override fun addHistory(gid: String, r: SignedRoster) {
         val cid = cidOf(gid) ?: return
-        val held = db.query("SELECT roster, sig FROM group_rosters WHERE cid = ? AND ver = ?", cid, r.roster.ver) { c ->
-            trustedRoster(c.getBlob(0), c.getBlob(1))?.roster
-        }.filterNotNull()
-        if (!GroupEngine.fits(held, r.roster)) {
-            return
-        }
         db.exec(
             "INSERT OR IGNORE INTO group_rosters (cid, ver, hash, roster, sig) VALUES (?, ?, ?, ?, ?)",
             cid, r.roster.ver, r.hashB64, r.bytes, r.sig,
         )
-        // Bounded: enough to answer `gsync`.
+        // Bounded: enough to bring a member who's behind up to date.
         db.exec(
             "DELETE FROM group_rosters WHERE cid = ? AND ver < (SELECT MAX(ver) FROM group_rosters WHERE cid = ?) - 200",
             cid, cid,
@@ -152,42 +149,7 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
 
     override fun dropHeld(id: Long) = db.exec("DELETE FROM group_held WHERE id = ?", id)
 
-    /** Lines of `gid by ver`, newest last, in one kv entry (no table: it's a handful). */
-    private fun withdrawals(): List<List<String>> =
-        repo.kvString(WITHDRAWN)?.lines()?.map { it.split(' ') }?.filter { it.size == 3 }.orEmpty()
-
-    override fun withdrawn(gid: String, by: String): Long? =
-        withdrawals().filter { it[0] == gid && it[1] == by }.mapNotNull { it[2].toLongOrNull() }.maxOrNull()
-
-    override fun addWithdrawn(gid: String, by: String, ver: Long) {
-        val v = maxOf(ver, withdrawn(gid, by) ?: ver)
-        val kept = (withdrawals().filter { !(it[0] == gid && it[1] == by) } + listOf(listOf(gid, by, v.toString()))).takeLast(32)
-        repo.kvPutString(WITHDRAWN, kept.joinToString("\n") { it.joinToString(" ") })
-    }
-
-    /** Lines of `gid fact sig`, newest last, in one kv entry (a handful at most). */
-    private fun early(): List<List<String>> = repo.kvString(EARLY)?.lines()?.map { it.split(' ') }?.filter { it.size == 3 }.orEmpty()
-
-    override fun addEarlyFact(gid: String, fact: Content.GFact) {
-        val kept = (early() + listOf(listOf(gid, fact.fact, fact.sig))).takeLast(16)
-        repo.kvPutString(EARLY, kept.joinToString("\n") { it.joinToString(" ") })
-    }
-
-    override fun takeEarlyFacts(gid: String): List<Content.GFact> {
-        val all = early()
-        val mine = all.filter { it[0] == gid }
-        if (mine.isNotEmpty()) {
-            repo.kvPutString(EARLY, (all - mine.toSet()).joinToString("\n") { it.joinToString(" ") }.ifEmpty { null })
-        }
-        return mine.map { Content.GFact(it[0], it[1], it[2]) }
-    }
-
     fun cidOf(gid: String): Long? = db.queryOne("SELECT cid FROM groups WHERE gid = ?", gid) { it.getLong(0) }
-
-    private companion object {
-        const val WITHDRAWN = "group_withdrawn"
-        const val EARLY = "group_early_facts"
-    }
 
     private fun trustedRoster(bytes: ByteArray, sig: ByteArray): SignedRoster? =
         runCatching { SignedRoster(bytes, sig, GroupJson.decodeFromString(Roster.serializer(), bytes.toString(Charsets.UTF_8))) }.getOrNull()

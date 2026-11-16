@@ -53,6 +53,7 @@ sealed class Content {
 
     // --- groups (docs/groups.md). `g` is the group id. ---
 
+    /** Every group message carries the sender's [Head] (`h`): that's how members notice they differ (docs/groups.md). */
     @Serializable
     @SerialName("gtext")
     data class GText(
@@ -62,36 +63,31 @@ sealed class Content {
         val ts: Long,
         val exp: Long? = null,
         val once: Boolean? = null,
+        val h: Head? = null,
     ) : Content()
 
     @Serializable
     @SerialName("greceipt")
-    data class GReceipt(val g: String, val ids: List<String>, val kind: String) : Content()
+    data class GReceipt(val g: String, val ids: List<String>, val kind: String, val h: Head? = null) : Content()
 
     @Serializable
     @SerialName("gdelete")
-    data class GDelete(val g: String, val ids: List<String>) : Content()
+    data class GDelete(val g: String, val ids: List<String>, val h: Head? = null) : Content()
 
+    /**
+     * Group state, merged by whoever gets it (docs/groups.md, "State"): rosters continuing the receiver's chain (oldest
+     * first), facts the roster doesn't show yet, and cards. Any part may be empty; with all of them empty it just says
+     * "this is where I am".
+     */
     @Serializable
-    @SerialName("groster")
-    data class GRoster(val g: String, val roster: String, val sig: String) : Content()
-
-    @Serializable
-    @SerialName("gcard")
-    data class GCard(val g: String, val card: String, val sig: String) : Content()
-
-    @Serializable
-    @SerialName("gsync")
-    data class GSync(val g: String, val have: Long) : Content()
-
-    @Serializable
-    @SerialName("gleave")
-    data class GLeave(val g: String) : Content()
-
-    /** A member's signed accept or leave (docs/groups.md, "Facts"). */
-    @Serializable
-    @SerialName("gfact")
-    data class GFact(val g: String, val fact: String, val sig: String) : Content()
+    @SerialName("gstate")
+    data class GState(
+        val g: String,
+        val h: Head,
+        val rosters: List<Signed> = emptyList(),
+        val facts: List<Signed> = emptyList(),
+        val cards: List<Signed> = emptyList(),
+    ) : Content()
 
     /** The group this content belongs to, or null for 1:1 content. */
     val groupId: String?
@@ -99,11 +95,17 @@ sealed class Content {
             is GText -> g
             is GReceipt -> g
             is GDelete -> g
-            is GRoster -> g
-            is GCard -> g
-            is GSync -> g
-            is GLeave -> g
-            is GFact -> g
+            is GState -> g
+            else -> null
+        }
+
+    /** The sender's head on group content, if any. */
+    val head: Head?
+        get() = when (this) {
+            is GText -> h
+            is GReceipt -> h
+            is GDelete -> h
+            is GState -> h
             else -> null
         }
 
