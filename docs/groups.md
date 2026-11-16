@@ -243,7 +243,8 @@ member more than 150 versions behind gets the rest the next time they write, an 
 Invitees are outside delivery: they have no inbox in the group, and nobody but the owner owes them anything.
 - **An invitation** is a `gstate` with the roster that invites them, over the owner's 1:1 session.
 - **The acceptance** (with the card) and a **decline** go only to the inviter (the owner), over 1:1. Neither is sent
-  again if lost: they wait for the owner like anything sent to them.
+  again if lost (expired, or sent to an owner who has left since, its inbox gone): they wait for the owner like
+  anything sent to them. An invitee whose acceptance was lost stays waiting to be let in, until they leave.
 - **Being let in.** The owner's next roster admits them and carries their card. Then the owner owes them its state, like
   any member who has shown no head.
 - **A withdrawn invitation** goes to them once, over 1:1. If that's lost, they find out when they accept: the owner

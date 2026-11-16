@@ -563,9 +563,10 @@ class GroupScenario(private val seed: Long) {
             val m = model(p)
             val role = r.role(p.id)
             // Invitees are out of delivery: the owner and they exchange invitations, acceptances, declines and withdrawals
-            // once, over 1:1 (or the card an acceptance brings). If one of those was lost, or the owner has no route to
+            // once, over 1:1 (or the card an acceptance brings). If one of those was lost (held back, or sent to an inbox
+            // that was gone: an owner who has left since), or the owner has no route to
             // them, they may not agree: they find out when they act (the owner answers an acceptance), or stay waiting.
-            val inviteeCut = p.id in lostTo || p.id in lostFrom || ownerCantReach(p, r)
+            val inviteeCut = p.id in lostTo || p.id in lostFrom || net.deadLetters.any { it.first == p.id } || ownerCantReach(p, r)
             val ok = when {
                 m == null -> role == null || (role == Role.INVITED && inviteeCut) || unreachable(p, h)
                 // Someone who left knows they're out, whether or not their departure reached anyone (it can be lost).

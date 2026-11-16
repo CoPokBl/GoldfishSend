@@ -169,6 +169,9 @@ class GroupNet {
     var counting = false
     val states = HashMap<Pair<String, String>, Int>()
 
+    /** (sender, receiver) of every group message that went to an inbox that no longer exists (the server's 404). */
+    val deadLetters = mutableSetOf<Pair<String, String>>()
+
     /** Envelopes [counting] leaves out: what the adversary crafted and queued before it stopped. */
     val uncounted: MutableSet<Envelope> = java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
 
@@ -190,7 +193,12 @@ class GroupNet {
             },
         )
         when (e) {
-            is Envelope.ToInbox -> e.to.onInbox(e.sendSecret, e.blob)
+            is Envelope.ToInbox -> {
+                if (e.to.inboxes.values.none { e.sendSecret in it }) {
+                    deadLetters += e.from.id to e.to.id
+                }
+                e.to.onInbox(e.sendSecret, e.blob)
+            }
             is Envelope.Direct -> e.to.engine.onDirect(e.from.id, e.content)
         }
         for (p in peers) {
