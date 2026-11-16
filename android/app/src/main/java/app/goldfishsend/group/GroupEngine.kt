@@ -543,7 +543,6 @@ class GroupEngine(
             // Out of the group and invited again: like a first invitation, it's taken on its owner's word, gap or not (what
             // we missed meanwhile isn't ours to know).
             m.roster = signed
-            m.facts.clear()
             store.addHistory(m.gid, signed)
             settle(m, null, r.by)
             return
@@ -608,6 +607,14 @@ class GroupEngine(
                     io.sendDirect(c.g, id, c)
                 }
             }
+            // And kept, bounded like any: if we're invited again, it may still count.
+            val r = loaded.roster?.roster
+            if (r != null && f.id != me && !Membership.stale(r, f) && loaded.facts.none { it.key == sf.key } &&
+                loaded.facts.count { it.fact.id == f.id } < MAX_AHEAD
+            ) {
+                loaded.facts += sf
+                store.save(loaded)
+            }
             return
         }
         // A departure carries the newest roster the leaver had: it may be one we haven't seen (they signed it just before).
@@ -618,7 +625,18 @@ class GroupEngine(
         val m = store.load(c.g) ?: return
         val r = m.roster?.roster ?: return
         val applies = Membership.applies(r, f)
-        if (Membership.stale(r, f) || m.facts.any { it.key == sf.key }) {
+        if (Membership.stale(r, f)) {
+            // An acceptance of an invitation that was withdrawn, from someone we may have no other way to tell (their
+            // inviter left): the owner answers with how they got out, through the card it carries, once.
+            val card = f.card?.let { runCatching { GroupCrypto.openCard(B64.dec(it.data), B64.dec(it.sig), io::validServer) }.getOrNull() }
+            if (f.kind == FactKind.ACCEPT && card != null && card.card.id == f.id && card.card.g == c.g && m.state == GroupModel.JOINED &&
+                m.view()?.isOwner(me) == true && r.member(f.id)?.since != f.since && askOnce("$me out ${sf.key}", io.nowMillis())
+            ) {
+                tellOut(m, f.id, f.since, card)
+            }
+            return
+        }
+        if (m.facts.any { it.key == sf.key }) {
             return
         }
         if (!applies && m.facts.count { it.fact.id == f.id && !Membership.applies(r, it.fact) } >= MAX_AHEAD) {
@@ -698,9 +716,7 @@ class GroupEngine(
             return
         }
         if (cur.roster.role(from) == null) {
-            // Someone who's out but doesn't know it (the roster taking them out never reached them): they get that
-            // roster, and nothing newer.
-            removalOf(m, from)?.let { io.sendDirect(c.g, from, rosterContent(it)) }
+            tellOut(m, from, c.have, null)
             return
         }
         val rosters = chain(m, c.have).takeLast(SYNC_ROSTERS)
@@ -736,6 +752,29 @@ class GroupEngine(
             x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver == x!!.roster.ver - 1 }
         }
         return out.reversed()
+    }
+
+    /**
+     * Someone who's out but doesn't know it (the roster taking them out never reached them): they get our chain from
+     * [have] up to that roster, and nothing newer. Over 1:1 if they're a contact, else through [card] (theirs, which we
+     * keep only until this is delivered).
+     */
+    private fun tellOut(m: GroupModel, id: String, have: Long, card: SignedCard?) {
+        val out = removalOf(m, id) ?: return
+        val rosters = chain(m, have).filter { it.roster.ver <= out.roster.ver }.takeLast(SYNC_ROSTERS).ifEmpty { listOf(out) }
+        if (rosters.all { io.sendDirect(m.gid, id, rosterContent(it)) }) {
+            return
+        }
+        if (card == null || m.cards[id] != null) {
+            return
+        }
+        m.cards[id] = card
+        store.save(m)
+        for (r in rosters) {
+            io.sendGroup(m.gid, id, rosterContent(r))
+        }
+        m.cards.remove(id)
+        store.save(m)
     }
 
     /** The roster in our chain that took [id] out: the oldest one back from the current roster that doesn't list them. */

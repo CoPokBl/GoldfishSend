@@ -493,6 +493,29 @@ class GroupStatefulTest {
         ),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest (input departure-heard-while-out): Carol, removed, heard Alice's departure, then was
+     * invited again; the departure had been dropped, so she kept Alice as the owner. Facts heard while out are kept.
+     */
+    @Test
+    fun departureHeardWhileOut() = scenario(
+        0L,
+        listOf(
+            Op(8, 21, 0, 0), Op(2, 0, 212, 0), Op(8, 2, 0, 0), Op(3, 0, 67, 0), Op(0, 94, 0, 0), Op(0, 36, 0, 0), Op(8, 125, 83, 0),
+            Op(2, 0, 102, 0), Op(1, 0, 0, 0), Op(1, 89, 0, 0), Op(8, 91, 75, 0), Op(11, 0, 0, 0), Op(0, 67, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input withdrawn-invitation-nobody-can-tell): Bob, the owner after Alice left,
+     * withdrew Dave's invitation; nobody still in could reach Dave. Now if Dave joins, Bob answers his acceptance.
+     */
+    @Test
+    fun withdrawnInvitationNobodyCanTell() {
+        scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(3, 81, 118, 0)))
+        scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(3, 81, 118, 0), Op(0, 3, 0, 0)))
+    }
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

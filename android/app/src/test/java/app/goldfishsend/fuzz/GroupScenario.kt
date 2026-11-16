@@ -434,6 +434,9 @@ class GroupScenario(private val seed: Long) {
         return (if (r.owner == null) null else liveness(r)) ?: safety(r)
     }
 
+    /** [p] is invited, and nobody honest still in [r] has them as a contact. */
+    private fun unreachable(p: Peer, r: View): Boolean = honest.none { q -> q != p && r.isActive(q.id) && p.id in q.contacts }
+
     private fun equivocated(): Boolean {
         val at = malloryLeftAt ?: return false
         return honest.any { p -> p.store.historySince(gid, at).any { it.roster.by == mallory.id } }
@@ -447,6 +450,9 @@ class GroupScenario(private val seed: Long) {
                 m == null -> role == null
                 role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED
                 role == Role.INVITED -> m.state == GroupModel.INVITED
+                // A withdrawn invitation nobody can tell them about: they have no inbox yet, and none of the members they
+                // know is still in. They find out if they join (the owner answers their acceptance).
+                role == null && m.state == GroupModel.INVITED -> unreachable(p, r)
                 else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
             }
             if (!ok) {

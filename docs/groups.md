@@ -160,7 +160,11 @@ For a received roster R, with current roster C:
   changes, every member passes the new owner the facts it holds that the roster doesn't show yet (the old owner may
   have been the only one they reached). Either way, at most once per member and fact.
 - **After leaving.** A member who has left still passes a fact that reaches it over 1:1 to the roster's members who
-  are its contacts, once. It may be the only link between the author and the people it invited.
+  are its contacts, once. It may be the only link between the author and the people it invited. It also keeps the
+  fact (bounded like any), in case it's invited again: it may still count then.
+- **An acceptance of a withdrawn invitation.** The owner answers once, through the card the acceptance carries, with
+  how its author got out. The author may have no other way to hear it, for example when their inviter has left. An
+  invitee nobody still in can reach learns of the withdrawal only this way, by joining.
 
 #### Relaying
 Members only reach the members whose cards they have, and a member's view can lag: an invitee only has the cards the
@@ -179,7 +183,8 @@ owner sent when inviting them. The owner, who keeps every card, closes the gaps:
 - **Unordered 1:1 messages.** A roster that arrives over 1:1 from its owner, for a group we don't know, and leaves us
   out, voids an older invitation from that owner arriving after it. The newest 32 are remembered.
 - **`gsync` from someone who's out** (the roster taking them out never reached them; for example, it arrived before
-  the invitation, and they joined): a member answers over 1:1 with that roster, and nothing newer.
+  the invitation, and they joined): a member answers with the chain from their `have` up to that roster, and nothing
+  newer. The answer goes over 1:1, or through their card if a fact of theirs brought one.
 - **`gsync` answers** come from any member, since the chain checks itself. They contain:
   - the rosters from `have` onwards, at most 50 (the asker asks again from where it got to);
   - the facts held that the roster doesn't show yet;
