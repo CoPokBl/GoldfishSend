@@ -166,8 +166,7 @@ object Messenger {
             return
         }
         when (val c = c0) {
-            is Content.Chunk, is Content.GText, is Content.GReceipt, is Content.GDelete, is Content.GRoster,
-            is Content.GCard, is Content.GSync, is Content.GLeave, is Content.GFact -> Unit
+            is Content.Chunk, is Content.GText, is Content.GReceipt, is Content.GDelete, is Content.GState -> Unit
             is Content.Hello -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
                 if (secret == null || secret.size != 32 || !ServerApi.isValidContactServer(c.server)) {

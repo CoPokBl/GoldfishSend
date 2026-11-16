@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 6
+    const val VERSION = 7
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -219,9 +219,24 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 7) {
+                for (s in V7) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Group delivery by state and heads (docs/groups.md, "State"). Groups made before can't be read any more. */
+    internal val V7 = listOf(
+        "DELETE FROM contacts WHERE is_group = 1",
+        // What we know of each peer's head and what we've sent them (JSON).
+        "ALTER TABLE groups ADD COLUMN peers TEXT",
+        // How often our head changed, and the last one counted (docs/groups.md, "Heads").
+        "ALTER TABLE groups ADD COLUMN head_seq INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE groups ADD COLUMN head_key TEXT",
+    )
 
     /** Groups v2 (one owner, membership facts). Groups made before can't be read any more, and nothing was released. */
     internal val V6 = listOf(

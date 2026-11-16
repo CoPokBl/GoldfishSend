@@ -9,6 +9,7 @@ import app.goldfishsend.group.GroupStore
 import app.goldfishsend.core.ReceiveGuard
 import app.goldfishsend.db.MAX_CHUNKS_PER_CONTACT
 import app.goldfishsend.group.HeldBlob
+import app.goldfishsend.group.PeerSync
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.CardBundle
 import app.goldfishsend.proto.CardInbox
@@ -18,7 +19,10 @@ import app.goldfishsend.proto.GroupCard
 import app.goldfishsend.proto.GroupCrypto
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.Rand
+import app.goldfishsend.proto.Head
+import app.goldfishsend.proto.Signed
 import app.goldfishsend.proto.SignedCard
+import app.goldfishsend.proto.SignedFact
 import app.goldfishsend.proto.SignedRoster
 import org.signal.libsignal.protocol.IdentityKeyPair
 import org.signal.libsignal.protocol.ecc.ECKeyPair
@@ -28,6 +32,16 @@ import org.signal.libsignal.protocol.kem.KEMKeyType
 import org.signal.libsignal.protocol.state.KyberPreKeyRecord
 import org.signal.libsignal.protocol.state.SignedPreKeyRecord
 import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore
+
+/** A head that says nothing (an attacker's, or a test's that doesn't care): everyone looks ahead of it. */
+val NO_HEAD = Head(0, "", "")
+
+/** State messages carrying one roster, fact or card, as a test or an attacker sends them. */
+fun rosterState(r: SignedRoster, h: Head = NO_HEAD) = Content.GState(r.roster.g, h, rosters = listOf(r.wire()))
+
+fun factState(f: SignedFact, h: Head = NO_HEAD) = Content.GState(f.fact.g, h, facts = listOf(f.wire()))
+
+fun cardState(c: SignedCard, h: Head = NO_HEAD) = Content.GState(c.card.g, h, cards = listOf(Signed(B64.enc(c.bytes), B64.enc(c.sig))))
 
 /** Like the app's SignalStore: group prekeys are last-resort, so using them deletes nothing. */
 class LastResortStore(kp: IdentityKeyPair, reg: Int) : InMemorySignalProtocolStore(kp, reg) {
@@ -44,6 +58,9 @@ class MemoryGroupStore : GroupStore {
         var invitedBy: String?,
         var facts: String?,
         var since: Long,
+        var peers: String?,
+        var headSeq: Long,
+        var headKey: String?,
     )
 
     private val rows = HashMap<String, Row>()
@@ -57,26 +74,25 @@ class MemoryGroupStore : GroupStore {
 
     override fun load(gid: String): GroupModel? {
         val r = rows[gid] ?: return null
-        return GroupModel(gid, r.state, r.roster, r.cards.toMutableMap(), r.myCard, r.invitedBy, FactLines.decode(r.facts), r.since)
+        return GroupModel(gid, r.state, r.roster, r.cards.toMutableMap(), r.myCard, r.invitedBy, FactLines.decode(r.facts), r.since, PeerSync.decode(r.peers), r.headSeq, r.headKey)
     }
 
     override fun save(m: GroupModel) {
-        rows[m.gid] = Row(m.state, m.roster, m.cards.toMap(), m.myCard, m.invitedBy, FactLines.encode(m.facts), m.since)
+        rows[m.gid] = Row(m.state, m.roster, m.cards.toMap(), m.myCard, m.invitedBy, FactLines.encode(m.facts), m.since, PeerSync.encode(m.peers), m.headSeq, m.headKey)
         routes.getOrPut(m.gid) { HashMap() }.putAll(m.cards)
     }
 
-    /** Like RepoGroupStore.addHistory: capped per version, nothing kept 200 versions behind the newest. */
+    /** Like RepoGroupStore.addHistory: nothing kept 200 versions behind the newest. */
     override fun addHistory(gid: String, r: SignedRoster) {
         val rows = historyRows.getOrPut(gid) { LinkedHashMap() }
-        if (r.hashB64 !in rows && !GroupEngine.fits(rows.values.filter { it.roster.ver == r.roster.ver }.map { it.roster }, r.roster)) {
-            return
-        }
         rows.putIfAbsent(r.hashB64, r)
         val newest = rows.values.maxOf { it.roster.ver }
         rows.values.removeAll { it.roster.ver < newest - 200 }
     }
 
     override fun history(gid: String, hashB64: String): SignedRoster? = historyRows[gid]?.get(hashB64)
+
+    fun gids(): List<String> = rows.keys.toList()
 
     override fun historySince(gid: String, since: Long): List<SignedRoster> =
         historyRows[gid]?.values?.filter { it.roster.ver > since }?.sortedBy { it.roster.ver }.orEmpty()
@@ -111,28 +127,6 @@ class MemoryGroupStore : GroupStore {
     override fun dropHeld(id: Long) {
         heldRows.values.forEach { l -> l.removeAll { it.id == id } }
     }
-
-    private val withdrawals = LinkedHashMap<String, Long>()
-    private val early = mutableListOf<Content.GFact>()
-
-    override fun addEarlyFact(gid: String, fact: Content.GFact) {
-        early += fact
-        while (early.size > 16) {
-            early.removeAt(0)
-        }
-    }
-
-    override fun takeEarlyFacts(gid: String): List<Content.GFact> = early.filter { it.g == gid }.also { early.removeAll(it) }
-
-    override fun withdrawn(gid: String, by: String): Long? = withdrawals["$gid $by"]
-
-    override fun addWithdrawn(gid: String, by: String, ver: Long) {
-        val v = withdrawals.remove("$gid $by")
-        withdrawals["$gid $by"] = maxOf(ver, v ?: ver)
-        while (withdrawals.size > 32) {
-            withdrawals.remove(withdrawals.keys.first())
-        }
-    }
 }
 
 /**
@@ -142,7 +136,7 @@ class MemoryGroupStore : GroupStore {
 class GroupNet {
     sealed class Envelope {
         /** [what]: the content's type, for tests that pick envelopes (the blob is encrypted). */
-        class ToInbox(val to: Peer, val sendSecret: String, val blob: ByteArray, val from: Peer, val what: String = "") : Envelope()
+        class ToInbox(val to: Peer, val sendSecret: String, val blob: ByteArray, val from: Peer, val what: String = "", val head: String? = null) : Envelope()
         class Direct(val to: Peer, val from: Peer, val content: Content) : Envelope()
     }
 
@@ -168,8 +162,30 @@ class GroupNet {
     /** Delivers one envelope, then runs what each member does after a call (held messages, inbox rotation, waiting texts). */
     var delivered = 0
 
+    /**
+     * While set, state messages delivered that change nothing for their receiver are counted per (sender, receiver, the
+     * sender's heads, the receiver's heads): the same useless exchange over and over is ping-pong.
+     */
+    var counting = false
+    val states = HashMap<Pair<String, String>, Int>()
+
+    /** (sender, receiver) of every group message that went to an inbox that no longer exists (the server's 404). */
+    val deadLetters = mutableSetOf<Pair<String, String>>()
+
+    /** Envelopes [counting] leaves out: what the adversary crafted and queued before it stopped. */
+    val uncounted: MutableSet<Envelope> = java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
+
     fun deliver(e: Envelope) {
         delivered++
+        val state = counting && e !in uncounted && when (e) {
+            is Envelope.ToInbox -> e.what == "GState"
+            is Envelope.Direct -> e.content is Content.GState
+        }
+        val (from, to) = when (e) {
+            is Envelope.ToInbox -> e.from to e.to
+            is Envelope.Direct -> e.from to e.to
+        }
+        val before = if (state) to.heads() else null
         trace?.invoke(
             when (e) {
                 is Envelope.ToInbox -> "  ${e.from.name} -> ${e.to.name} (group)"
@@ -177,11 +193,24 @@ class GroupNet {
             },
         )
         when (e) {
-            is Envelope.ToInbox -> e.to.onInbox(e.sendSecret, e.blob)
+            is Envelope.ToInbox -> {
+                if (e.to.inboxes.values.none { e.sendSecret in it }) {
+                    deadLetters += e.from.id to e.to.id
+                }
+                e.to.onInbox(e.sendSecret, e.blob)
+            }
             is Envelope.Direct -> e.to.engine.onDirect(e.from.id, e.content)
         }
         for (p in peers) {
             p.runDeferred()
+        }
+        if (state && to.heads() == before) {
+            val sent = when (e) {
+                is Envelope.ToInbox -> e.head
+                is Envelope.Direct -> e.content.head?.key
+            }
+            val k = "${from.name} $sent" to "${to.name} $before"
+            states[k] = (states[k] ?: 0) + 1
         }
     }
 
@@ -281,7 +310,11 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
     fun say(gid: String, body: String, wireId: String = Content.newId()): List<String> {
         val m = model(gid)
         check(m.state == GroupModel.JOINED)
-        val content = Content.GText(gid, wireId, body, System.currentTimeMillis())
+        if (!GroupEngine.admitted(m, id)) {
+            // Like the app: nothing to send until the owner has taken us in.
+            return emptyList()
+        }
+        val content = Content.GText(gid, wireId, body, System.currentTimeMillis(), h = engine.head(m))
         val r = m.view()!!
         val to = r.members.map { it.id }.filter { it != id && r.isActive(it) }
         for (t in to) {
@@ -310,9 +343,13 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
     /** Sends straight to a member's (possibly stale) card, as a modified or removed client might. */
     fun sendWithCard(card: GroupCard, content: Content) {
         val to = net.peers.first { it.id == card.id }
-        for (part in Chunker.splitContent(content, Padding.MAX_PREKEY_PLAINTEXT)) {
+        val parts = Chunker.splitContent(content, Padding.MAX_PREKEY_PLAINTEXT)
+        for ((i, part) in parts.withIndex()) {
             val blob = engine.encryptTo(card.id, card, part.encode())
-            net.queue.addLast(GroupNet.Envelope.ToInbox(to, card.inbox.sendSecret, blob, this, content.javaClass.simpleName))
+            // The content's type on its last part: that's the one whose delivery makes it count.
+            net.queue.addLast(
+                GroupNet.Envelope.ToInbox(to, card.inbox.sendSecret, blob, this, if (i == parts.size - 1) content.javaClass.simpleName else "Chunk", content.head?.key),
+            )
         }
     }
 
@@ -348,6 +385,9 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
     }
 
     fun roster(gid: String) = model(gid).roster!!
+
+    /** Our heads in every group, and our state there (what a state message can change). */
+    fun heads(): List<String> = store.gids().mapNotNull { g -> store.load(g)?.let { "${engine.head(it)?.key} ${it.state}" } }
 
     private inner class Io : GroupIo {
         override fun sendGroup(gid: String, to: String, content: Content) = this@Peer.sendGroup(gid, to, content)

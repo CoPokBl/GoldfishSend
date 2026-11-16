@@ -131,14 +131,26 @@ server.
     exception: the next member may sign once the owner has left, and only with the departures that make them next as
     proof.
   - **Flooding.** Facts are capped: one of each kind per stint, and 2 per member for stints we can't place yet.
+  - **Made-up heads.** Every group message carries the sender's head (docs/groups.md, "Heads"), and a head that differs
+    from ours makes us send our state. A member who invents heads gets at most 3 state messages per head of ours, plus
+    one each time they send something an hour or more after the last: no more than an honest member who is behind.
+    A head only steers what we send them, never what we accept: rosters, facts and cards check themselves. Likewise,
+    a blob whose hint names someone the owner removed makes it send them their removal again, once an hour at most.
 - **Removed members** stop receiving at once (nobody encrypts to them any more), and every remaining member moves to a
   new inbox, so they can't even send noise for long. What they received before stays with them. Their old sessions
   carry nothing new.
-- **The server** can drop, delay, reorder or replay messages. Replays and reordering change nothing (rosters are chained;
-  facts are idempotent). Dropping only delays: a member who misses rosters asks any member for the chain, which checks
-  itself.
+- **The server** can drop, delay, reorder or replay messages. Replays and reordering change nothing: rosters are
+  chained, and merging state is idempotent. Dropping only delays, until the next message between those members: its
+  head shows what's missing, and whoever is ahead sends it (an hour after the last send, so it isn't sent twice while
+  still on its way).
 - **Residual:**
-  - **Eventual consistency.** Membership can briefly differ between members while facts and rosters travel.
+  - **Eventual consistency.** Membership can briefly differ between members while facts and rosters travel. Nothing
+    is sent in the background: a group nobody writes in doesn't catch up, and what was lost (retention expiry) is
+    sent again only once someone writes. A member whose copy of a departure was lost, and whom nobody who holds it
+    can reach, goes on taking the leaver's messages (the leaver still has their sessions) until they hear.
+  - **Invitees** are reached over 1:1 only, by the owner. An acceptance, a decline or a withdrawn invitation that's
+    lost isn't sent again: the invitee learns how things stand when they act (the owner answers an acceptance), and
+    the owner when the invitee writes to them again.
   - **A lost owner.** If the owner loses their phone (rather than leaving), membership can't change any more. Members
     can still talk, accept, decline and leave.
 

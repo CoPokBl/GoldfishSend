@@ -132,17 +132,17 @@ class PoisonMessageTest {
         net.deliverAll()
         bob.join(gid)
         net.deliverAll()
-        // Bob gets Carol's texts before anything telling him she joined (her acceptance, or Alice's roster): they're held.
+        // Bob gets Carol's texts before anything telling him she's in (Alice's roster admitting her): they're held.
         val late = mutableListOf<GroupNet.Envelope>()
         net.filter = { e ->
             val fromAlice = e is GroupNet.Envelope.ToInbox && e.to == bob && e.from == alice || e is GroupNet.Envelope.Direct && e.to == bob
-            val carolsAcceptance = e is GroupNet.Envelope.ToInbox && e.to == bob && e.from == carol && e.what == "GFact"
-            if (fromAlice || carolsAcceptance) {
+            if (fromAlice) {
                 late += e
             }
-            !fromAlice && !carolsAcceptance
+            !fromAlice
         }
         carol.join(gid)
+        net.deliverAll()
         carol.say(gid, "poison")
         carol.say(gid, "fine")
         net.deliverAll()

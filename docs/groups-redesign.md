@@ -1,6 +1,6 @@
 # Group membership: why it keeps breaking, and what to do instead
 
-Status: option 1 chosen (one owner, no co-admins), and implemented on `group-fuzz-clean`. `docs/groups.md` is the spec; this file keeps the reasoning, and "Option 1 in detail" below checks the hard cases.
+Status: option 1 chosen (one owner, no co-admins), and implemented on `group-fuzz-clean`. Delivery and catch-up (the "Dissemination" below) were replaced later by heads and state messages (`docs/groups.md`, "Heads" to "Invitees"). `docs/groups.md` is the spec; this file keeps the reasoning, and "Option 1 in detail" below checks the hard cases.
 
 ## Summary
 

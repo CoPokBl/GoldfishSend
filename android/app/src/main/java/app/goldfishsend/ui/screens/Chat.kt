@@ -452,7 +452,10 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                         "You left this group, so you can't send messages here."
                     },
                 )
-                else -> Composer(draft) { text ->
+                // Joined, but not taken in yet.
+                else -> if (g != null && !g.admitted) {
+                    Banner("Waiting for the group's owner to let you in. You can send messages once they have.")
+                } else Composer(draft) { text ->
                     followSent = true
                     dividerCleared = true
                     scope.launch {
@@ -660,7 +663,7 @@ private fun SystemChip(text: String, modifier: Modifier) {
 }
 
 /** A group as the chat screen needs it: our state, who invited us, member names and whether we may edit its info. */
-private class ChatGroup(val state: Int, val inviter: String, val names: Map<String, String>, val canEdit: Boolean, val subtitle: String)
+private class ChatGroup(val state: Int, val inviter: String, val names: Map<String, String>, val canEdit: Boolean, val subtitle: String, val admitted: Boolean)
 
 private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val m = app.goldfishsend.core.Groups.model(s, cid) ?: return null
@@ -673,7 +676,7 @@ private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val active = r.members.count { it.role != app.goldfishsend.proto.Role.INVITED }
     val invited = r.members.size - active
     val count = "$active ${if (active == 1) "member" else "members"}" + if (invited > 0) ", $invited invited" else ""
-    return ChatGroup(m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), count)
+    return ChatGroup(m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), count, app.goldfishsend.group.GroupEngine.admitted(m, me))
 }
 
 @OptIn(ExperimentalFoundationApi::class)

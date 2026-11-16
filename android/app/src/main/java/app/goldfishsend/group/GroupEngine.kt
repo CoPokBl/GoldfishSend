@@ -8,6 +8,8 @@ import app.goldfishsend.proto.FactKind
 import app.goldfishsend.proto.GroupBlob
 import app.goldfishsend.proto.GroupCard
 import app.goldfishsend.proto.GroupCrypto
+import app.goldfishsend.proto.GroupJson
+import app.goldfishsend.proto.Head
 import app.goldfishsend.proto.Membership
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.Rand
@@ -21,6 +23,9 @@ import app.goldfishsend.proto.SignedCard
 import app.goldfishsend.proto.SignedFact
 import app.goldfishsend.proto.SignedRoster
 import app.goldfishsend.proto.View
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 import org.signal.libsignal.protocol.DuplicateMessageException
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
@@ -47,6 +52,11 @@ class GroupModel(
     val facts: MutableList<SignedFact>,
     /** Our stint: the `since` of our entry in the roster (0 if we never had one). */
     var since: Long,
+    /** What we know of each peer's state, and what we've sent them (docs/groups.md, "What's owed"). */
+    val peers: MutableMap<String, PeerSync> = mutableMapOf(),
+    /** How often our head has changed ([Head.s]), and the last one counted. */
+    var headSeq: Long = 0,
+    var headKey: String? = null,
 ) {
     /** Cards of members who just went, in memory only, so the system line can still name them. */
     val departed: MutableMap<String, SignedCard> = mutableMapOf()
@@ -62,6 +72,33 @@ class GroupModel(
     }
 }
 
+/**
+ * Per peer: [acked], the newest head they showed us (on anything they sent); [sent], the last state or ask we sent them,
+ * as "their head > our head", at [sentTs] (our clock); [sentN], how many we sent while our head was [sentAt]. [out]:
+ * they were taken out, and we owe them the rosters from version [outFrom] on that say so.
+ */
+@Serializable
+data class PeerSync(
+    val acked: Head? = null,
+    val sent: String? = null,
+    val sentAt: String? = null,
+    val sentN: Int = 0,
+    val sentTs: Long = 0,
+    val out: Boolean = false,
+    /** Not in our roster, but their first message proved who they are: a member we haven't heard is one yet. */
+    val unlisted: Boolean = false,
+    val outFrom: Long = 0,
+) {
+    companion object {
+        private val serializer = MapSerializer(String.serializer(), serializer())
+
+        fun encode(m: Map<String, PeerSync>): String? = if (m.isEmpty()) null else GroupJson.encodeToString(serializer, m)
+
+        fun decode(s: String?): MutableMap<String, PeerSync> =
+            s?.let { runCatching { GroupJson.decodeFromString(serializer, it).toMutableMap() }.getOrNull() } ?: mutableMapOf()
+    }
+}
+
 /** Facts in the store's text column: `fact sig` (b64u) per line. */
 object FactLines {
     fun encode(list: List<SignedFact>): String? = if (list.isEmpty()) null else list.joinToString("\n") { "${B64.enc(it.bytes)} ${B64.enc(it.sig)}" }
@@ -74,7 +111,7 @@ object FactLines {
         }
         runCatching {
             val bytes = B64.dec(parts[0])
-            SignedFact(bytes, B64.dec(parts[1]), app.goldfishsend.proto.GroupJson.decodeFromString(Fact.serializer(), bytes.toString(Charsets.UTF_8)))
+            SignedFact(bytes, B64.dec(parts[1]), GroupJson.decodeFromString(Fact.serializer(), bytes.toString(Charsets.UTF_8)))
         }.getOrNull()
     }?.toMutableList() ?: mutableListOf()
 }
@@ -103,10 +140,7 @@ interface GroupStore {
     /** Writes the group and replaces its card set with [GroupModel.cards]. */
     fun save(m: GroupModel)
 
-    /**
-     * Stores a roster: one we took, or one further on that we can't take yet (a gap). Capped per version and per author
-     * ([GroupEngine.fits]): anyone can sign rosters that will never be valid, and they mustn't crowd out the real one.
-     */
+    /** Stores a roster of our chain (the newest 200 versions are kept). */
     fun addHistory(gid: String, r: SignedRoster)
 
     fun history(gid: String, hashB64: String): SignedRoster?
@@ -118,18 +152,6 @@ interface GroupStore {
     fun storeChunk(gid: String, key: String, part: Int, parts: Int, data: String): String?
 
     fun hold(gid: String, hintKey: ByteArray, blob: ByteArray)
-
-    /** The newest roster version from [by] that left us out of [gid] while we had no invitation to it, or null. */
-    fun withdrawn(gid: String, by: String): Long?
-
-    /** Records one for [withdrawn]. Only the newest few (any group) are kept. */
-    fun addWithdrawn(gid: String, by: String, ver: Long)
-
-    /** Keeps a fact for a group we don't know yet (it overtook our invitation). Only the newest few (any group) are kept. */
-    fun addEarlyFact(gid: String, fact: Content.GFact)
-
-    /** The facts kept by [addEarlyFact] for [gid], and forgets them. */
-    fun takeEarlyFacts(gid: String): List<Content.GFact>
 
     fun held(gid: String): List<HeldBlob>
 
@@ -166,9 +188,9 @@ interface GroupIo {
 class NoCardException(id: String) : Exception("no card for member")
 
 /**
- * The group protocol (docs/groups.md): the owner's roster chain, members' facts, cards, sync, and the per-member
- * encryption with sender hints. All calls are synchronous; the app runs them under its libsignal lock inside one DB
- * transaction.
+ * The group protocol (docs/groups.md): the owner's roster chain and members' facts (membership), and one idempotent
+ * state message with heads on everything (delivery). All calls are synchronous; the app runs them under its libsignal
+ * lock inside one DB transaction.
  */
 class GroupEngine(
     private val store: GroupStore,
@@ -196,19 +218,22 @@ class GroupEngine(
         store.addHistory(gid, signed)
         store.save(m)
         io.onEvents(m, listOf(GroupEvent.Created))
-        for (id in others) {
-            io.sendDirect(gid, id, rosterContent(signed))
-            io.sendDirect(gid, id, cardContent(myCard))
-        }
+        invite(m, signed, others)
         return m
     }
 
     /**
-     * As the owner, publishes [op] as the next roster, with the facts we hold folded in (null: only fold them). Signs it,
-     * applies it locally and sends it to everyone in the old and new roster; new invitees also get every card over 1:1.
-     * Returns null if we aren't the owner or the change isn't possible.
+     * As the owner, publishes [op] as the next roster, with the facts we hold folded in (null: only fold them). Signs it
+     * and applies it; what everyone is owed follows from that ([flush]). Returns null if we aren't the owner or the change
+     * isn't possible.
      */
     fun publish(m: GroupModel, op: RosterOp?): SignedRoster? {
+        val signed = sign(m, op) ?: return null
+        flush(m)
+        return signed
+    }
+
+    private fun sign(m: GroupModel, op: RosterOp?): SignedRoster? {
         val base = m.roster ?: return null
         if (m.state != GroupModel.JOINED) {
             return null
@@ -219,7 +244,7 @@ class GroupEngine(
         }
         val ver = base.roster.ver + 1
         val folded = Membership.fold(base.roster, facts, me)
-        val changed = (if (op == null) folded.takeIf { it != base.roster } else op.apply(folded, me, ver)) ?: return null
+        val changed = (if (op == null) folded.takeIf { Membership.pending(base.roster, facts, me) } else op.apply(folded, me, ver)) ?: return null
         val proof = Membership.departures(base.roster, facts)
         val proofWire = m.facts.filter { sf -> proof.any { it === sf.fact } }.map { it.wire() }
         val next = RosterRules.successor(base, changed, me, io.nowMillis() / 1000, proofWire)
@@ -228,15 +253,32 @@ class GroupEngine(
         }
         val signed = GroupCrypto.signRoster(identity.privateKey, next)
         dbg { "publish v${next.ver} ${op?.javaClass?.simpleName ?: "fold"}" }
-        val cardsBefore = m.cards.toMap()
         take(m, signed)
-        broadcast(m, base.roster, signed, cardsBefore)
+        // Whoever this takes out is owed the rosters that say so; whoever it invites gets the invitation over 1:1.
+        for (id in base.roster.ids() - next.ids().toSet() - me) {
+            if (facts.none { it.kind == FactKind.LEAVE && it.id == id }) {
+                val since = base.roster.member(id)!!.since
+                m.peers[id] = (m.peers[id] ?: PeerSync()).copy(out = true, outFrom = since)
+            }
+        }
+        invite(m, signed, next.members.filter { it.role == Role.INVITED && it.since == next.ver }.map { it.id })
+        store.save(m)
         return signed
     }
 
+    /** An invitation: the roster that invites them, over 1:1 (they're the owner's contacts, and have no inbox yet). */
+    private fun invite(m: GroupModel, signed: SignedRoster, ids: List<String>) {
+        val h = head(m) ?: return
+        for (id in ids) {
+            // Invited again: whatever we owed them from before is over.
+            m.peers.remove(id)
+            io.sendDirect(m.gid, id, Content.GState(m.gid, h, rosters = listOf(signed.wire())))
+        }
+    }
+
     /**
-     * Joins a group we were invited to: our acceptance and card go to every member we can reach (the inviter and the
-     * owner over 1:1 too), then we ask the inviter for anything we missed.
+     * Joins a group we were invited to: our acceptance, carrying our card, goes to the owner (over 1:1, or through their
+     * card if we have it); the owner admits us in its next roster and then sends us the group's state.
      */
     fun join(m: GroupModel, myCard: SignedCard): Boolean {
         val mine = m.roster?.roster?.member(me)
@@ -252,56 +294,51 @@ class GroupEngine(
         m.state = GroupModel.JOINED
         m.facts += fact
         settle(m, before, me)
-        tellEveryone(m, factContent(fact))
-        for (id in m.cards.keys) {
-            io.sendGroup(m.gid, id, cardContent(myCard))
-        }
-        // Over 1:1 where possible: if the invitation was withdrawn meanwhile, the inviter can still tell us (see onSync).
-        m.invitedBy?.let {
-            io.sendDirect(m.gid, it, cardContent(myCard))
-            if (!io.sendDirect(m.gid, it, Content.GSync(m.gid, 0))) {
-                requestSync(m, it, 0)
-            }
-        }
+        flush(m)
         return true
     }
 
     /**
-     * Leaves (or declines). Members stop sending to us at once (`gleave`), and our departure (a fact) takes us out of
-     * everyone's view. Leaving as the owner hands the group to the next member in the roster. Always possible.
+     * Leaves (or declines): our departure (a fact) goes at once to everyone we can reach, the owner (or, declining, the
+     * inviter) included, and takes us out of their view. Leaving as the owner hands the group to the next member.
      */
     fun leave(m: GroupModel): Boolean {
         if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
             return true
         }
         // As the owner: first take in the acceptances we hold, so whoever joined can take over.
-        publish(m, null)
-        val head = m.roster
+        sign(m, null)
         val fact = GroupCrypto.signFact(
             identity.privateKey,
             Fact(
                 g = m.gid, kind = FactKind.LEAVE, id = me, since = m.since, ts = io.nowMillis() / 1000,
                 // Whoever takes over from us builds on the newest rosters we know, which may be ones we just signed and that
                 // reached nobody yet.
-                last = if (m.state == GroupModel.JOINED) ownRun(m).map { it.wire() } else emptyList(),
+                last = if (m.state == GroupModel.JOINED) m.roster?.roster?.ver ?: 0 else 0,
             ),
         )
-        if (m.state == GroupModel.JOINED) {
-            for (id in m.cards.keys) {
-                io.sendGroup(m.gid, id, Content.GLeave(m.gid))
+        m.facts += fact
+        val h = head(m)
+        if (h != null) {
+            val run = if (m.state == GroupModel.JOINED) ownRun(m).map { it.wire() } else emptyList()
+            val content = Content.GState(m.gid, h, rosters = run, facts = listOf(fact.wire()))
+            val v = m.view()!!
+            val targets = (if (m.state == GroupModel.JOINED) v.ids().filter { v.isActive(it) } else emptyList()) + listOfNotNull(m.invitedBy, v.owner)
+            for (id in targets.toSet() - me) {
+                send(m, id, content)
+            }
+            if (m.state == GroupModel.INVITED) {
+                v.owner?.let { m.peers[it] = PeerSync(sent = DECLINED, sentTs = io.nowMillis()) }
             }
         }
-        // Declining: the inviter (the owner, and our contact) hears it over 1:1 too, which survives deleting the chat.
-        tellEveryone(m, factContent(fact))
-        m.facts += fact
         m.state = GroupModel.LEFT
-        // The cards stay until the goodbyes above are delivered; nothing new is sent once we've left.
+        // The cards stay until what's queued above is delivered; nothing new is sent once we've left.
         store.save(m)
         io.onEvents(m, listOf(GroupEvent.YouLeft))
         return true
     }
 
-    /** The newest roster, and before it the run of rosters we signed ending there, oldest first ([Fact.last]). */
+    /** The newest roster, and before it the run of rosters we signed ending there, oldest first (sent with a departure). */
     private fun ownRun(m: GroupModel): List<SignedRoster> {
         val out = ArrayList<SignedRoster>()
         var x = m.roster
@@ -312,40 +349,209 @@ class GroupEngine(
         return out.reversed()
     }
 
-    /** Replaces our card (new inbox or keys) and sends it to every member. */
+    /** Replaces our card (new inbox or keys). Who needs it follows from our head ([flush]). */
     fun updateCard(m: GroupModel, card: SignedCard) {
         m.myCard = card
         store.save(m)
-        if (m.state == GroupModel.JOINED) {
-            for (id in m.cards.keys) {
-                io.sendGroup(m.gid, id, cardContent(card))
+        flush(m)
+    }
+
+    // ---------- heads and state ----------
+
+    /** Our head (docs/groups.md, "Heads"), to put on everything we send to the group. Null without a roster. */
+    fun head(m: GroupModel): Head? = headOf(m, me)
+
+    /** The cards half of a head's digest, to tell whether cards differ. */
+    private fun cardsPart(h: Head) = h.d.drop(16)
+
+    /**
+     * What we owe each peer, from our state and what they last showed us (docs/groups.md, "What's owed"), sent where we
+     * have a route. The owner owes every member its state; a member owes the owner, and anyone whose head shows them
+     * behind. A peer ahead of us is asked. Each (their head, our head) pair gets one message (an ask: each head of theirs),
+     * and at most [MAX_STATES] go to a peer per head of ours, whatever heads they show; an ordinary message or an ask from
+     * them renews that, [RESEND_AFTER] after we last sent them one ([observe]). What can't be sent yet stays owed.
+     */
+    private fun flush(m: GroupModel) {
+        val v = m.view() ?: return
+        val mine = head(m) ?: return
+        if (mine.key != m.headKey) {
+            m.headSeq++
+            m.headKey = mine.key
+            store.save(m)
+            return flush(m)
+        }
+        if (m.state == GroupModel.JOINED && m.roster!!.roster.role(me) == Role.INVITED) {
+            oweAcceptance(m, v, mine)
+            store.save(m)
+            return
+        }
+        if (m.state == GroupModel.LEFT && m.roster!!.roster.role(me) == Role.INVITED) {
+            oweDecline(m, v, mine)
+            return
+        }
+        if (m.state != GroupModel.JOINED) {
+            return
+        }
+        for (mem in v.members) {
+            val id = mem.id
+            if (id == me || !v.isActive(id)) {
+                continue
+            }
+            val ps = m.peers[id] ?: PeerSync()
+            val theirs = ps.acked
+            val cmp = theirs?.let { Head.compare(mine, it) }
+            if (cmp == 0 || (theirs != null && cmp == null)) {
+                continue
+            }
+            if (!(v.owner == me || id == v.owner || theirs != null)) {
+                continue
+            }
+            // Once per pair of heads; an ask (we're behind) once per head of theirs and version of ours, whatever else
+            // changes on our side.
+            val key = if (cmp == -1) "ask ${theirs!!.key}<${mine.v}" else "${theirs?.key}>${mine.key}"
+            val n = if (ps.sentAt == mine.key) ps.sentN else 0
+            dbg { "${who(me)} owes ${who(id)}: cmp $cmp, $n sent for this head" }
+            if (ps.sent == key || n >= MAX_STATES) {
+                continue
+            }
+            val ok = if (cmp == -1) {
+                send(m, id, Content.GState(m.gid, mine))
+            } else {
+                val withCards = theirs == null || cardsPart(theirs) != cardsPart(mine)
+                states(m, mine, theirs?.v ?: (mem.since - 1).coerceAtLeast(0), withCards).all { send(m, id, it) }
+            }
+            if (ok) {
+                m.peers[id] = ps.copy(sent = key, sentAt = mine.key, sentN = n + 1, sentTs = io.nowMillis())
             }
         }
+        // Who was taken out is owed the rosters that say so (through their old card, or over 1:1), again if they still
+        // write to the group ([receive]).
+        for ((id, ps) in m.peers.filter { it.value.out && it.value.sent == null }) {
+            val from = ps.acked?.v ?: (ps.outFrom - 1)
+            val ok = states(m, mine, from, withCards = false, withFacts = false, newest = true).all { s ->
+                io.sendDirect(m.gid, id, s) || sendGroupTo(m, id, s)
+            }
+            if (ok) {
+                m.peers[id] = ps.copy(sent = OUT, sentTs = io.nowMillis())
+            }
+        }
+        store.save(m)
     }
 
     /**
-     * A fact of ours, to everyone in the roster: through their card if we have it, else over 1:1 (invitees have no
-     * inbox yet, and the owner invited them, so they're the owner's contacts). And to our inviter over 1:1.
+     * Joined, not admitted yet: our state, with our acceptance in it, is owed to the owner, through their card if we have
+     * it, else over 1:1. It may tell them more than that we accepted: that they're the owner now, say, when the one who
+     * invited us left and only we heard.
      */
-    private fun tellEveryone(m: GroupModel, content: Content) {
-        val r = m.roster?.roster ?: return
-        for (id in r.ids() - me) {
-            reach(m, id, r.role(id) == Role.INVITED, m.cards, content)
+    private fun oweAcceptance(m: GroupModel, v: View, mine: Head) {
+        val owner = v.owner?.takeIf { it != me } ?: return
+        if (m.facts.none { it.fact.id == me && it.fact.kind == FactKind.ACCEPT && it.fact.since == m.since }) {
+            return
         }
-        // Our inviter over 1:1 too, even with a card: if they've left, that's how they can still pass it on.
-        m.invitedBy?.takeIf { it != me && (m.cards[it] != null || it !in r.ids()) }?.let { io.sendDirect(m.gid, it, content) }
+        val ps = m.peers[owner] ?: PeerSync()
+        // Once the owner shows a head ahead of ours, it has taken us in: what we lack is what it sends us, so we ask.
+        val ahead = ps.acked?.let { Head.compare(mine, it) == -1 } == true
+        val key = if (ahead) "ask ${ps.acked!!.key}<${mine.v}" else "accept>${mine.key}"
+        if (ps.sent == key) {
+            return
+        }
+        val ok = if (ahead) {
+            send(m, owner, Content.GState(m.gid, mine))
+        } else {
+            states(m, mine, ps.acked?.v ?: (m.since - 1).coerceAtLeast(0), withCards = true).all { send(m, owner, it) }
+        }
+        if (ok) {
+            m.peers[owner] = ps.copy(sent = key, sentAt = mine.key, sentN = 1, sentTs = io.nowMillis())
+        }
     }
 
     /**
-     * Sends to a member through their card if we have one, else over 1:1. An [invited] member is tried over 1:1 first:
-     * they have no inbox yet, and a card we hold of theirs may be from an earlier stint (its inbox deleted).
+     * Declined: our departure is owed to the owner. It went to the one we knew when we declined; if they had left, their
+     * answer ([redirect]) names the one after them, with their card. That may be out of date too (they may not have heard
+     * of every departure), so then it goes to every member we can reach, once each: whoever holds it passes it on.
      */
-    private fun reach(m: GroupModel, id: String, invited: Boolean, cards: Map<String, SignedCard>, content: Content) {
-        when {
-            invited -> if (!io.sendDirect(m.gid, id, content) && cards[id] != null) io.sendGroup(m.gid, id, content)
-            cards[id] != null -> io.sendGroup(m.gid, id, content)
-            else -> io.sendDirect(m.gid, id, content)
+    private fun oweDecline(m: GroupModel, v: View, mine: Head) {
+        val owner = v.owner?.takeIf { it != me } ?: return
+        val dep = m.facts.lastOrNull { it.fact.id == me && it.fact.kind == FactKind.LEAVE && it.fact.since == m.since } ?: return
+        if (m.peers[owner]?.sent == DECLINED) {
+            return
         }
+        val content = Content.GState(m.gid, mine, facts = listOf(dep.wire()))
+        for (id in listOf(owner) + v.ids().filter { it != me && it != owner && v.isActive(it) }) {
+            if (m.peers[id]?.sent == DECLINED) {
+                continue
+            }
+            val sent = when {
+                io.sendDirect(m.gid, id, content) -> true
+                m.cards[id] != null -> {
+                    io.sendGroup(m.gid, id, content)
+                    true
+                }
+                else -> false
+            }
+            if (sent) {
+                m.peers[id] = PeerSync(sent = DECLINED, sentTs = io.nowMillis())
+            }
+        }
+        store.save(m)
+    }
+
+    /**
+     * Our state for someone at version [from]: our chain after it (the first [SYNC_ROSTERS]: they ask again from where
+     * they got to; or with [newest], the last ones, for someone out, who can take the newest past a gap), the facts our
+     * roster doesn't show yet, and (if [withCards]) every card we hold, in as many messages as it takes to keep each small.
+     */
+    private fun states(m: GroupModel, h: Head, from: Long, withCards: Boolean, withFacts: Boolean = true, newest: Boolean = false): List<Content.GState> {
+        val after = chain(m, from + 1)
+        val rosters = (if (newest) after.takeLast(SYNC_ROSTERS) else after.take(SYNC_ROSTERS)).map { it.wire() }
+        val r = m.roster!!.roster
+        val facts = if (withFacts) m.facts.filter { Membership.applies(r, it.fact) }.map { it.wire() } else emptyList()
+        val cards = if (withCards) (m.cards.values + listOfNotNull(m.myCard)).map { Signed(B64.enc(it.bytes), B64.enc(it.sig)) } else emptyList()
+        val out = mutableListOf<Content.GState>()
+        var cur = Content.GState(m.gid, h, facts = facts)
+        var size = facts.sumOf { it.data.length }
+        fun add(w: Signed, roster: Boolean) {
+            if (size + w.data.length > STATE_BYTES && (cur.rosters.isNotEmpty() || cur.cards.isNotEmpty() || cur.facts.isNotEmpty())) {
+                out += cur
+                cur = Content.GState(m.gid, h)
+                size = 0
+            }
+            cur = if (roster) cur.copy(rosters = cur.rosters + w) else cur.copy(cards = cur.cards + w)
+            size += w.data.length
+        }
+        rosters.forEach { add(it, true) }
+        cards.forEach { add(it, false) }
+        out += cur
+        return out
+    }
+
+    /** Through their card if we have it (and we're in), else over 1:1. */
+    private fun send(m: GroupModel, id: String, content: Content): Boolean {
+        if (m.cards[id] != null && m.state == GroupModel.JOINED) {
+            io.sendGroup(m.gid, id, content)
+            return true
+        }
+        return io.sendDirect(m.gid, id, content)
+    }
+
+    /** To someone just taken out: their card is kept (as departed) until what's queued to them is delivered. */
+    private fun sendGroupTo(m: GroupModel, id: String, content: Content): Boolean {
+        if (m.departed[id] == null && m.cards[id] == null) {
+            return false
+        }
+        io.sendGroup(m.gid, id, content)
+        return true
+    }
+
+    /** Our chain from version [from] (inclusive) to the current roster, oldest first, as far back as we hold it. */
+    private fun chain(m: GroupModel, from: Long): List<SignedRoster> {
+        val out = ArrayList<SignedRoster>()
+        var x = m.roster
+        while (x != null && x.roster.ver >= from && out.size < 200) {
+            out += x
+            x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver == x!!.roster.ver - 1 }
+        }
+        return out.reversed()
     }
 
     // ---------- crypto ----------
@@ -392,17 +598,40 @@ class GroupEngine(
         if (m.state != GroupModel.JOINED) {
             return
         }
-        val sender = r.ids().firstOrNull { id ->
+        val sender = (r.ids() + m.peers.filter { it.value.unlisted }.keys).firstOrNull { id ->
             id != me && GroupCrypto.hint(inboxHintKey, blob.nonce, B64.dec(id)).contentEquals(blob.mac)
         }
-        dbg { "receive g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
+        dbg { "${who(me)} receives g=${gid.take(6)} type=${blob.type} sender=${sender?.let(::who)}" }
         if (sender == null) {
-            // A newcomer whose roster hasn't reached us yet: keep it (bounded, 7 days) if the hint really is theirs.
+            // Someone we took out, still writing to the group: they didn't hear (it was lost). Their message isn't
+            // read; the rosters that say so are owed again, at most once per [RESEND_AFTER].
+            val out = m.peers.entries.firstOrNull { (id, ps) ->
+                ps.out && GroupCrypto.hint(inboxHintKey, blob.nonce, B64.dec(id)).contentEquals(blob.mac)
+            }
+            if (out != null) {
+                if (io.nowMillis() - out.value.sentTs >= RESEND_AFTER) {
+                    m.peers[out.key] = out.value.copy(sent = null)
+                    store.save(m)
+                    flush(m)
+                }
+                return
+            }
+            // Someone our roster doesn't list yet (a newcomer, or an owner who came after it): if the hint really is the
+            // identity inside, read it. State checks itself; anything else waits for a roster that lists them.
             if (blob.type == PREKEY) {
                 val id = runCatching { PreKeySignalMessage(blob.body).identityKey.serialize() }.getOrNull() ?: return
-                if (GroupCrypto.hint(inboxHintKey, blob.nonce, id).contentEquals(blob.mac)) {
-                    store.hold(gid, inboxHintKey, raw)
+                if (!GroupCrypto.hint(inboxHintKey, blob.nonce, id).contentEquals(blob.mac)) {
+                    return
                 }
+                val from = B64.enc(id)
+                val content = decrypt(from, blob) ?: return
+                val unlisted = m.peers.filter { it.value.unlisted }.keys
+                if (unlisted.size >= MAX_UNLISTED) {
+                    m.peers.remove(unlisted.first())
+                }
+                m.peers[from] = (m.peers[from] ?: PeerSync()).copy(unlisted = true)
+                store.save(m)
+                onContent(m.gid, from, content, direct = false)
             }
             return
         }
@@ -427,8 +656,10 @@ class GroupEngine(
         } else {
             cipher.decrypt(SignalMessage(blob.body))
         }
+        if (padded == null) dbg { "identity mismatch from ${who(sender)}" }
         padded?.let { Content.decode(Padding.unpad(it)) }
     } catch (e: DuplicateMessageException) {
+        dbg { "duplicate from ${who(sender)}" }
         null
     } catch (e: Exception) {
         dbg { "decrypt from ${who(sender)} failed: ${e.javaClass.simpleName}" }
@@ -459,126 +690,168 @@ class GroupEngine(
         if (content.groupId != gid) {
             return
         }
-        dbg { "content ${content.javaClass.simpleName} g=${gid.take(6)} from=${who(from)} direct=$direct" }
+        dbg { "${who(me)} content ${content.javaClass.simpleName} g=${gid.take(6)} from=${who(from)} direct=$direct" }
         when (content) {
-            is Content.GRoster -> onRoster(from, content, direct)
-            is Content.GFact -> onFact(from, content, direct)
-            is Content.GCard -> onCard(content)
-            is Content.GSync -> onSync(from, content)
-            is Content.GLeave -> onLeave(from, content)
-            is Content.GText -> active(gid, from)?.let { io.onText(it, from, content) } ?: holdFromInvitee(gid, from, content)
-            is Content.GReceipt -> active(gid, from)?.let { io.onReceipt(it, from, content) } ?: holdFromInvitee(gid, from, content)
-            is Content.GDelete -> active(gid, from)?.let { io.onDelete(it, from, content) } ?: holdFromInvitee(gid, from, content)
+            is Content.GState -> onState(from, content, direct)
+            is Content.GText -> active(gid, from, content.h)?.let { io.onText(it, from, content) } ?: holdFromInvitee(gid, from, content)
+            is Content.GReceipt -> active(gid, from, content.h)?.let { io.onReceipt(it, from, content) } ?: holdFromInvitee(gid, from, content)
+            is Content.GDelete -> active(gid, from, content.h)?.let { io.onDelete(it, from, content) } ?: holdFromInvitee(gid, from, content)
             else -> Unit
         }
+        store.load(gid)?.let { flush(it) }
     }
 
     /**
-     * A message from someone still invited as far as we know: their acceptance hasn't reached us yet (pushes arrive out of
+     * A message from someone still invited as far as we know: their admission hasn't reached us yet (pushes arrive out of
      * order). Keep it until it does, bounded like other held blobs. It's already decrypted (the session has moved on), so
      * it's kept as content, then replayed by [replayHeld].
      */
     private fun holdFromInvitee(gid: String, from: String, content: Content) {
         val m = store.load(gid) ?: return
-        if (m.state != GroupModel.JOINED || m.view()?.role(from) != Role.INVITED) {
+        val role = m.view()?.role(from)
+        if (m.state != GroupModel.JOINED || (role != Role.INVITED && !(role == null && m.peers[from]?.unlisted == true))) {
             return
+        }
+        if (role == null && (content.head?.v ?: 0) > (m.roster?.roster?.ver ?: 0) + 1) {
+            // Someone our roster doesn't list, writing from further on: we missed what lists them.
+            behindAGap(m)
         }
         dbg { "holding ${content.javaClass.simpleName} from invitee ${who(from)}" }
         store.hold(gid, HELD_CONTENT, B64.dec(from) + content.encode())
     }
 
-    /** The group, if we're in it and [from] is a current member (not just invited). */
-    private fun active(gid: String, from: String): GroupModel? {
+    /** The group, if we're in it and [from] is a current member (not just invited); their head is noted. */
+    private fun active(gid: String, from: String, h: Head?): GroupModel? {
         val m = store.load(gid) ?: return null
         if (m.state != GroupModel.JOINED || m.view()?.isActive(from) != true) {
             return null
         }
+        if (h != null) {
+            observe(m, from, h, renew = true)
+            store.save(m)
+        }
         return m
     }
 
-    private fun onRoster(from: String, c: Content.GRoster, direct: Boolean) {
-        val signed = runCatching { GroupCrypto.openRoster(B64.dec(c.roster), B64.dec(c.sig)) }.getOrNull() ?: return
-        val r = signed.roster
-        if (!RosterRules.wellFormed(r, c.g)) {
-            return
-        }
-        val m = store.load(c.g)
-        if (m == null) {
-            invitation(from, signed, direct)
-            return
-        }
-        onSignedRoster(m, signed, from)
+    /**
+     * [from]'s head, which acknowledges everything up to it (unless a newer one of theirs came first). With [renew] (an
+     * ordinary message, or an ask), once [RESEND_AFTER] has passed since we last sent them anything, what we sent may
+     * have been lost (retention expiry), so it's owed again. Before that it's likely still on its way: answering every
+     * message, or any state, would have two members answer each other's messages in flight.
+     */
+    private fun observe(m: GroupModel, from: String, h: Head, renew: Boolean) {
+        val ps0 = m.peers[from] ?: PeerSync()
+        val ps = if (renew && io.nowMillis() - ps0.sentTs >= RESEND_AFTER) ps0.copy(sent = null, sentN = 0) else ps0
+        m.peers[from] = if (ps.acked == null || h.s >= ps.acked.s) ps.copy(acked = h) else ps
     }
 
-    /** A roster for a group we don't know: an invitation if it came over 1:1 from the owner who signed it, listing us. */
-    private fun invitation(from: String, signed: SignedRoster, direct: Boolean) {
+    /**
+     * State from a peer, merged: rosters extend our chain, facts join the set, the higher card `seq` wins. Merging the
+     * same state again changes nothing. Then whatever it changed is owed on ([flush], by [onContent]).
+     */
+    private fun onState(from: String, c: Content.GState, direct: Boolean) {
+        val rosters = c.rosters.take(SYNC_ROSTERS).mapNotNull { w -> GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) } }
+        if (store.load(c.g) == null) {
+            val first = rosters.firstOrNull() ?: return
+            invitation(from, first, direct) ?: return
+        }
+        val was = store.load(c.g)?.roster?.roster?.ver ?: return
+        for (sr in rosters) {
+            onSignedRoster(store.load(c.g) ?: return, sr)
+        }
+        store.load(c.g)?.let { m -> if (m.roster?.roster?.ver == was && rosters.any { it.roster.ver > was + 1 }) behindAGap(m) }
+        val before = store.load(c.g)?.view() ?: return
+        var changed = false
+        var by = from
+        for (w in c.facts.take(MAX_FACTS)) {
+            val sf = GroupCrypto.openFact(w) ?: continue
+            if (onFact(store.load(c.g) ?: return, from, sf, direct)) {
+                changed = true
+                by = sf.fact.id
+            }
+        }
+        val m = store.load(c.g) ?: return
+        if (changed && m.state != GroupModel.LEFT && m.state != GroupModel.REMOVED) {
+            settle(m, before, by)
+        }
+        for (w in c.cards.take(RosterRules.MAX_MEMBERS + 1)) {
+            val card = runCatching { GroupCrypto.openCard(B64.dec(w.data), B64.dec(w.sig), io::validServer) }.getOrNull() ?: continue
+            addCard(m, card)
+        }
+        if (m.roster?.roster?.role(from) != null) {
+            observe(m, from, c.h, renew = c.rosters.isEmpty() && c.facts.isEmpty() && c.cards.isEmpty())
+        }
+        store.save(m)
+    }
+
+    /**
+     * Someone sent us rosters further on than ours that don't connect: their chain starts after ours ends (they came
+     * later). Only an owner of ours can fill that, and what it sent us may have been lost: what we owe it is owed again
+     * (at most once per [RESEND_AFTER]). If it has left since, its answer names who owns the group now.
+     */
+    private fun behindAGap(m: GroupModel) {
+        if (m.state != GroupModel.JOINED) {
+            return
+        }
+        val owner = m.view()?.owner?.takeIf { it != me } ?: return
+        val ps = m.peers[owner] ?: return
+        if (io.nowMillis() - ps.sentTs >= RESEND_AFTER) {
+            m.peers[owner] = ps.copy(sent = null, sentN = 0)
+            store.save(m)
+        }
+    }
+
+    /** A roster for a group we don't know: an invitation if it came over 1:1, signed by its owner, listing us invited. */
+    private fun invitation(from: String, signed: SignedRoster, direct: Boolean): GroupModel? {
         val r = signed.roster
-        if (!direct || r.by != from || r.owner != from) {
-            return
-        }
         val mine = r.member(me)
-        if (mine == null) {
-            // 1:1 messages aren't ordered: this may be the invitation being withdrawn, ahead of the invitation.
-            store.addWithdrawn(r.g, from, r.ver)
-            return
+        if (!direct || r.by != r.owner || mine?.role != Role.INVITED) {
+            return null
         }
-        if (mine.role != Role.INVITED || (store.withdrawn(r.g, from) ?: 0) > r.ver) {
-            return
-        }
-        val fresh = GroupModel(r.g, GroupModel.INVITED, signed, mutableMapOf(), null, from, mutableListOf(), mine.since)
+        val fresh = GroupModel(r.g, GroupModel.INVITED, signed, mutableMapOf(), null, r.by, mutableListOf(), mine.since)
         store.save(fresh)
         store.addHistory(r.g, signed)
-        io.onEvents(fresh, listOf(GroupEvent.Invited(from)))
-        for (f in store.takeEarlyFacts(r.g)) {
-            onFact(from, f, direct = true)
-        }
+        io.onEvents(fresh, listOf(GroupEvent.Invited(r.by)))
+        return fresh
     }
 
     /**
      * A roster for a group we know. The chain is linear: the next one (signed by the owner of ours) is taken; an older one
-     * is old news; one further on means we missed some, so it's kept and we ask for what's in between.
+     * is old news; one further on can't be checked, except as an invitation (we're out) or as the owner of ours taking us
+     * out. Otherwise it's left: whoever sent it sees our head and sends what's in between.
      */
-    private fun onSignedRoster(m: GroupModel, signed: SignedRoster, from: String) {
+    private fun onSignedRoster(m: GroupModel, signed: SignedRoster) {
         val cur = m.roster ?: return
         val r = signed.roster
-        // (One we kept from beyond a gap may come again, now as something we can use: it's looked at again.)
         if (r.ver <= cur.roster.ver) {
             return
         }
-        if (r.ver > cur.roster.ver + 1 && invitesAgain(m, signed)) {
-            reinvited(m, signed)
+        if (r.ver == cur.roster.ver + 1 && r.prev == cur.hashB64 && validNext(cur, signed)) {
+            take(m, signed)
             return
         }
-        if (r.ver == cur.roster.ver + 1) {
-            if (r.prev == cur.hashB64 && validNext(cur, signed)) {
-                take(m, signed)
-                followHeld(m)
-            }
-            return
-        }
-        store.addHistory(m.gid, signed)
-        dbg { "gap: v${r.ver} on v${cur.roster.ver}" }
-        // Whoever sent it, and the owner: the sender may only be passing on a departure, from a leaver who's gone. Once
-        // per gap and member an hour (an ask that couldn't go out, for lack of a way to reach them, doesn't count).
-        for (id in setOfNotNull(from, m.view()?.owner) - me) {
-            val key = "$me ${m.gid} ${cur.hashB64} $id"
-            if (!askedRecently(key, io.nowMillis()) && requestSync(m, id, cur.roster.ver)) {
-                askOnce(key, io.nowMillis())
+        if (r.ver > cur.roster.ver + 1) {
+            if (invitesAgain(m, signed)) {
+                jump(m, signed)
+            } else if (m.state != GroupModel.LEFT && m.state != GroupModel.REMOVED && r.by == m.view()?.owner && r.member(me)?.since != m.since) {
+                // Our owner, signing a roster without our stint: we were taken out (what's in between isn't ours to know).
+                jump(m, signed)
             }
         }
     }
 
     /**
      * Out of the group (or only invited, and taken out meanwhile), [r] lists us as invited in a newer stint, signed by its
-     * owner. Like a first invitation, it's taken on its owner's word, gap or not: what we missed meanwhile isn't ours to
-     * know. (Not while we're in: then the chain is ours to follow.)
+     * owner. Like a first invitation, it's taken on its owner's word, gap or not. (Not while we're in: then the chain is
+     * ours to follow.)
      */
     private fun invitesAgain(m: GroupModel, r: SignedRoster): Boolean {
         val mine = r.roster.member(me) ?: return false
         return m.state != GroupModel.JOINED && r.roster.by == r.roster.owner && mine.role == Role.INVITED && mine.since > m.since
     }
 
-    private fun reinvited(m: GroupModel, signed: SignedRoster) {
+    /** Moves to [signed] past a gap (see [onSignedRoster]). */
+    private fun jump(m: GroupModel, signed: SignedRoster) {
         m.roster = signed
         store.addHistory(m.gid, signed)
         settle(m, null, signed.roster.by)
@@ -589,119 +862,108 @@ class GroupEngine(
         return RosterRules.validChild(cur.roster, next.roster, proof)
     }
 
-    /** Rosters we kept from beyond a gap that follow on now, or (now we're out) invite us again. */
-    private fun followHeld(m: GroupModel) {
-        while (true) {
-            val cur = m.roster ?: return
-            val held = store.historySince(m.gid, cur.roster.ver)
-            val next = held.firstOrNull { it.roster.ver == cur.roster.ver + 1 && it.roster.prev == cur.hashB64 && validNext(cur, it) }
-            if (next != null) {
-                take(m, next)
-                continue
+    /**
+     * A member's accept or leave. It counts if it's about a stint our roster lists; one about a newer stint (we're behind)
+     * is kept for when our roster catches up; one about a stint that's over is ignored, so replays do nothing. Returns
+     * whether it's new and counts.
+     */
+    private fun onFact(m0: GroupModel, from: String, sf: SignedFact, direct: Boolean): Boolean {
+        val f = sf.fact
+        if (f.g != m0.gid || f.id == me) {
+            return false
+        }
+        val m = store.load(m0.gid) ?: return false
+        val r = m.roster?.roster ?: return false
+        val out = m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
+        if (out) {
+            // Out of the group: an invitee's acceptance or decline that reached us, the inviter, is answered from our
+            // records, and so is one we took in before we left (what we sent them since may have been lost).
+            redirect(m, from, sf, direct)
+        }
+        if (Membership.stale(r, f)) {
+            if (!out) {
+                answerStale(m, from, sf, direct)
             }
-            held.lastOrNull { invitesAgain(m, it) }?.let { reinvited(m, it) }
+            return false
+        }
+        if (m.facts.any { it.key == sf.key }) {
+            return false
+        }
+        val applies = Membership.applies(r, f)
+        if (!applies && m.facts.count { it.fact.id == f.id && !Membership.applies(r, it.fact) } >= MAX_AHEAD) {
+            return false
+        }
+        if (out) {
+            m.facts += sf
+            store.save(m)
+            return false
+        }
+        m.facts += sf
+        store.save(m)
+        if (applies && f.kind == FactKind.ACCEPT) {
+            f.card?.let { w -> runCatching { GroupCrypto.openCard(B64.dec(w.data), B64.dec(w.sig), io::validServer) }.getOrNull() }
+                ?.takeIf { it.card.id == f.id && it.card.g == m.gid }?.let { addCard(m, it) }
+        }
+        return applies
+    }
+
+    /**
+     * An acceptance of an invitation that's over, from its author over 1:1: they get our chain from that invitation, which
+     * says how it ended. Once per our head.
+     */
+    private fun answerStale(m: GroupModel, from: String, sf: SignedFact, direct: Boolean) {
+        val f = sf.fact
+        if (!direct || from != f.id || f.kind != FactKind.ACCEPT || m.roster?.roster?.member(f.id) != null || m.state != GroupModel.JOINED) {
             return
+        }
+        val mine = head(m) ?: return
+        val ps = m.peers[from] ?: PeerSync()
+        val key = "stale>${mine.key}"
+        if ((ps.sent == key && io.nowMillis() - ps.sentTs < RESEND_AFTER) || chain(m, 0).none { it.roster.member(f.id)?.since == f.since }) {
+            return
+        }
+        if (states(m, mine, f.since - 1, withCards = false, withFacts = false).all { io.sendDirect(m.gid, from, it) }) {
+            m.peers[from] = ps.copy(sent = key, sentTs = io.nowMillis())
+            store.save(m)
         }
     }
 
     /**
-     * A member's accept or leave. It counts if it's about a stint our roster lists; one about a newer stint (we're behind)
-     * is kept for when our roster catches up; one about a stint that's over is ignored, so replays do nothing.
+     * We invited them, then left: their acceptance (or decline) reached only us. They get, over 1:1, our chain from the invitation, the
+     * facts we hold (which say who owns the group now) and that owner's card, and can send it on themselves.
      */
-    private fun onFact(from: String, c: Content.GFact, direct: Boolean) {
-        val sf = runCatching { GroupCrypto.openFact(B64.dec(c.fact), B64.dec(c.sig)) }.getOrNull() ?: return
+    private fun redirect(m: GroupModel, from: String, sf: SignedFact, direct: Boolean) {
         val f = sf.fact
-        if (f.g != c.g || f.id == me) {
-            return
-        }
-        val loaded = store.load(c.g)
-        if (loaded == null) {
-            // 1:1 messages aren't ordered: this may have overtaken our invitation (the owner left right after inviting us).
-            if (direct) {
-                store.addEarlyFact(c.g, c)
-            }
-            return
-        }
-        if (loaded.state != GroupModel.JOINED && loaded.state != GroupModel.INVITED) {
-            // Out of the group, we may still be the only link between its author and the members who are our contacts
-            // (people we invited): it goes on to them over 1:1, once.
-            if (direct && askOnce("$me pass ${sf.key}", io.nowMillis())) {
-                for (id in loaded.roster?.roster?.ids().orEmpty() - me - f.id - from) {
-                    io.sendDirect(c.g, id, c)
-                }
-            }
-            // And kept, bounded like any: if we're invited again, it may still count.
-            val r = loaded.roster?.roster
-            if (r != null && f.id != me && !Membership.stale(r, f) && loaded.facts.none { it.key == sf.key } &&
-                loaded.facts.count { it.fact.id == f.id } < MAX_AHEAD
-            ) {
-                loaded.facts += sf
-                store.save(loaded)
-            }
-            return
-        }
-        // A departure carries the newest roster the leaver had: it may be one we haven't seen (they signed it just before).
-        for (w in f.last) {
-            val r = GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) } ?: continue
-            onSignedRoster(store.load(c.g) ?: return, r, from)
-        }
-        val m = store.load(c.g) ?: return
         val r = m.roster?.roster ?: return
-        val applies = Membership.applies(r, f)
-        if (Membership.stale(r, f)) {
-            // An acceptance of an invitation that was withdrawn, from someone we may have no other way to tell (their
-            // inviter left): the owner answers with how they got out, through the card it carries. Only for a stint our
-            // chain really had, and once per member an hour: the card's inbox is theirs to choose.
-            val card = f.card?.let { runCatching { GroupCrypto.openCard(B64.dec(it.data), B64.dec(it.sig), io::validServer) }.getOrNull() }
-            if (f.kind == FactKind.ACCEPT && card != null && card.card.id == f.id && card.card.g == c.g && m.state == GroupModel.JOINED &&
-                m.view()?.isOwner(me) == true && r.member(f.id) == null &&
-                chain(m, 0).any { it.roster.member(f.id)?.since == f.since } && askOnce("$me out ${f.id}", io.nowMillis())
-            ) {
-                tellOut(m, f.id, f.since, card)
-            }
+        val mem = r.member(f.id)
+        if (!direct || from != f.id || mem?.since != f.since || (f.kind != FactKind.ACCEPT && mem.role != Role.INVITED)) {
             return
         }
-        if (m.facts.any { it.key == sf.key }) {
+        val v = m.view() ?: return
+        // Nobody left to own it, maybe: then what we send says so.
+        val owner = v.owner?.takeIf { it != me }
+        val mine = head(m) ?: return
+        val ps = m.peers[from] ?: PeerSync()
+        val key = "redirect>${mine.key}"
+        if (ps.sent == key && io.nowMillis() - ps.sentTs < RESEND_AFTER) {
             return
         }
-        if (!applies && m.facts.count { it.fact.id == f.id && !Membership.applies(r, it.fact) } >= MAX_AHEAD) {
-            return
-        }
-        val before = m.view()
-        m.facts += sf
-        if (!applies) {
+        val base = states(m, mine, f.since - 1, withCards = false).first()
+        val ownerCard = owner?.let { m.cards[it] ?: m.departed[it] }
+        val content = base.copy(cards = listOfNotNull(ownerCard?.let { Signed(B64.enc(it.bytes), B64.enc(it.sig)) }))
+        if (io.sendDirect(m.gid, from, content)) {
+            m.peers[from] = ps.copy(sent = key, sentTs = io.nowMillis())
             store.save(m)
-            return
-        }
-        settle(m, before, f.id)
-        // An acceptance carries the newcomer's card: whoever learns they're in can reach them, and sends them its own (the
-        // copy they have may be from before an inbox moved, or from an earlier stint).
-        f.card?.let { onCard(Content.GCard(c.g, it.data, it.sig)) }
-        if (f.kind == FactKind.ACCEPT) {
-            store.load(c.g)?.takeIf { it.state == GroupModel.JOINED && it.cards[f.id] != null }?.myCard?.let { io.sendGroup(c.g, f.id, cardContent(it)) }
-        }
-        // The owner takes facts in, and may not be reachable by their author (no card, not a contact): whoever got it
-        // from the author passes it on. (If it made someone else the owner, settle has passed it on already.)
-        val after = store.load(c.g) ?: return
-        val owner = after.view()?.owner
-        if (owner != null && owner == before?.owner && owner != me && owner != from && owner != f.id && from == f.id) {
-            toOwner(after, owner, c)
         }
     }
 
-    private fun toOwner(m: GroupModel, owner: String, c: Content) {
-        if (m.cards[owner] != null && m.state == GroupModel.JOINED) {
-            io.sendGroup(m.gid, owner, c)
-        } else {
-            io.sendDirect(m.gid, owner, c)
-        }
-    }
-
-    private fun onCard(c: Content.GCard) {
-        val m = store.load(c.g) ?: return
-        val card = runCatching { GroupCrypto.openCard(B64.dec(c.card), B64.dec(c.sig), io::validServer) }.getOrNull() ?: return
+    /** A card for someone in our roster, if it's newer than the one we hold. */
+    private fun addCard(m: GroupModel, card: SignedCard) {
         val id = card.card.id
-        if (card.card.g != c.g || id == me || m.view()?.role(id) == null || m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
+        // Out of the group, we keep no cards, but for one: having declined, the owner's, to send them the decline.
+        val declined = m.state == GroupModel.LEFT && m.roster?.roster?.role(me) == Role.INVITED
+        val out = (m.state == GroupModel.LEFT && !declined) || m.state == GroupModel.REMOVED
+        if (card.card.g != m.gid || id == me || m.roster?.roster?.role(id) == null || out || (declined && id != m.view()?.owner)) {
             return
         }
         val existing = m.cards[id]
@@ -711,124 +973,14 @@ class GroupEngine(
         m.cards[id] = card
         store.save(m)
         io.onCard(m, id)
-        val mine = m.myCard
-        if (existing != null || m.state != GroupModel.JOINED || mine == null) {
-            return
-        }
-        // A newcomer has only the cards that existed when they were sent some: ours may be missing (we joined at about the
-        // same time) or old (we moved inbox since). Ours goes to them now.
-        io.sendGroup(m.gid, id, cardContent(mine))
-        if (m.view()?.isOwner(me) == true) {
-            // The owner closes the gaps: the current roster (sent before they could be reached), every card to them, and
-            // theirs to everyone else.
-            m.roster?.let { io.sendGroup(m.gid, id, rosterContent(it)) }
-            val content = cardContent(card)
-            for ((other, theirs) in m.cards) {
-                if (other != id) {
-                    io.sendGroup(m.gid, other, content)
-                    io.sendGroup(m.gid, id, cardContent(theirs))
-                }
-            }
-            // Invitees too (over 1:1): they'll need it to answer, or to reach the group once they're in.
-            for (other in m.view()?.members.orEmpty()) {
-                if (other.role == Role.INVITED && other.id != id && m.cards[other.id] == null) {
-                    io.sendDirect(m.gid, other.id, content)
-                }
-            }
-        }
-    }
-
-    private fun onSync(from: String, c: Content.GSync) {
-        val m = store.load(c.g) ?: return
-        val cur = m.roster ?: return
-        if (m.state != GroupModel.JOINED) {
-            return
-        }
-        if (cur.roster.role(from) == null) {
-            tellOut(m, from, c.have, null)
-            return
-        }
-        val rosters = chain(m, c.have).takeLast(SYNC_ROSTERS)
-        dbg { "sync from ${who(from)} have=${c.have}: ${rosters.size} rosters" }
-        // Someone still invited (or invited again) may not read their group inbox: 1:1 for them.
-        val send: (Content) -> Unit = if (m.cards[from] != null && m.view()?.isActive(from) == true) {
-            { content -> io.sendGroup(c.g, from, content) }
-        } else {
-            { content -> if (!io.sendDirect(c.g, from, content) && m.cards[from] != null) io.sendGroup(c.g, from, content) }
-        }
-        for (r in rosters) {
-            send(rosterContent(r))
-        }
-        for (f in m.facts) {
-            if (Membership.applies(cur.roster, f.fact) && f.fact.id != from) {
-                send(factContent(f))
-            }
-        }
-        m.myCard?.let { send(cardContent(it)) }
-        for ((id, card) in m.cards) {
-            if (id != from) {
-                send(cardContent(card))
-            }
-        }
-    }
-
-    /** Our chain from version [have] (inclusive) to the current roster, oldest first, as far back as we hold it. */
-    private fun chain(m: GroupModel, have: Long): List<SignedRoster> {
-        val out = ArrayList<SignedRoster>()
-        var x = m.roster
-        while (x != null && x.roster.ver >= have && out.size < 200) {
-            out += x
-            x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver == x!!.roster.ver - 1 }
-        }
-        return out.reversed()
-    }
-
-    /**
-     * Someone who's out but doesn't know it (the roster taking them out never reached them): they get our chain from
-     * [have] up to that roster, and nothing newer. Over 1:1 if they're a contact, else through [card] (theirs, which we
-     * keep only until this is delivered).
-     */
-    private fun tellOut(m: GroupModel, id: String, have: Long, card: SignedCard?) {
-        val out = removalOf(m, id) ?: return
-        val rosters = chain(m, have).filter { it.roster.ver <= out.roster.ver }.takeLast(SYNC_ROSTERS).ifEmpty { listOf(out) }
-        if (rosters.all { io.sendDirect(m.gid, id, rosterContent(it)) }) {
-            return
-        }
-        if (card == null || m.cards[id] != null) {
-            return
-        }
-        m.cards[id] = card
-        store.save(m)
-        for (r in rosters) {
-            io.sendGroup(m.gid, id, rosterContent(r))
-        }
-        m.cards.remove(id)
-        store.save(m)
-    }
-
-    /** The roster in our chain that took [id] out: the oldest one back from the current roster that doesn't list them. */
-    private fun removalOf(m: GroupModel, id: String): SignedRoster? {
-        var cur = m.roster ?: return null
-        while (true) {
-            val parent = store.history(m.gid, cur.roster.prev)?.takeIf { it.roster.ver < cur.roster.ver } ?: return null
-            if (parent.roster.role(id) != null) {
-                return cur
-            }
-            cur = parent
-        }
-    }
-
-    private fun onLeave(from: String, c: Content.GLeave) {
-        val m = store.load(c.g) ?: return
-        // Stop sending to them at once. Their departure (a fact) does the rest.
-        if (m.cards.remove(from) != null) {
-            store.save(m)
-        }
     }
 
     // ---------- applying changes ----------
 
-    /** Moves to [signed] (already checked) as our roster. The departures in its proof count as held facts. */
+    /**
+     * Moves to [signed] (already checked) as our roster. The departures in its proof count as held facts, and the card of
+     * anyone it admits is taken.
+     */
     private fun take(m: GroupModel, signed: SignedRoster) {
         val before = m.view()
         m.roster = signed
@@ -840,6 +992,13 @@ class GroupEngine(
             }
         }
         settle(m, before, signed.roster.by)
+        for (mem in signed.roster.members) {
+            val w = mem.card ?: continue
+            val card = runCatching { GroupCrypto.openCard(B64.dec(w.data), B64.dec(w.sig), io::validServer) }.getOrNull() ?: continue
+            if (card.card.id == mem.id) {
+                addCard(m, card)
+            }
+        }
     }
 
     /**
@@ -869,6 +1028,10 @@ class GroupEngine(
         m.departed.clear()
         m.cards.filterKeys { it !in ids }.let { m.departed.putAll(it) }
         m.cards.keys.retainAll(ids)
+        m.peers.keys.retainAll { it in ids || m.peers[it]?.out == true || m.peers[it]?.unlisted == true }
+        for (id in ids) {
+            m.peers[id]?.takeIf { it.unlisted }?.let { m.peers[id] = it.copy(unlisted = false) }
+        }
         store.save(m)
         if (events.isNotEmpty()) {
             io.onEvents(m, events)
@@ -877,17 +1040,8 @@ class GroupEngine(
             io.rotateInbox(m)
         }
         heldReady += m.gid
-        val owner = after.owner
-        if (before != null && owner != before.owner && owner != null && owner != me && (m.state == GroupModel.JOINED || m.state == GroupModel.INVITED)) {
-            // Someone else is the owner now: they take the facts in, and may not have heard the ones we hold.
-            for (f in m.facts) {
-                if (f.fact.id != owner && Membership.applies(r, f.fact)) {
-                    toOwner(m, owner, factContent(f))
-                }
-            }
-        }
-        if (m.state == GroupModel.JOINED && after.owner == me && Membership.fold(r, m.facts.map { it.fact }, me) != r) {
-            publish(m, null)
+        if (m.state == GroupModel.JOINED && Membership.pending(r, m.facts.map { it.fact }, me)) {
+            sign(m, null)
         }
     }
 
@@ -897,6 +1051,7 @@ class GroupEngine(
         m.since = mine.since
         m.invitedBy = by
         m.facts.removeAll { it.fact.id == me }
+        m.peers.clear()
         events += GroupEvent.Invited(by)
     }
 
@@ -934,34 +1089,6 @@ class GroupEngine(
         return events
     }
 
-    private fun broadcast(m: GroupModel, old: Roster, signed: SignedRoster, cardsBefore: Map<String, SignedCard>) {
-        val content = rosterContent(signed)
-        val targets = (old.ids() + signed.roster.ids()).toSet() - me
-        val newcomers = signed.roster.members.filter { it.role == Role.INVITED && it.since == signed.roster.ver }.map { it.id }.toSet()
-        dbg { "broadcast v${signed.roster.ver} to ${targets.map { who(it) + (if (cardsBefore[it] != null) "/g" else "/d") }}" }
-        for (id in targets) {
-            val invited = id in newcomers || (old.role(id) ?: signed.roster.role(id)) == Role.INVITED
-            reach(m, id, invited, cardsBefore, content)
-        }
-        // Newcomers need every card to reach the members.
-        for (id in newcomers) {
-            m.myCard?.let { io.sendDirect(m.gid, id, cardContent(it)) }
-            for (card in m.cards.values) {
-                io.sendDirect(m.gid, id, cardContent(card))
-            }
-        }
-    }
-
-    /** Returns false if [to] can't be reached (no card, not a contact). */
-    private fun requestSync(m: GroupModel, to: String, have: Long): Boolean {
-        val content = Content.GSync(m.gid, have)
-        if (m.cards[to] != null && m.state == GroupModel.JOINED) {
-            io.sendGroup(m.gid, to, content)
-            return true
-        }
-        return io.sendDirect(m.gid, to, content)
-    }
-
     /** Groups whose membership changed in this engine's calls, so their held messages may be deliverable now. */
     private val heldReady = LinkedHashSet<String>()
 
@@ -992,50 +1119,36 @@ class GroupEngine(
         val LOCAL = SignalProtocolAddress("self", 1)
         private const val PREKEY = 3
 
-        /** Rosters per `gsync` answer; the asker asks again from where it got to. */
+        /** Rosters per state message; whoever is still behind shows it in their head, and gets the next ones. */
         const val SYNC_ROSTERS = 50
 
         /** Facts kept per member for stints our roster doesn't reach yet. */
         const val MAX_AHEAD = 2
 
-        /** Rosters kept per version (see [GroupStore.addHistory]): the chain has one, the rest is room for junk, capped per author. */
-        const val MAX_PER_VERSION = 16
-        const val MAX_PER_AUTHOR = 2
+        /** Facts looked at per state message (two per member is all there can be). */
+        private const val MAX_FACTS = 2 * RosterRules.MAX_MEMBERS
 
-        /** Whether [r] may join [held], the rosters already kept at its version. */
-        fun fits(held: List<Roster>, r: Roster): Boolean = held.size < MAX_PER_VERSION && held.count { it.by == r.by } < MAX_PER_AUTHOR
+        /** Senders not in our roster whose messages we read ([PeerSync.unlisted]), the newest. */
+        private const val MAX_UNLISTED = 8
+
+        /** State messages sent to one peer per head of ours, whatever heads they show (inventing heads gets no more). */
+        const val MAX_STATES = 3
+
+        /** [PeerSync.sent] for someone taken out, once the rosters that say so went to them. */
+        private const val OUT = "out"
+
+        /** [PeerSync.sent] for an owner our decline went to. */
+        private const val DECLINED = "declined"
+
+        /** How long what we sent a peer counts as on its way: after that, a message showing they still lack it renews it. */
+        const val RESEND_AFTER = 60 * 60 * 1000L
+
+        /** Payload per state message (b64u characters of rosters and cards), so each stays well within the chunk limit. */
+        private const val STATE_BYTES = 40_000
 
         /** Marks a held row as already-decrypted content from an invitee (a real hint key is 32 bytes). */
         private val HELD_CONTENT = byteArrayOf(0x43)
         private const val IDENTITY_LEN = 33
-
-        /** Syncs we asked for, by what about, and when; newest last. Per process: enough to stop a loop. */
-        private val asked = LinkedHashMap<String, Long>()
-
-        /** A sync whose answer didn't help may be asked for again after this long (the answer may have been lost). */
-        private const val ASK_AGAIN_MS = 3600_000L
-
-        /** True if [key] wasn't asked about in the last hour (of the last 256 keys). */
-        @Synchronized
-        private fun askOnce(key: String, now: Long): Boolean {
-            val last = asked[key]
-            if (last != null && now - last in 0 until ASK_AGAIN_MS) {
-                return false
-            }
-            asked.remove(key)
-            asked[key] = now
-            if (asked.size > 256) {
-                asked.remove(asked.keys.first())
-            }
-            return true
-        }
-
-        @Synchronized
-        private fun askedRecently(key: String, now: Long): Boolean = asked[key]?.let { now - it in 0 until ASK_AGAIN_MS } == true
-
-        /** For tests: each scenario starts with a fresh process, as far as this goes. */
-        @Synchronized
-        fun forgetAsked() = asked.clear()
 
         /** Protocol decisions, for debugging. The app routes this to logcat in debug builds only; it never carries content. */
         @Volatile
@@ -1048,11 +1161,21 @@ class GroupEngine(
         /** A short, stable label for a member in debug output. */
         private fun who(id: String): String = id.takeLast(6)
 
-        fun rosterContent(r: SignedRoster) = Content.GRoster(r.roster.g, B64.enc(r.bytes), B64.enc(r.sig))
+        /**
+         * Joined and taken in: the roster lists [me] as a member. Until then (our acceptance on its way to the owner) we
+         * don't know who else is in, so we can't send to the group.
+         */
+        fun admitted(m: GroupModel, me: String): Boolean =
+            m.state == GroupModel.JOINED && m.roster?.roster?.role(me).let { it != null && it != Role.INVITED }
 
-        fun factContent(f: SignedFact) = Content.GFact(f.fact.g, B64.enc(f.bytes), B64.enc(f.sig))
-
-        fun cardContent(c: SignedCard) = Content.GCard(c.card.g, B64.enc(c.bytes), B64.enc(c.sig))
+        /** [me]'s head in [m] (see [head]); for the app, which adds it to messages outside the engine. */
+        fun headOf(m: GroupModel, me: String): Head? {
+            val sr = m.roster ?: return null
+            val v = m.view() ?: return null
+            val f = Membership.factDigest(sr.roster, m.facts.map { it.fact to it.bytes })
+            val c = Membership.cardDigest(v) { id -> if (id == me) m.myCard?.card?.seq ?: 0 else m.cards[id]?.card?.seq ?: 0 }
+            return Head(sr.roster.ver, B64.enc(sr.hash.copyOf(12)), B64.enc(f) + B64.enc(c), m.headSeq)
+        }
 
         /** Builds and signs this member's card. */
         fun makeCard(identity: IdentityKeyPair, card: GroupCard): SignedCard = GroupCrypto.signCard(identity.privateKey, card)

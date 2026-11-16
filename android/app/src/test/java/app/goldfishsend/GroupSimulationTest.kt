@@ -259,17 +259,27 @@ class GroupSimulationTest {
         }
     }
 
-    /** A new member's first message can overtake their acceptance (pushes aren't ordered). It must wait, not be dropped. */
+    /**
+     * A new member's first message can overtake the roster admitting them (pushes aren't ordered). It must wait, not be
+     * dropped. (Until the owner takes them in they can't send: they don't know who's in.)
+     */
     @Test
     fun aMessageThatOvertakesTheSendersJoinIsKept() {
         alice.create(gid, "Trip", bob, carol)
         net.deliverAll()
         bob.join(gid)
         net.deliverAll()
-        // Carol joins and speaks at once, but Bob gets her text before anything telling him she joined.
         carol.join(gid)
+        assertTrue(carol.say(gid, "too soon").isEmpty())
+        // Alice takes Carol in, and Carol speaks at once, but Bob gets her text before anything telling him she's in.
+        val toBob = mutableListOf<GroupNet.Envelope>()
+        while (net.queue.isNotEmpty()) {
+            val e = net.queue.removeFirst()
+            if (e.to() == bob) toBob += e else net.deliver(e)
+        }
         carol.say(gid, "first words")
         net.reorder = { batch -> batch.sortedBy { e -> if (e.to() == bob && e.from() == carol) 0 else 1 } }
+        net.queue.addAll(toBob)
         net.deliverAll()
         net.reorder = null
         net.deliverAll()
@@ -289,7 +299,7 @@ class GroupSimulationTest {
         )
         val signed = app.goldfishsend.proto.GroupCrypto.signRoster(carol.identity.privateKey, forged)
         for (to in listOf(alice, bob)) {
-            carol.sendGroup(gid, to.id, app.goldfishsend.group.GroupEngine.rosterContent(signed))
+            carol.sendGroup(gid, to.id, rosterState(signed))
         }
         net.deliverAll()
         assertEquals(3, alice.roster(gid).roster.members.size)
@@ -305,5 +315,30 @@ class GroupSimulationTest {
     private fun GroupNet.Envelope.from(): Peer = when (this) {
         is GroupNet.Envelope.ToInbox -> from
         is GroupNet.Envelope.Direct -> from
+    }
+
+    /**
+     * Bob misses over a hundred rosters (lost: retention expiry). Nothing happens until someone speaks: then his message
+     * shows Alice where he is, and she sends the chain from there, in batches he asks on for as he takes them.
+     */
+    @Test
+    fun aMemberFarBehindCatchesUpOnHisNextMessage() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        threeMembers()
+        net.filter = { e -> e.to() != bob }
+        repeat(120) { i ->
+            now += 1000
+            alice.publish(gid, RosterOp.Meta(name = "Trip $i"))
+            net.deliverAll()
+        }
+        net.filter = { true }
+        assertEquals(3L, bob.roster(gid).roster.ver)
+        now += app.goldfishsend.group.GroupEngine.RESEND_AFTER
+        bob.say(gid, "still here")
+        net.deliverAll()
+        assertConverged(alice, bob, carol)
+        assertEquals("Trip 119", bob.view(gid).name)
+        assertTrue(texts(alice).contains("still here"))
     }
 }

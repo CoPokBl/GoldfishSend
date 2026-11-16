@@ -20,6 +20,10 @@ apart from a batch send endpoint so that fan-out doesn't hit per-IP limits. This
   roster, so those decisions never wait for the owner and can't be lost. Concurrent changes therefore always agree:
   the same roster and the same facts give the same membership, in any order. When the owner leaves, the next member
   in the roster takes over.
+- **Delivery follows state, not events.** Every group message carries where its sender is (their head). Whoever is
+  ahead sends one idempotent state message, whatever was lost before, so nothing depends on a particular message
+  arriving. Invitees stay outside this until the owner takes them in. There is no background traffic: a group catches
+  up as its members write.
 - **Maximum 100 members.**
 
 ## Identifiers
@@ -64,7 +68,8 @@ their card. Every member sends to it. The server sees one ordinary mailbox.
 ```json
 { "v": 2, "g": "groupId", "ver": 7, "prev": "b64u SHA-256 of the previous roster's bytes, or empty at ver 1",
   "name": "Group name", "timer": 0,
-  "members": [ { "id": "b64u", "role": "owner", "since": 1 }, { "id": "b64u", "role": "member", "since": 3 },
+  "members": [ { "id": "b64u", "role": "owner", "since": 1 },
+               { "id": "b64u", "role": "member", "since": 3, "card": { "data": "b64u card bytes", "sig": "b64u" } },
                { "id": "b64u", "role": "invited", "since": 7 } ],
   "by": "signer identityKey b64u", "ts": 1763000000,
   "proof": [ { "data": "b64u fact bytes", "sig": "b64u" } ] }
@@ -73,7 +78,9 @@ their card. Every member sends to it. The server sees one ordinary mailbox.
 - **Exactly one `owner`.** Only they change the name, the timer or the membership.
 - **`since`** is the version of the roster that invited the member. It names this **stint** of theirs: someone who is
   removed or leaves, then is invited again, starts a new stint with a new `since`.
-- **`invited`** members are listed, but get no messages until they accept and publish a card.
+- **`invited`** members are listed, but get no messages until the owner takes their acceptance in.
+- **`card`** appears only in the roster that admits a member (`invited` before, `member` now): it's the card from their
+  acceptance. Everyone who takes that roster in can reach them from then on.
 - **`proof`** lists the departures this roster takes in (see "The view"). When the owner of the previous roster has
   left, it is also what makes the signer their successor.
 
@@ -88,13 +95,11 @@ their card. Every member sends to it. The server sees one ordinary mailbox.
   - `leave`: a member leaves, or an invitee declines.
 - **`since`** names the stint the fact is about. A fact about any other stint means nothing. A late or replayed fact
   about an old stint is therefore ignored, and a member who is invited again isn't affected by their old departure.
-- **`last`** (a list, oldest first, at most 8) only appears on a departure. It holds the newest roster the leaver
-  held, and before it the run of rosters they signed themselves that end there. Whoever takes over from them builds
-  on these. So rosters the leaver signed just before leaving aren't forked around, even if they had reached nobody
-  yet (an owner who took over before having anyone's card).
-- **`card`**, on an acceptance only, is the newcomer's card. Whoever learns they're in can reach them, including an
-  owner who never got the card itself. Every member who takes an acceptance in sends the newcomer its own card (the
-  copy the newcomer has may predate an inbox move, or an earlier stint).
+- **`last`** only appears on a departure: the version of the newest roster the leaver held (0 if none). The departure
+  is sent with those rosters, the run the leaver signed themselves at the end of their chain (at most 8). Whoever takes
+  over from them builds on these, so rosters the leaver signed just before leaving aren't forked around, even if they
+  had reached nobody yet.
+- **`card`**, on an acceptance only, is the newcomer's card. The owner puts it in the roster that admits them.
 
 #### The view
 Everything a member does with the group acts on the **view**: the newest roster, with the facts held for its stints
@@ -109,7 +114,7 @@ applied.
   Acceptances nobody took in don't count either, so everyone still listed as invited stays invited. Nobody passes facts
   on then, so who's still listed may differ between members; nothing anyone can do depends on it. A member who sees
   this may only be behind, though: a newer roster, with an owner, still counts.
-- **A departure carrying a newer roster** (`last`) only applies once our roster has caught up with it.
+- **A departure whose `last` is newer than our roster** only applies once our roster has caught up with it.
 - **Applying the view.** The view is a pure function of the roster and the facts. It's applied the moment it changes:
   - who receives our messages;
   - whose messages we accept;
@@ -132,9 +137,10 @@ For a received roster R, with current roster C:
 3. **Order.**
    - **Older rosters.** One at or below our version is old news and is ignored. A second roster at a version we hold
      means the owner equivocated. That includes a successor who sent a departure and went on signing.
-   - **Rosters with a gap.** One further on is kept (at most 16 per version, 2 per signer), and we ask for what's in
-     between with `gsync`: from whoever sent it, and from the owner, once per gap and member an hour. An ask that
-     couldn't go out (no card, not a contact) doesn't count. Kept rosters that follow on are taken as the gap fills. One kept like that is looked at again if it comes once more (as an invitation, say).
+   - **Rosters with a gap.** One further on is ignored: rosters travel as a chain from the receiver's head, so what's
+     in between comes with it, or after (see "What's owed"). Two exceptions are taken past a gap: a new invitation
+     (below), and a roster signed by our owner that no longer lists our stint (we were taken out; what happened in
+     between isn't ours to know).
 4. **Diff the view before and after:**
    - **Members who went:** stop sending to them. A departure shows as "left", a removal as "removed".
      - Their card is kept only until what's already queued to them (the roster that took them out) is delivered. Then
@@ -148,54 +154,106 @@ For a received roster R, with current roster C:
      the remaining members; the old mailbox is deleted after a 15-day drain.
 
 #### Accepting a fact
-- **Checks.** A fact must verify under its `id` and be for this group. If it carries `last`, those rosters are taken
-  first (they may be news).
-- **Before the invitation.** A fact over 1:1 for a group we don't know yet may have overtaken our invitation (the
-  owner left right after inviting us). It's kept, the newest 16 in all, and applied once the invitation comes.
+- **Checks.** A fact must verify under its `id` and be for this group.
 - **Which facts are kept.**
-  - **Our roster lists the stint:** the fact counts at once.
+  - **Our roster lists the stint:** the fact counts at once. An acceptance's card is taken too.
   - **About a newer stint than our roster reaches:** it's kept until the roster catches up, at most 2 per member.
   - **About a stint that's over:** it's ignored.
   - **Duplicates:** one fact of each kind per stint.
-- **Forwarding to the owner.** Whoever gets a fact first-hand from its author passes it on to the effective owner,
-  who takes facts in and may not be reachable by the author (no card, not a contact). When the effective owner
-  changes, every member passes the new owner the facts it holds that the roster doesn't show yet (the old owner may
-  have been the only one they reached). Either way, at most once per member and fact.
-- **After leaving.** A member who has left still passes a fact that reaches it over 1:1 to the roster's members who
-  are its contacts, once. It may be the only link between the author and the people it invited. It also keeps the
-  fact (bounded like any), in case it's invited again: it may still count then.
-- **An acceptance of a withdrawn invitation.** The owner answers once, through the card the acceptance carries, with
-  how its author got out. The author may have no other way to hear it, for example when their inviter has left. An
-  invitee nobody still in can reach learns of the withdrawal only this way, by joining.
+- **An acceptance of a withdrawn invitation,** over 1:1 from its author: the owner answers once per head of its own,
+  over 1:1, with its chain from that invitation, which says how it ended.
+- **An acceptance that reaches an inviter who has left.** The invitee only knows the inviter. They answer over 1:1,
+  at most once an hour, with their chain from the invitation, the facts they hold (which say who owns the group now)
+  and the new owner's card if they have it. The invitee then sends their acceptance on to the new owner. If nobody is
+  left to own the group, the answer says so. The same goes for an acceptance the inviter took in before leaving: what
+  they sent the newcomer since may have been lost.
 
-#### Relaying
-Members only reach the members whose cards they have, and a member's view can lag: an invitee only has the cards the
-owner sent when inviting them. The owner, who keeps every card, closes the gaps:
-- **Facts** go from their author to everyone in the roster: through their card if the author has it, and otherwise
-  over 1:1. Invitees have no inbox yet, but the owner invited them, so they're the owner's contacts. Facts also go to
-  the author's inviter over 1:1. The owner's next roster takes the facts in, and reaches everyone.
-- **A newcomer's first card.** Every member who receives it sends the newcomer their own card. The newcomer's copy may
-  be missing or old, since cards change when inboxes rotate. The owner also sends:
-  - the newcomer the current roster (rosters sent before the newcomer could be reached didn't reach them) and every
-    card;
-  - the newcomer's card to every other member, and to invitees over 1:1.
-- **Invited members** have no inbox yet: rosters reach them only over 1:1. The owner sends every roster to them that
-  way. Anything for an invitee goes over 1:1 first, and through their card only if that fails: a card we hold of
-  theirs may be from an earlier stint, its inbox deleted.
-- **On joining,** invitees send `gsync` to their inviter (over 1:1 if they can), and their card the same way.
-- **Unordered 1:1 messages.** A roster that arrives over 1:1 from its owner, for a group we don't know, and leaves us
-  out, voids an older invitation from that owner arriving after it. The newest 32 are remembered.
-- **`gsync` from someone who's out** (the roster taking them out never reached them; for example, it arrived before
-  the invitation, and they joined): a member answers with the chain from their `have` up to that roster, and nothing
-  newer. The answer goes over 1:1, or through their card if a fact of theirs brought one.
-- **`gsync` answers** come from any member, since the chain checks itself. They contain:
-  - the rosters from `have` onwards, at most 50 (the asker asks again from where it got to);
-  - the facts held that the roster doesn't show yet;
-  - every card.
+#### Heads
+Every `gtext`, `greceipt`, `gdelete` and `gstate` carries the sender's **head** `h`, inside the E2E payload:
+```json
+{ "v": 7, "r": "b64u, 16 chars", "d": "b64u, 32 chars", "s": 12 }
+```
+- `v`: the version of the sender's roster.
+- `r`: b64u of the first 12 bytes of that roster's hash.
+- `d`: two digests of 12 bytes each, b64u, concatenated (16 characters each):
+  - **facts:** SHA-256 of the lines `b64u(SHA-256(factBytes))`, one per fact the sender holds that applies to the roster
+    (see "The view") and isn't folded in yet. Lines are sorted (by their UTF-8 bytes) and joined with `\n`, UTF-8, no
+    trailing newline (no facts: the empty string). First 12 bytes.
+  - **cards:** SHA-256 of the lines `<member id> <seq>`, one per active member of the sender's view (the sender
+    included), where `seq` is the card held for them (0 for none). Sorted by id, joined the same way. First 12 bytes.
+- `s`: how many times the sender's head has changed. A head with a lower `s` than one already seen from that sender
+  (a late copy) doesn't replace it. It isn't part of the comparison.
 
-  To someone who isn't an active member, the answer goes over 1:1 where possible.
+Comparing our head with theirs: a higher `v` is **ahead**; at the same `v`, a different `r` is a **fork** (the owner
+equivocated: nothing to merge); the same `r` and `d` is **equal**; otherwise each may hold facts or cards the other
+lacks.
 
-Duplicates are harmless: a roster, fact or card already held is ignored.
+#### State
+`gstate` is the only message that carries membership: `{ h, rosters[], facts[], cards[] }`, each list of signed b64u
+documents as above. Receiving one is a **merge**, the same whatever order states arrive in, and doing it twice changes
+nothing:
+- **rosters**, oldest first: each that's next in our chain is taken ("Accepting a roster"), the others ignored;
+- **facts:** added to the set ("Accepting a fact");
+- **cards:** for anyone in our roster, the highest `seq` wins.
+
+A state for someone at version `n` holds our chain after `n` (at most 50 rosters: the receiver asks on from where it
+got to), the facts our roster doesn't show yet, and every card we hold if the card digests differ. It's split into
+several `gstate` messages, each at most 40 000 characters of documents, when it's larger. An empty one (just `h`) is
+an **ask**: "you're ahead of me".
+
+#### What's owed
+What we send follows from our state and the head each peer last showed us, not from what happened. Each time our state
+or a head we know changes, for every active member of our view:
+- **Who owes whom.** The owner owes every member. A member owes the owner, and anyone whose head they've seen. A new
+  owner by succession starts with no heads, so it sends everyone its state once.
+- **Equal or forked:** nothing.
+- **They're ahead:** an ask, once per head of theirs and version of ours.
+- **Otherwise:** our state for their version (or, if they've shown no head yet, from the start of their stint), once
+  per pair of their head and ours, and at most 3 to one member per head of ours, whatever heads they show.
+- **Through their card** if we have one, else over 1:1. What can't go anywhere yet stays owed, and goes once a route
+  appears.
+- **Lost messages.** A state that was lost (retention expiry) isn't known to be lost. When a `gtext`, `greceipt`,
+  `gdelete` or an ask arrives from them at least an hour after we last sent them anything, and still shows they lack
+  something, it's owed again. Sooner than that, it's most likely still on its way: answering it again would have two
+  members keep answering each other's states in flight.
+- **Rosters that don't connect.** A state whose rosters are all further on than ours, with a gap, comes from someone
+  whose chain starts after ours ends (they joined later). So does a message from someone our roster doesn't list,
+  whose head is further on. Only an owner of ours can fill the gap, so what we owe it is owed again (at most once an
+  hour); if it has left, its answer says who owns the group now.
+- **Senders our roster doesn't list.** The first message from someone our roster doesn't list yet (a newcomer, or an
+  owner who came after our roster) is read if its hint matches the identity in it (a PreKey message). A state is
+  merged, since it checks itself; anything else waits, like an early message, for a roster that lists them. The newest
+  8 such senders are remembered, so the rest of a chunked state is read too.
+
+Besides members:
+- **Joined, not taken in yet:** we owe the owner our state (our acceptance in it), once per head of ours: through
+  their card if we have it, else over 1:1. Once the owner shows a head ahead of ours, we ask instead. Until the owner
+  takes us in we don't know who else is in, so we send nothing to the group (the app says it's waiting).
+- **Taken out:** a member the owner removes is owed the rosters that say so (from the head they last showed, or their
+  stint, the newest 50), over 1:1 or through their old card. If that's lost, they go on writing to the group: the
+  owner recognises them by the hint of a blob it can no longer attribute to a member, doesn't read it, and sends the
+  rosters again, at most once an hour. Only the owner who removed them does this: if it leaves before they hear, they
+  don't. Someone who left needs nothing.
+
+**Convergence follows ordinary traffic.** Nothing is sent in the background or on a timer. Members who write to each
+other converge: each message shows the other side where its sender is, and at most a few state messages follow. A
+group where nobody writes doesn't heal by itself; a lost message is made up for only when someone next writes. A
+member more than 150 versions behind gets the rest the next time they write, an hour later or more.
+
+#### Invitees
+Invitees are outside delivery: they have no inbox in the group, and nobody but the owner owes them anything.
+- **An invitation** is a `gstate` with the roster that invites them, over the owner's 1:1 session.
+- **The acceptance** (with the card) and a **decline** go only to the inviter (the owner), over 1:1. Neither is sent
+  again if lost (expired, or sent to an owner who has left since, its inbox gone): they wait for the owner like
+  anything sent to them. An invitee whose acceptance was lost stays waiting to be let in, until they leave.
+- **Being let in.** The owner's next roster admits them and carries their card. Then the owner owes them its state, like
+  any member who has shown no head.
+- **A withdrawn invitation** goes to them once, over 1:1. If that's lost, they find out when they accept: the owner
+  answers (see "Accepting a fact"). If that answer is lost too, they stay waiting to be let in, until they leave.
+- **A decline that reaches an inviter who has left** is answered like an acceptance. The invitee then sends it on to
+  the owner that answer names, and to every member they can reach (that owner may have left too), once each.
+- **A pending member's acceptance** goes with their state: someone who accepted may be the only one to have heard that
+  the inviter left, and so who owns the group now.
 
 ## Message format
 
@@ -212,7 +270,8 @@ Each inbox uses its own hint key: a rotated inbox keeps its old one while it dra
   same sender.
 - **No match.** A blob with no matching member is dropped.
 - **Newcomers.** A PreKey message whose hint matches the identity inside it, but from someone who isn't a member yet,
-  is held for up to 7 days, waiting for a roster that adds them. Then it's dropped.
+  is read (see "What's owed"): a state is merged, anything else is held for up to 7 days, waiting for a roster that
+  adds them. Then it's dropped.
 - **Early messages.** Pushes aren't ordered, so a newcomer's first messages can arrive before their acceptance. A
   `gtext`, `greceipt` or `gdelete` from someone the view still lists as `invited` is kept, already decrypted, in the
   encrypted database, for at most 7 days. It's replayed once the view makes them a member.
@@ -239,41 +298,35 @@ cards, rosters, facts that carry a roster.
 ### Content types (JSON `t`), all with `g` = groupId
 | t | Fields | Sender | Meaning |
 |---|---|---|---|
-| `gtext` | `id`, `body`, `ts`, `exp?`, `once?` | member | A chat message (long ones go as `chunk` parts) |
-| `greceipt` | `ids[]`, `kind` (`read`) | member | Read receipts, batched per author, sent only to the message's author and only if read receipts are on. Groups send no delivery receipts: that would be a push to the author per member per message. An outgoing message shows "read" once every member it went to has read it. |
-| `gdelete` | `ids[]` | author of those messages | Delete for everyone |
-| `groster` | `roster` (b64u bytes), `sig` | the owner (or anyone passing one on) | A new roster, sent to every member in the old and new roster |
-| `gfact` | `fact` (b64u bytes), `sig` | the member it's about (or anyone passing it on) | An accept or a leave (see "Fact") |
-| `gcard` | `card` (b64u bytes), `sig` | anyone forwarding a valid card | A member card |
-| `gsync` | `have` (`ver`) | member | "Send me the roster and cards." Any member who receives it answers (see "Relaying"). |
-| `gleave` | | member | "I'm leaving". Receivers stop sending to that member at once. The leaver's departure fact does the rest. |
+| `gtext` | `id`, `body`, `ts`, `exp?`, `once?`, `h` | member | A chat message (long ones go as `chunk` parts) |
+| `greceipt` | `ids[]`, `kind` (`read`), `h` | member | Read receipts, batched per author, sent only to the message's author and only if read receipts are on. Groups send no delivery receipts: that would be a push to the author per member per message. An outgoing message shows "read" once every member it went to has read it. |
+| `gdelete` | `ids[]`, `h` | author of those messages | Delete for everyone |
+| `gstate` | `h`, `rosters[]`, `facts[]`, `cards[]` | anyone | State to merge (see "State"); empty, an ask |
 
 ## Flows
 
 ### Create
 The creator picks a name and some contacts. They create their group inbox and card, and publish roster v1: themselves
-as owner, and the contacts as `invited`, all with `since` 1. Each invitee gets a `groster` plus the creator's `gcard`
-over the existing **1:1 session**. The 1:1 session identifies the creator, so this needs no new trust.
+as owner, and the contacts as `invited`, all with `since` 1. Each invitee gets the invitation over the existing **1:1
+session**. The 1:1 session identifies the creator, so this needs no new trust.
 
 ### Add a member (owner only, and only the owner's own contacts)
-The owner publishes `ver + 1` with the new member `invited` and `since == ver + 1`. They send `groster` to everyone,
-and send the newcomer all current cards over the 1:1 session.
+The owner publishes `ver + 1` with the new member `invited` and `since == ver + 1`, and sends them the invitation over
+the 1:1 session. Members learn of the new roster as described in "What's owed".
 
 ### Accept or decline
 The invitee sees "Alice added you to <name>", with Join or Decline.
 - **Join:**
   1. Create the group inbox, prekeys and card.
-  2. Send an `accept` fact (see "Relaying"), and the card to every member whose card we have. Sessions start from
-     their bundles.
-  3. Send `gsync` to the inviter.
+  2. Send an `accept` fact carrying the card to the owner (see "Invitees").
 
-  The owner takes the acceptance into its next roster, and relays the card. A group with nobody left to own it can't
-  be joined.
-- **Decline:** send a `leave` fact. It goes to the inviter over 1:1 too, which still arrives if the chat is deleted
-  right away.
+  The owner takes the acceptance into its next roster, which carries the card, and sends the newcomer its state. A
+  group with nobody left to own it can't be joined.
+- **Decline:** send a `leave` fact to the owner over 1:1. It still arrives if the chat is deleted right away.
 
 ### Leave
-1. Send `gleave` to all, and a `leave` fact carrying our newest roster.
+1. Send a `leave` fact at once, with the rosters at the end of our chain that we signed ourselves, in one `gstate`: to
+   every active member, the owner and our inviter. Receivers stop sending to us as soon as they hold it.
 2. Delete the group inbox (no drain needed) and this group's prekeys.
 
 The chat stays, read-only, until the user deletes it.
@@ -285,8 +338,8 @@ The chat stays, read-only, until the user deletes it.
   starts a new group with the members who are their contacts. That limitation is stated in the UI.
 
 ### Remove, or make someone else the owner (owner only)
-Publish a roster, as above. The removed member gets the roster too, so they know. Making someone else the owner keeps
-us on as a member.
+Publish a roster, as above. The removed member is sent the rosters that say so (see "What's owed"), so they know.
+Making someone else the owner keeps us on as a member.
 
 ## Rules and limits
 
@@ -298,8 +351,8 @@ us on as a member.
   their self-chosen name, marked as unverified. Safety numbers can be compared per member.
 - **Identity changes:** a member's identity key never changes inside a group. A reinstalled member must be removed and
   added again.
-- **Hidden chats, the decoy profile and wipes** treat groups like chats. Wiping messages keeps queued rosters, facts and
-  cards (they aren't messages), so the group stays consistent.
+- **Hidden chats, the decoy profile and wipes** treat groups like chats. Wiping messages keeps queued state messages
+  (they aren't messages), so the group stays consistent.
 - **Inbox rotation** also happens on the mailbox-rotation schedule (if enabled) and when our own server's identity key
   changes (the new card carries the new `serverKey`).
 - **A member's server presents a different identity key** than their card says: only that member's deliveries wait,

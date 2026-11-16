@@ -41,9 +41,34 @@ data class GroupCard(
 @Serializable
 data class Signed(val data: String, val sig: String)
 
-/** [since]: the version of the roster that invited them, which names this stint of theirs in the group. */
+/**
+ * [since]: the version of the roster that invited them, which names this stint of theirs in the group. [card]: only in
+ * the roster that admits them (taken from their acceptance), so whoever holds it can reach them.
+ */
 @Serializable
-data class RosterMember(val id: String, val role: String, val since: Long)
+data class RosterMember(val id: String, val role: String, val since: Long, val card: Signed? = null)
+
+/**
+ * Where a member is (docs/groups.md, "Heads"): their roster's version, its hash (first 12 bytes) and a digest (12 bytes
+ * for facts, 12 for cards) of the facts it doesn't show yet and the card `seq` of every active member. Two members with
+ * equal heads hold the same state; otherwise one of them is behind, or each has something the other lacks. [s] counts
+ * the sender's head changes, so an older head arriving late doesn't replace a newer one.
+ */
+@Serializable
+data class Head(val v: Long, val r: String, val d: String, val s: Long = 0) {
+    val key: String get() = "$v:$r:$d"
+
+    companion object {
+        /** 1: [a] is ahead of [b]; -1: behind; 0: equal; 2: same roster, each may have facts or cards the other lacks. */
+        fun compare(a: Head, b: Head): Int? = when {
+            a.v > b.v -> 1
+            a.v < b.v -> -1
+            a.r != b.r -> null
+            a.d == b.d -> 0
+            else -> 2
+        }
+    }
+}
 
 /**
  * The member list, signed by its owner. [proof]: when the owner of the roster before this one has left, the departures
@@ -89,22 +114,13 @@ data class Fact(
     val since: Long,
     val ts: Long,
     /**
-     * On a departure: the newest rosters the leaver held, oldest first (the run they signed themselves at the end of
-     * their chain, or else just the newest), so whoever takes over from them builds on them.
+     * On a departure: the version of the newest roster the leaver held. It only counts once our roster has caught up,
+     * so whoever takes over from them builds on it (the rosters themselves travel next to the fact, in the state).
      */
-    val last: List<Signed> = emptyList(),
+    val last: Long = 0,
     /** On an acceptance: the member's card, so whoever learns they're in can reach them. */
     val card: Signed? = null,
 ) {
-    /** The newest of [last]'s versions (0 if none, -1 if any is unreadable). */
-    val lastVer: Long by lazy {
-        if (last.isEmpty()) {
-            return@lazy 0L
-        }
-        runCatching {
-            last.maxOf { w -> GroupJson.decodeFromString(Roster.serializer(), B64.dec(w.data).toString(Charsets.UTF_8)).ver }
-        }.getOrDefault(-1L)
-    }
 }
 
 object FactKind {
@@ -145,7 +161,7 @@ object GroupCrypto {
     const val HINT_MAC = 16
     const val HINT_KEY = 32
 
-    /** Rosters a departure carries at most (see [Fact.last]). */
+    /** Rosters a departure's state carries at most: the leaver's own run at the end of their chain. */
     const val MAX_LAST = 8
 
     /** A b64u identity key in canonical form (33 bytes, DJB type 0x05), or null. */
@@ -216,7 +232,7 @@ object GroupCrypto {
         if (f.v != 2 || f.since < 1 || (f.kind != FactKind.ACCEPT && f.kind != FactKind.LEAVE) || !verify(f.id, FACT_LABEL, bytes, sig)) {
             return null
         }
-        if ((f.last.isNotEmpty() && (f.kind != FactKind.LEAVE || f.lastVer < 1 || f.last.size > MAX_LAST)) || (f.card != null && f.kind != FactKind.ACCEPT)) {
+        if (f.last < 0 || (f.last != 0L && f.kind != FactKind.LEAVE) || (f.card != null && f.kind != FactKind.ACCEPT)) {
             return null
         }
         return SignedFact(bytes, sig, f)
@@ -323,11 +339,11 @@ object Membership {
      */
     fun applies(r: Roster, f: Fact): Boolean {
         val m = r.member(f.id) ?: return false
-        return f.g == r.g && m.since == f.since && (f.kind == FactKind.LEAVE || m.role == Role.INVITED) && f.lastVer in 0..r.ver
+        return f.g == r.g && m.since == f.since && (f.kind == FactKind.LEAVE || m.role == Role.INVITED) && f.last <= r.ver
     }
 
     /** Not about a stint of [r], and not one that may come later either: over, or never was. */
-    fun stale(r: Roster, f: Fact): Boolean = !applies(r, f) && f.since <= r.ver && f.lastVer in 0..r.ver
+    fun stale(r: Roster, f: Fact): Boolean = !applies(r, f) && f.since <= r.ver && f.last <= r.ver
 
     /** Members of [r] whose stint a held departure ended. */
     fun gone(r: Roster, facts: Collection<Fact>): Set<String> =
@@ -369,7 +385,37 @@ object Membership {
      */
     fun fold(base: Roster, facts: Collection<Fact>, me: String): Roster {
         val v = view(base, facts)
-        return base.copy(members = v.members.map { if (it.role == Role.OWNER && it.id != me) it.copy(role = Role.MEMBER) else it })
+        val cards = facts.filter { it.kind == FactKind.ACCEPT && applies(base, it) }.associate { it.id to it.card }
+        return base.copy(
+            members = v.members.map {
+                val role = if (it.role == Role.OWNER && it.id != me) Role.MEMBER else it.role
+                // The roster admitting someone carries their card (from their acceptance); no other one does.
+                val card = if (base.role(it.id) == Role.INVITED && role != Role.INVITED) cards[it.id] else null
+                it.copy(role = role, card = card)
+            },
+        )
+    }
+
+    /** Whether the effective owner [me] has something to fold into a roster: facts it doesn't show, or ownership itself. */
+    fun pending(r: Roster, facts: Collection<Fact>, me: String): Boolean =
+        owner(r, facts) == me && (r.owner != me || facts.any { applies(r, it) })
+
+    /**
+     * The first half of [Head.d]: SHA-256 (first 12 bytes) of the b64u SHA-256 hashes of the facts' bytes that [r]
+     * doesn't show yet (the ones that apply to it), sorted, one per line (UTF-8, `\n` between lines).
+     */
+    fun factDigest(r: Roster, facts: Collection<Pair<Fact, ByteArray>>): ByteArray {
+        val lines = facts.filter { applies(r, it.first) }.map { B64.enc(Hash.sha256(it.second)) }.sorted()
+        return Hash.sha256(lines.joinToString("\n").utf8()).copyOf(12)
+    }
+
+    /**
+     * The second half of [Head.d]: SHA-256 (first 12 bytes) of `<id> <seq>` for every active member of [view] (ourselves
+     * included), the `seq` of the card held for them (0 for none), sorted by id, one per line.
+     */
+    fun cardDigest(view: View, cardSeq: (String) -> Long): ByteArray {
+        val lines = view.members.filter { view.isActive(it.id) }.map { it.id }.sorted().map { "$it ${cardSeq(it)}" }
+        return Hash.sha256(lines.joinToString("\n").utf8()).copyOf(12)
     }
 
     /**

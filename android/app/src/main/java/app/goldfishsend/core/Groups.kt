@@ -125,7 +125,7 @@ object Groups {
         return cid
     }
 
-    /** Accepts an invitation: our inbox, keys and card go to every member. */
+    /** Accepts an invitation: our inbox, keys and card go to the owner, who lets us in. */
     suspend fun join(s: Session, cid: Long) {
         val m = model(s, cid) ?: return
         if (m.state != GroupModel.INVITED) {
@@ -218,7 +218,7 @@ object Groups {
     /** Sends a text to every member we can reach (one outbox row per member and part). */
     fun sendText(s: Session, cid: Long, body: String, viewOnce: Boolean = false) {
         val m = model(s, cid) ?: return
-        if (m.state != GroupModel.JOINED) {
+        if (!GroupEngine.admitted(m, me(s))) {
             return
         }
         val contact = s.repo.contact(cid) ?: return
@@ -233,7 +233,7 @@ object Groups {
             recipients = targets.size,
         ) ?: return
         val parts = Chunker.splitContent(
-            Content.GText(m.gid, wire, body, now, exp.takeIf { it > 0 }, viewOnce.takeIf { it }),
+            Content.GText(m.gid, wire, body, now, exp.takeIf { it > 0 }, viewOnce.takeIf { it }, GroupEngine.headOf(m, me(s))),
             MAX_PLAINTEXT,
         )
         s.db.tx {
@@ -259,7 +259,7 @@ object Groups {
         return v.members.filter { it.id != me && v.isActive(it.id) }.map { it.id }
     }
 
-    /** Group fan-out of control content (rosters, cards, receipts). */
+    /** Group fan-out of control content (state, receipts). */
     private fun enqueueGroup(s: Session, cid: Long, to: String, content: Content, messageId: String? = null) {
         for (p in Chunker.splitContent(content, MAX_PLAINTEXT)) {
             s.repo.enqueue(cid, messageId, OutboxKind.CONTENT, p.encode(), memberKey = to)
@@ -269,11 +269,11 @@ object Groups {
 
     fun deleteForEveryone(s: Session, cid: Long, wireId: String) {
         val m = model(s, cid) ?: return
-        if (m.state != GroupModel.JOINED) {
+        if (!GroupEngine.admitted(m, me(s))) {
             return
         }
         for (to in recipients(s, m)) {
-            enqueueGroup(s, cid, to, Content.GDelete(m.gid, listOf(wireId)))
+            enqueueGroup(s, cid, to, Content.GDelete(m.gid, listOf(wireId), GroupEngine.headOf(m, me(s))))
         }
     }
 
@@ -283,7 +283,7 @@ object Groups {
             return
         }
         val m = model(s, cid) ?: return
-        if (m.state != GroupModel.JOINED) {
+        if (!GroupEngine.admitted(m, me(s))) {
             return
         }
         val byTag = m.cards.keys.associateBy { GroupCrypto.tag(it) }
@@ -291,7 +291,7 @@ object Groups {
             val i = w.indexOf(':')
             if (i <= 0) null else byTag[w.substring(0, i)]?.let { it to w.substring(i + 1) }
         }.groupBy({ it.first }, { it.second }).forEach { (author, ids) ->
-            enqueueGroup(s, cid, author, Content.GReceipt(m.gid, ids.take(500), Content.Receipt.READ))
+            enqueueGroup(s, cid, author, Content.GReceipt(m.gid, ids.take(500), Content.Receipt.READ, GroupEngine.headOf(m, me(s))))
         }
     }
 
@@ -309,7 +309,7 @@ object Groups {
         Outbox.kick()
     }
 
-    /** Group content over a 1:1 session (invitations, forwarded cards, rosters for invitees). */
+    /** Group content over a 1:1 session (invitations, acceptances, answers to invitees and to members who are out). */
     suspend fun onDirect(s: Session, contactId: Long, content: Content) {
         val key = s.repo.contact(contactId)?.identityKey ?: return
         ReceiveGuard.runSuspend("group content") { withEngine(s) { it.onDirect(B64.enc(key), content) } }
@@ -325,7 +325,7 @@ object Groups {
             return
         }
         val parts = Chunker.splitContent(
-            Content.GText(m.gid, msg.wireId, msg.body, msg.ts, msg.expSecs.takeIf { it > 0 }, msg.viewOnce.takeIf { it }),
+            Content.GText(m.gid, msg.wireId, msg.body, msg.ts, msg.expSecs.takeIf { it > 0 }, msg.viewOnce.takeIf { it }, GroupEngine.headOf(m, me(s))),
             MAX_PLAINTEXT,
         )
         s.db.tx {

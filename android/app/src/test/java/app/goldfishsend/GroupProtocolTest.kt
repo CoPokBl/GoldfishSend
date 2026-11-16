@@ -61,7 +61,7 @@ class GroupProtocolTest {
         signed(RosterRules.successor(base, change(base.roster), by, 2, proof.map { it.wire() }))
 
     private fun fact(id: String, kind: String, since: Long = 1, last: SignedRoster? = null) =
-        GroupCrypto.signFact(keyOf(id).privateKey, Fact(g = g, kind = kind, id = id, since = since, ts = 1, last = listOfNotNull(last?.wire())))
+        GroupCrypto.signFact(keyOf(id).privateKey, Fact(g = g, kind = kind, id = id, since = since, ts = 1, last = last?.roster?.ver ?: 0))
 
     // --- signatures ---
 
@@ -86,8 +86,7 @@ class GroupProtocolTest {
         val forged = GroupCrypto.signFact(a.privateKey, f.fact)
         assertNull(GroupCrypto.openFact(forged.bytes, forged.sig))
         // A kind we don't know, a stint before the first roster, a roster on an acceptance, an unreadable roster.
-        for (bad in listOf(f.fact.copy(kind = "own"), f.fact.copy(since = 0), f.fact.copy(kind = FactKind.ACCEPT, last = listOf(signed(roster()).wire())),
-            f.fact.copy(last = listOf(Signed("AAAA", "AAAA"))), f.fact.copy(last = List(9) { signed(roster()).wire() }),
+        for (bad in listOf(f.fact.copy(kind = "own"), f.fact.copy(since = 0), f.fact.copy(kind = FactKind.ACCEPT, last = 1), f.fact.copy(last = -1),
             f.fact.copy(card = Signed("AAAA", "AAAA")))) {
             val x = GroupCrypto.signFact(b.privateKey, bad)
             assertNull(GroupCrypto.openFact(x.bytes, x.sig))
@@ -276,7 +275,7 @@ class GroupProtocolTest {
 
     @Test
     fun anyContentChunksAndReassembles() {
-        val big = Content.GCard(g, B64.enc(Rand.bytes(5000)), B64.enc(Rand.bytes(64)))
+        val big = Content.GState(g, app.goldfishsend.proto.Head(1, "r", "d"), cards = listOf(Signed(B64.enc(Rand.bytes(5000)), B64.enc(Rand.bytes(64)))))
         val parts = Chunker.splitContent(big, Padding.MAX_PREKEY_PLAINTEXT)
         assertTrue(parts.size > 1)
         for (p in parts) {
@@ -285,7 +284,7 @@ class GroupProtocolTest {
         }
         val joined = parts.joinToString("") { (it as Content.Chunk).data }
         assertEquals(big, Content.decode(B64.dec(joined)))
-        val small = Content.GLeave(g)
+        val small = Content.GState(g, app.goldfishsend.proto.Head(1, "r", "d"))
         assertEquals(listOf(small), Chunker.splitContent(small, Padding.MAX_PREKEY_PLAINTEXT))
     }
 

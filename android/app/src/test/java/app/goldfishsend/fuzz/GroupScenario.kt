@@ -2,6 +2,9 @@ package app.goldfishsend.fuzz
 
 import app.goldfishsend.GroupNet
 import app.goldfishsend.Peer
+import app.goldfishsend.cardState
+import app.goldfishsend.factState
+import app.goldfishsend.rosterState
 import app.goldfishsend.core.ReceiveGuard
 import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupModel
@@ -55,26 +58,25 @@ class GroupScenario(private val seed: Long) {
     private var now = 1_700_000_000_000L
     private val limbo = mutableListOf<GroupNet.Envelope>()
 
+    /** Who lost messages sent to them, and who lost messages they sent, when the held-back ones were lost. */
+    private val lostTo = mutableSetOf<String>()
+    private val lostFrom = mutableSetOf<String>()
+
     // What honest actions and Mallory's own did, for the invariants.
     private val added = mutableSetOf<String>()
-    private val promoted = mutableSetOf(alice.id)
-
-    /** An owner left at some point: someone took over by succession. */
-    private var ownerLeft = false
 
     /** The newest roster Mallory claimed to hold when she sent a departure of hers (her client carried on regardless). */
     private var malloryLeftAt: Long? = null
     private val churned = mutableSetOf<String>()
     private val joined = mutableSetOf<String>()
 
-    private class Said(val from: Peer, val body: String, val to: List<String>)
+    private class Said(val from: Peer, val body: String, val to: List<String>, val last: Boolean = false)
 
     private val said = mutableListOf<Said>()
     private var msg = 0
     private val drops = mutableListOf<String>()
 
     init {
-        GroupEngine.forgetAsked()
         net.clock = { now }
         if (debug) {
             net.trace = { println(it) }
@@ -88,13 +90,22 @@ class GroupScenario(private val seed: Long) {
 
     private fun bob() = peers[1]
 
+    private fun GroupNet.Envelope.sender(): Peer = when (this) {
+        is GroupNet.Envelope.ToInbox -> from
+        is GroupNet.Envelope.Direct -> from
+    }
+
     private fun log(s: String) {
         if (debug) {
             println(s)
         }
     }
 
-    /** Runs the scenario. Null if every check passed. */
+    /**
+     * Runs the scenario. Null if every check passed. After the steps the adversary stops, and whatever is still held back
+     * is lost (retention expiry); the network is fair from then on. Everything queued is delivered, each honest active
+     * member sends one ordinary message, and everything is delivered again. Then the checks run.
+     */
     fun run(ops: List<Op>): Failure? {
         ReceiveGuard.onDrop = { where, e -> drops += "$where: ${e.javaClass.simpleName}" }
         log((peers + sam).joinToString { "${it.name}=${it.id.takeLast(6)}" })
@@ -108,28 +119,71 @@ class GroupScenario(private val seed: Long) {
                 } catch (e: Throwable) {
                     return Failure("exception: step $i $op: ${e.javaClass.simpleName}: ${e.message}", e)
                 }
+                rolledBack()?.let { return it }
             }
+            log("--- the adversary stops; held-back messages are lost")
+            for (e in limbo) {
+                when (e) {
+                    is GroupNet.Envelope.ToInbox -> e.from.id to e.to.id
+                    is GroupNet.Envelope.Direct -> e.from.id to e.to.id
+                }.let { (a, b) ->
+                    lostFrom += a
+                    lostTo += b
+                }
+            }
+            limbo.clear()
+            net.counting = true
+            // Mallory's messages already on their way are the attack's, not her engine's answers.
+            net.queue.filter { it.sender() == mallory }.forEach { net.uncounted += it }
             try {
+                now += GroupEngine.RESEND_AFTER
+                quiesce()
+                now += GroupEngine.RESEND_AFTER
+                log("--- one message from each honest active member")
+                for (p in honest) {
+                    val m = joinedModel(p) ?: continue
+                    if (m.view()?.isActive(p.id) == true) {
+                        val body = "m${msg++} ${p.name}"
+                        log("${p.name} says $body")
+                        said += Said(p, body, p.say(gid, body, "w$msg"), last = true)
+                    }
+                }
                 quiesce()
             } catch (e: Throwable) {
                 return Failure("exception: delivering the rest: ${e.javaClass.simpleName}: ${e.message}", e)
             }
-            return check() ?: afterwards() ?: drops.takeIf { it.isNotEmpty() }?.let { Failure("dropped: $it") }
+            rolledBack()?.let { return it }
+            for (p in peers) {
+                model(p)?.let { m -> log("${p.name}: state ${m.state}, ${m.view()?.let(::describe)}, cards ${m.cards.keys.map(::who)}") }
+            }
+            return drops.takeIf { it.isNotEmpty() }?.let { Failure("dropped: $it") } ?: check() ?: afterwards()
+                ?: drops.takeIf { it.isNotEmpty() }?.let { Failure("dropped: $it") }
         } finally {
             ReceiveGuard.onDrop = null
         }
     }
 
+    /** Delivers what the engines sent (nothing else is reset or retried) until nothing is left. */
     private fun quiesce() {
-        repeat(50) {
-            net.queue.addAll(limbo)
-            limbo.clear()
-            net.deliverAll()
-            if (net.queue.isEmpty() && limbo.isEmpty()) {
-                return
-            }
+        net.deliverAll()
+        if (net.queue.isNotEmpty()) {
+            error("never quiet")
         }
-        error("never quiet")
+    }
+
+    /** Versions never go backwards, for any honest member. */
+    private val highest = HashMap<String, Long>()
+
+    private fun rolledBack(): Failure? {
+        for (p in honest) {
+            val v = model(p)?.roster?.roster?.ver ?: continue
+            val was = highest[p.id] ?: 0
+            if (v < was) {
+                return Failure("rollback: ${p.name} went from v$was to v$v")
+            }
+            highest[p.id] = v
+        }
+        return null
     }
 
     private fun peer(i: Int) = peers[Math.floorMod(i, peers.size)]
@@ -156,9 +210,6 @@ class GroupScenario(private val seed: Long) {
                 if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
                     return
                 }
-                if (m.view()?.isOwner(p.id) == true) {
-                    ownerLeft = true
-                }
                 if (p.engine.leave(m)) {
                     log("${p.name} leaves")
                     churned += p.id
@@ -182,7 +233,6 @@ class GroupScenario(private val seed: Long) {
                 }
                 if (a.publish(gid, RosterOp.MakeOwner(t.id)) != null) {
                     log("${a.name} makes ${t.name} the owner")
-                    promoted += t.id
                 }
             }
             5 -> {
@@ -271,11 +321,11 @@ class GroupScenario(private val seed: Long) {
                 if (op.c % 2 == 1 && facts.isNotEmpty()) {
                     val f = facts[Math.floorMod(op.c / 2, facts.size)]
                     log("mallory replays ${who(f.fact.id)}'s ${f.fact.kind} (${f.fact.since}) to ${target.name}")
-                    toTarget(target, GroupEngine.factContent(f))
+                    toTarget(target, factState(f))
                 } else if (history.isNotEmpty()) {
                     val r = history[Math.floorMod(op.c, history.size)]
                     log("mallory replays v${r.roster.ver} by ${who(r.roster.by)} to ${target.name}")
-                    toTarget(target, GroupEngine.rosterContent(r))
+                    toTarget(target, rosterState(r))
                 }
             }
             1 -> forgeRoster(cur, target, op.c)
@@ -284,7 +334,7 @@ class GroupScenario(private val seed: Long) {
                 val card = mallory.store.routes[gid]?.get(target.id)?.card ?: return
                 val forged = card.copy(inbox = m.myCard?.card?.inbox ?: return, seq = card.seq + 1)
                 log("mallory forges ${target.name}'s card")
-                toTarget(peer(op.c), GroupEngine.cardContent(GroupCrypto.signCard(mallory.identity.privateKey, forged)))
+                toTarget(peer(op.c), cardState(GroupCrypto.signCard(mallory.identity.privateKey, forged)))
             }
             3 -> {
                 // Mallory's session, but the hint names someone else.
@@ -319,13 +369,14 @@ class GroupScenario(private val seed: Long) {
                 }
             }
             6 -> {
-                log("mallory asks ${target.name} for a sync")
-                toTarget(target, Content.GSync(gid, op.c.toLong() % 20))
+                // A head she made up: whoever sees it thinks they differ from her.
+                log("mallory shows ${target.name} a made-up head")
+                toTarget(target, Content.GState(gid, app.goldfishsend.proto.Head(op.c.toLong() % 20, B64.enc(ByteArray(12) { op.c.toByte() }), "x$msg")))
             }
             else -> {
                 // A card of Mallory's own with an old sequence number.
                 log("mallory sends a stale card of hers to ${target.name}")
-                toTarget(target, GroupEngine.cardContent(mallory.card(gid, 1, m.myCard?.card?.bundle)))
+                toTarget(target, cardState(mallory.card(gid, 1, m.myCard?.card?.bundle)))
             }
         }
     }
@@ -350,7 +401,7 @@ class GroupScenario(private val seed: Long) {
             else -> RosterRules.successor(cur, change, alice.id, now / 1000, emptyList())
         }
         log("mallory forges v${stamped.ver} (${Math.floorMod(c, 5)}) to ${target.name}")
-        toTarget(target, GroupEngine.rosterContent(GroupCrypto.signRoster(mallory.identity.privateKey, stamped)))
+        toTarget(target, rosterState(GroupCrypto.signRoster(mallory.identity.privateKey, stamped)))
     }
 
     /**
@@ -369,18 +420,18 @@ class GroupScenario(private val seed: Long) {
         val content: Content = if (op.c % 3 == 0) {
             val f = GroupCrypto.signFact(
                 mallory.identity.privateKey,
-                Fact(g = gid, kind = FactKind.LEAVE, id = mallory.id, since = mine.since, ts = now / 1000 + Math.floorMod(op.b, 8), last = listOf(at.wire())),
+                Fact(g = gid, kind = FactKind.LEAVE, id = mallory.id, since = mine.since, ts = now / 1000 + Math.floorMod(op.b, 8), last = base.ver),
             )
             if (model(mallory)?.roster?.roster?.member(mallory.id)?.since == mine.since) {
                 churned += mallory.id
             }
             malloryLeftAt = minOf(malloryLeftAt ?: base.ver, base.ver)
             log("mallory leaves from v${base.ver} (stint ${mine.since})")
-            GroupEngine.factContent(f)
+            factState(f)
         } else {
             val change = base.copy(name = "Fork ${msg++}")
             log("mallory forks at v${base.ver}")
-            GroupEngine.rosterContent(GroupCrypto.signRoster(mallory.identity.privateKey, RosterRules.successor(at, change, mallory.id, now / 1000, emptyList())))
+            rosterState(GroupCrypto.signRoster(mallory.identity.privateKey, RosterRules.successor(at, change, mallory.id, now / 1000, emptyList())))
         }
         for (t in honest) {
             toTarget(t, content)
@@ -410,32 +461,91 @@ class GroupScenario(private val seed: Long) {
     // ---------- invariants ----------
 
     private fun check(): Failure? {
-        val inGroup = honest.filter { joinedModel(it) != null }
-        if (inGroup.isEmpty()) {
+        safety()?.let { return it }
+        if (equivocated()) {
+            // Mallory became the owner (next in line once others left) and equivocated, which members can't prevent
+            // (docs/threat-model.md): only safety holds then.
             return null
         }
-        val views = inGroup.map { it.view(gid) }
-        if (equivocated()) {
-            // Mallory became the owner (next in line once others left) and signed rosters after her own departure: an
-            // owner equivocating, which members can't prevent (docs/threat-model.md). Only safety is checked.
-            return safety(views.first())
+        // The honest active members: admitted (their roster says so), and not gone in their own view. Someone whose
+        // acceptance the owner hasn't taken in yet is still outside delivery.
+        val h = honest.filter { p -> joinedModel(p)?.let { it.roster!!.roster.role(p.id) != Role.INVITED && it.view()?.isActive(p.id) == true } == true }
+        if (h.isEmpty()) {
+            return null
         }
-        if (views.all { it.owner == null }) {
-            // Nobody left to manage it, for everyone: nobody can join, talk or change anything any more, and who's still
-            // listed isn't kept in step (there's no owner to pass facts on). Only safety is checked.
-            return safety(views.first())
+        val views = h.map { it.view(gid) }
+        // The newest roster any honest peer holds (chains don't fork, so it's the truth so far), and its holder's view.
+        val newest = honest.mapNotNull { p -> model(p)?.takeIf { it.roster != null } }.maxByOrNull { it.roster!!.roster.ver }?.view()
+        if (views.all { it.owner == null } || newest?.owner == null) {
+            // Nobody left to manage it, for everyone (or as of the newest roster: the owner who signed it left, and only
+            // they could have told the rest): nobody can join or change anything any more, and who's still listed isn't
+            // kept in step. Only safety holds then.
+            return null
         }
-        if (inGroup.map { it.roster(gid).hashB64 + " " + describe(it.view(gid)) }.toSet().size != 1) {
-            return Failure("diverged: ${inGroup.map { p -> "${p.name} ${describe(p.view(gid))}" }}")
+        val parts = components(h)
+        if (parts.size > 1) {
+            return Failure("disconnected: ${parts.map { c -> c.map { it.name } }}")
         }
-        val r = views.first()
-        // Nobody left to manage it (the owner left, and no member to take over): nobody can join, nothing changes, and
-        // acceptances don't count (Membership.view). Then only agreement and safety are checked.
-        return (if (r.owner == null) null else liveness(r)) ?: safety(r)
+        val state = h.map { p -> p.roster(gid).hashB64 + " " + unfolded(p) + " " + describe(p.view(gid)) }
+        if (state.toSet().size != 1) {
+            return Failure("diverged: ${h.map { p -> "${p.name} ${describe(p.view(gid))} facts ${unfolded(p).size}" }}")
+        }
+        for (p in h) {
+            for (q in h) {
+                val want = model(q)?.myCard?.card?.seq
+                val got = model(p)!!.cards[q.id]?.card?.seq
+                if (q != p && got != want) {
+                    return Failure("cards: ${p.name} has ${q.name}'s card $got, latest is $want")
+                }
+            }
+        }
+        net.states.entries.firstOrNull { it.value > MAX_STATE_EXCHANGES }?.let { (k, n) ->
+            return Failure("ping-pong: $n state messages that changed nothing, from ${k.first.substringBefore(' ')} to ${k.second.substringBefore(' ')}, neither's head changing")
+        }
+        return members(views.first(), h)
     }
 
-    /** [p] is invited, and nobody honest still in [r] has them as a contact. */
-    private fun unreachable(p: Peer, r: View): Boolean = honest.none { q -> q != p && r.isActive(q.id) && p.id in q.contacts }
+    /** The facts [p] holds that its roster doesn't show yet. */
+    private fun unfolded(p: Peer): Set<String> {
+        val m = model(p)!!
+        return m.facts.filter { app.goldfishsend.proto.Membership.applies(m.roster!!.roster, it.fact) }.map { it.key }.toSet()
+    }
+
+    /** [p] can send to [q]: a card of [q]'s whose inbox still exists, or a 1:1 contact. */
+    private fun route(p: Peer, q: Peer): Boolean {
+        val card = model(p)?.cards?.get(q.id)?.card
+        return (card != null && q.inboxes[gid]?.containsKey(card.inbox.sendSecret) == true) || q.id in p.contacts
+    }
+
+    /** The parts of [h] connected by routes both ways. */
+    private fun components(h: List<Peer>): List<List<Peer>> {
+        val left = h.toMutableList()
+        val out = mutableListOf<List<Peer>>()
+        while (left.isNotEmpty()) {
+            val part = mutableListOf(left.removeAt(0))
+            var i = 0
+            while (i < part.size) {
+                val p = part[i++]
+                val next = left.filter { q -> route(p, q) && route(q, p) }
+                part += next
+                left.removeAll(next)
+            }
+            out += part
+        }
+        return out
+    }
+
+    /** The owner of [r] is Mallory or nobody, or has no route to [p]. */
+    private fun ownerCantReach(p: Peer, r: View): Boolean {
+        val o = honest.firstOrNull { it.id == r.owner } ?: return true
+        return !route(o, p)
+    }
+
+        /** [p] joined, but their roster still lists them invited: their acceptance hasn't been taken in. */
+    private fun pending(p: Peer, m: GroupModel): Boolean = m.state == GroupModel.JOINED && m.roster?.roster?.role(p.id) == Role.INVITED
+
+    /** [p] is out of [r] or invited, and nobody honest still in it can reach them. */
+    private fun unreachable(p: Peer, h: List<Peer>): Boolean = h.none { q -> q != p && route(q, p) }
 
     /**
      * Mallory, the owner at some point (next in line once others left), equivocated: two rosters of hers at one version,
@@ -450,44 +560,44 @@ class GroupScenario(private val seed: Long) {
         return hers.any { it.roster.ver > at }
     }
 
-    private fun liveness(r: View): Failure? {
+    /** Everyone's state against the agreed view [r]; [h] are the honest active members. */
+    private fun members(r: View, h: List<Peer>): Failure? {
         for (p in honest) {
             val m = model(p)
             val role = r.role(p.id)
+            // Invitees are out of delivery: the owner and they exchange invitations, acceptances, declines and withdrawals
+            // once, over 1:1 (or the card an acceptance brings). If one of those was lost (held back, or sent to an inbox
+            // that was gone: an owner who has left since), or the owner has no route to
+            // them, they may not agree: they find out when they act (the owner answers an acceptance), or stay waiting.
+            val inviteeCut = p.id in lostTo || p.id in lostFrom || net.deadLetters.any { it.first == p.id } || ownerCantReach(p, r)
             val ok = when {
-                m == null -> role == null
-                role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED
-                role == Role.INVITED -> m.state == GroupModel.INVITED
-                // A withdrawn invitation nobody can tell them about: they have no inbox yet, and none of the members they
-                // know is still in. They find out if they join (the owner answers their acceptance).
-                role == null && m.state == GroupModel.INVITED -> unreachable(p, r)
-                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
+                // They know they're out, from a newer roster than the agreed one: what's agreed is behind.
+                m != null && m.state == GroupModel.REMOVED && (m.roster?.roster?.ver ?: 0) > r.roster.ver -> true
+                m == null -> role == null || (role == Role.INVITED && inviteeCut) || unreachable(p, h)
+                // Someone who left knows they're out, whether or not their departure reached anyone (it can be lost).
+                role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED || m.state == GroupModel.LEFT
+                role == Role.INVITED -> m.state == GroupModel.INVITED || inviteeCut || unreachable(p, h)
+                // Out: they know it, or nobody still in can reach them.
+                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || ((m.state == GroupModel.INVITED || pending(p, m)) && inviteeCut) ||
+                    unreachable(p, h)
             }
             if (!ok) {
                 return Failure("state: ${p.name} is ${m?.state} but $role in ${describe(r)}")
             }
         }
         for (p in honest) {
-            if (p.id in joined && p.id !in churned && !r.isActive(p.id)) {
+            if (p.id in joined && p.id !in churned && !r.isActive(p.id) && model(p)?.let { pending(p, it) } != true) {
                 return Failure("lost member: ${p.name} joined and never left, but is ${r.role(p.id)} in ${describe(r)}")
             }
             if (p.id in added && p.id !in joined && p.id !in churned && r.role(p.id) != Role.INVITED) {
                 return Failure("lost invitation: ${p.name} is ${r.role(p.id)} in ${describe(r)}")
             }
         }
-        for (p in honest.filter { joinedModel(it) != null }) {
-            val cards = model(p)!!.cards
-            for (q in honest.filter { it != p && r.isActive(it.id) }) {
-                val want = model(q)?.myCard?.card?.seq
-                if (cards[q.id]?.card?.seq != want) {
-                    return Failure("cards: ${p.name} has ${q.name}'s card ${cards[q.id]?.card?.seq}, latest is $want")
-                }
-            }
-        }
-        for (s in said) {
+        // The last round of messages, sent once the network was fair, reaches every active member it was sent to.
+        for (s in said.filter { it.last }) {
             for (to in s.to) {
                 val rcpt = honest.firstOrNull { it.id == to } ?: continue
-                if (s.from.id in churned || to in churned || !r.isActive(s.from.id) || !r.isActive(to)) {
+                if (!r.isActive(s.from.id) || !r.isActive(to) || joinedModel(rcpt) == null) {
                     continue
                 }
                 if (rcpt.texts.none { it.first == gid && it.second == s.from.id && it.third == s.body }) {
@@ -498,14 +608,34 @@ class GroupScenario(private val seed: Long) {
         return null
     }
 
-    private fun safety(r: View): Failure? {
-        for (mem in r.members) {
-            if (mem.id != alice.id && mem.id !in added) {
-                return Failure("authority: ${who(mem.id)} is in the roster but nobody added them: ${describe(r)}")
+    /**
+     * Always: no forks between honest members (two rosters at one version) unless the owner equivocated; every honest
+     * chain checks (each roster signed by the effective owner of the one before, given its proof: so the owner is who
+     * the succession rule says); nobody added but by an owner; no forged or leaked texts.
+     */
+    private fun safety(): Failure? {
+        val all = honest.flatMap { p -> p.store.historySince(gid, 0).map { p to it } }
+        for ((ver, rs) in all.groupBy { it.second.roster.ver }) {
+            if (rs.map { it.second.hashB64 }.toSet().size > 1 && !equivocated()) {
+                return Failure("fork at v$ver: ${rs.map { "${it.first.name} by ${who(it.second.roster.by)}" }.distinct()}")
             }
-            // Someone made owner (or Alice) who left hands it to the next member: then anyone may be the owner by now.
-            if (mem.role == Role.OWNER && mem.id !in promoted && !ownerLeft && promoted.none { it in churned }) {
-                return Failure("authority: ${who(mem.id)} is the owner but nobody made them one: ${describe(r)}")
+        }
+        for (p in honest) {
+            val chain = p.store.historySince(gid, 0).sortedBy { it.roster.ver }
+            for ((a, b) in chain.zipWithNext()) {
+                if (b.roster.ver != a.roster.ver + 1 || b.roster.prev != a.hashB64) {
+                    continue
+                }
+                val proof = b.roster.proof.mapNotNull { GroupCrypto.openFact(it)?.fact }
+                if (!RosterRules.validChild(a.roster, b.roster, proof)) {
+                    return Failure("authority: ${p.name} holds v${b.roster.ver} by ${who(b.roster.by)}, who wasn't the owner of v${a.roster.ver}")
+                }
+            }
+            val r = model(p)?.view() ?: continue
+            for (mem in r.members) {
+                if (mem.id != alice.id && mem.id !in added) {
+                    return Failure("authority: ${who(mem.id)} is in ${p.name}'s roster but nobody added them: ${describe(r)}")
+                }
             }
         }
         val byBody = said.associateBy { it.body }
@@ -540,7 +670,10 @@ class GroupScenario(private val seed: Long) {
         }
         net.deliverAll()
         for (p in honest) {
-            val got = p.texts.drop(before.getValue(p)).filter { it.third.startsWith("late ") }
+            // Only what their own view says is out: someone who never heard of a departure (it was lost, and nobody who
+            // knows can reach them) takes the leaver for a member, as far as they know.
+            val view = model(p)?.view()
+            val got = p.texts.drop(before.getValue(p)).filter { it.third.startsWith("late ") && view?.isActive(it.second) != true }
             if (got.isNotEmpty()) {
                 return Failure("posted after leaving: ${p.name} took ${got.map { it.third }}")
             }
@@ -554,6 +687,13 @@ class GroupScenario(private val seed: Long) {
     companion object {
         @Volatile
         var debug = System.getProperty("gf.groupFuzz.debug") != null
+
+        /**
+         * The same useless state exchange (same pair, same heads either side) after the adversary stopped: more is
+         * ping-pong. A sender may send up to [GroupEngine.MAX_STATES] per head of its own (in flight, each answering a head
+         * of ours it had just seen), and one more as it learns we're past them.
+         */
+        const val MAX_STATE_EXCHANGES = GroupEngine.MAX_STATES + 1
 
 
         /** A random scenario: mostly deliveries and messages, with membership changes and Mallory's tricks in between. */
