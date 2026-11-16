@@ -328,15 +328,24 @@ class GroupEngine(
      * inbox yet, and the owner invited them, so they're the owner's contacts). And to our inviter over 1:1.
      */
     private fun tellEveryone(m: GroupModel, content: Content) {
-        val ids = m.roster?.roster?.ids().orEmpty() - me
-        for (id in ids) {
-            if (m.cards[id] != null) {
-                io.sendGroup(m.gid, id, content)
-            } else {
-                io.sendDirect(m.gid, id, content)
-            }
+        val r = m.roster?.roster ?: return
+        for (id in r.ids() - me) {
+            reach(m, id, r.role(id) == Role.INVITED, m.cards, content)
         }
-        m.invitedBy?.takeIf { it != me }?.let { io.sendDirect(m.gid, it, content) }
+        // Our inviter over 1:1 too, even with a card: if they've left, that's how they can still pass it on.
+        m.invitedBy?.takeIf { it != me && (m.cards[it] != null || it !in r.ids()) }?.let { io.sendDirect(m.gid, it, content) }
+    }
+
+    /**
+     * Sends to a member through their card if we have one, else over 1:1. An [invited] member is tried over 1:1 first:
+     * they have no inbox yet, and a card we hold of theirs may be from an earlier stint (its inbox deleted).
+     */
+    private fun reach(m: GroupModel, id: String, invited: Boolean, cards: Map<String, SignedCard>, content: Content) {
+        when {
+            invited -> if (!io.sendDirect(m.gid, id, content) && cards[id] != null) io.sendGroup(m.gid, id, content)
+            cards[id] != null -> io.sendGroup(m.gid, id, content)
+            else -> io.sendDirect(m.gid, id, content)
+        }
     }
 
     // ---------- crypto ----------
@@ -931,11 +940,8 @@ class GroupEngine(
         val newcomers = signed.roster.members.filter { it.role == Role.INVITED && it.since == signed.roster.ver }.map { it.id }.toSet()
         dbg { "broadcast v${signed.roster.ver} to ${targets.map { who(it) + (if (cardsBefore[it] != null) "/g" else "/d") }}" }
         for (id in targets) {
-            if (cardsBefore[id] != null && id !in newcomers) {
-                io.sendGroup(m.gid, id, content)
-            } else {
-                io.sendDirect(m.gid, id, content)
-            }
+            val invited = id in newcomers || (old.role(id) ?: signed.roster.role(id)) == Role.INVITED
+            reach(m, id, invited, cardsBefore, content)
         }
         // Newcomers need every card to reach the members.
         for (id in newcomers) {

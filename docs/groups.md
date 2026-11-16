@@ -180,7 +180,8 @@ owner sent when inviting them. The owner, who keeps every card, closes the gaps:
     card;
   - the newcomer's card to every other member, and to invitees over 1:1.
 - **Invited members** have no inbox yet: rosters reach them only over 1:1. The owner sends every roster to them that
-  way.
+  way. Anything for an invitee goes over 1:1 first, and through their card only if that fails: a card we hold of
+  theirs may be from an earlier stint, its inbox deleted.
 - **On joining,** invitees send `gsync` to their inviter (over 1:1 if they can), and their card the same way.
 - **Unordered 1:1 messages.** A roster that arrives over 1:1 from its owner, for a group we don't know, and leaves us
   out, voids an older invitation from that owner arriving after it. The newest 32 are remembered.

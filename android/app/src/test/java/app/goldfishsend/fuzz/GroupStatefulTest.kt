@@ -581,6 +581,23 @@ class GroupStatefulTest {
     @Test
     fun seed3839OwnerEquivocates() = scenario(3839L, GroupScenario.generate(3839L, length(3839L)))
 
+    /**
+     * Found by GroupScenarioFuzzTest and .forks (inputs removal-to-an-old-stints-card, withdrawal-to-an-old-stints-card):
+     * Carol (or Alice) was invited again, then removed; the removal went to a card of hers from an earlier stint, whose
+     * inbox was gone. Invitees are now reached over 1:1 first.
+     */
+    @Test
+    fun removalToAnOldStintsCard() {
+        scenario(2L, listOf(Op(2, 0, 212, 0), Op(11, 0, 0, 0), Op(3, 0, 67, 0), Op(0, 42, 0, 0), Op(2, 0, 212, 0), Op(11, 0, 0, 0), Op(3, 0, 67, 0)))
+        scenario(
+            7L,
+            listOf(
+                Op(8, 255, 0, 0), Op(5, 0, 0, 0), Op(0, 44, 0, 0), Op(8, 255, 255, 0), Op(8, 0, 255, 0), Op(2, 0, 42, 0), Op(1, 0, 0, 0),
+                Op(8, 255, 0, 0), Op(8, 255, 255, 0), Op(8, 0, 0, 0), Op(8, 0, 185, 0), Op(0, 42, 0, 0), Op(2, 44, 0, 0), Op(3, 44, 0, 0),
+            ),
+        )
+    }
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {
