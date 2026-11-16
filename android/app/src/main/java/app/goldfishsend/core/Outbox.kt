@@ -83,6 +83,11 @@ object Outbox {
                                 drainContact(s, cid)
                             }
                         }
+                    } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // One contact's failure must not cancel the sends to everyone else.
+                        android.util.Log.w("Outbox", "sending to a contact failed: ${e.javaClass.simpleName}")
                     } finally {
                         lock.unlock()
                     }
