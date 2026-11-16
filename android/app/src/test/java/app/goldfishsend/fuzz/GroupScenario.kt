@@ -474,9 +474,12 @@ class GroupScenario(private val seed: Long) {
             return null
         }
         val views = h.map { it.view(gid) }
-        if (views.all { it.owner == null }) {
-            // Nobody left to manage it, for everyone: nobody can join or change anything any more, and who's still listed
-            // isn't kept in step. Only safety holds then.
+        // The newest roster any honest peer holds (chains don't fork, so it's the truth so far), and its holder's view.
+        val newest = honest.mapNotNull { p -> model(p)?.takeIf { it.roster != null } }.maxByOrNull { it.roster!!.roster.ver }?.view()
+        if (views.all { it.owner == null } || newest?.owner == null) {
+            // Nobody left to manage it, for everyone (or as of the newest roster: the owner who signed it left, and only
+            // they could have told the rest): nobody can join or change anything any more, and who's still listed isn't
+            // kept in step. Only safety holds then.
             return null
         }
         val parts = components(h)
@@ -568,6 +571,8 @@ class GroupScenario(private val seed: Long) {
             // them, they may not agree: they find out when they act (the owner answers an acceptance), or stay waiting.
             val inviteeCut = p.id in lostTo || p.id in lostFrom || net.deadLetters.any { it.first == p.id } || ownerCantReach(p, r)
             val ok = when {
+                // They know they're out, from a newer roster than the agreed one: what's agreed is behind.
+                m != null && m.state == GroupModel.REMOVED && (m.roster?.roster?.ver ?: 0) > r.roster.ver -> true
                 m == null -> role == null || (role == Role.INVITED && inviteeCut) || unreachable(p, h)
                 // Someone who left knows they're out, whether or not their departure reached anyone (it can be lost).
                 role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED || m.state == GroupModel.LEFT

@@ -232,7 +232,8 @@ Besides members:
 - **Taken out:** a member the owner removes is owed the rosters that say so (from the head they last showed, or their
   stint, the newest 50), over 1:1 or through their old card. If that's lost, they go on writing to the group: the
   owner recognises them by the hint of a blob it can no longer attribute to a member, doesn't read it, and sends the
-  rosters again, at most once an hour. Someone who left needs nothing.
+  rosters again, at most once an hour. Only the owner who removed them does this: if it leaves before they hear, they
+  don't. Someone who left needs nothing.
 
 **Convergence follows ordinary traffic.** Nothing is sent in the background or on a timer. Members who write to each
 other converge: each message shows the other side where its sender is, and at most a few state messages follow. A
