@@ -101,8 +101,9 @@ applied.
   in roster order whose stint hasn't ended, or nobody.
   - Only departures move ownership, never acceptances. So of two honest members, at most one can believe they're the
     next owner: everyone ahead of them must have left.
-- **Nobody left to own it.** If no member is left to take over, the group is over. Acceptances nobody took in don't
-  count either, so everyone still listed is out.
+- **Nobody left to own it.** If no member is left to take over, nothing can change any more, and nobody can join.
+  Acceptances nobody took in don't count either, so everyone still listed as invited stays invited. A member who
+  sees this may only be behind, though: a newer roster, with an owner, still counts.
 - **A departure carrying a newer roster** (`last`) only applies once our roster has caught up with it.
 - **Applying the view.** The view is a pure function of the roster and the facts. It's applied the moment it changes:
   - who receives our messages;
@@ -134,10 +135,9 @@ For a received roster R, with current roster C:
      - Their card is kept only until what's already queued to them (the roster that took them out) is delivered. Then
        it is deleted, and so is their session once they're in no other group.
    - **If we were taken out:** mark the group "You were removed" and stop sending.
-   - **If the group is over** (nobody left to own it) and we were invited or had just joined: the group has ended for
-     us too.
    - **Once out** (removed, left or declined), a roster that lists us as `invited` with a newer `since` is a new
-     invitation.
+     invitation. Like a first invitation, it's taken on the word of the owner who sent it over 1:1, even past a gap:
+     what happened while we were out isn't ours to know.
    - **If anyone went:** rotate our group inbox. That means a new mailbox and a new card with a new `hintKey`, sent to
      the remaining members; the old mailbox is deleted after a 15-day drain.
 
@@ -152,8 +152,9 @@ For a received roster R, with current roster C:
   - **About a stint that's over:** it's ignored.
   - **Duplicates:** one fact of each kind per stint.
 - **Forwarding to the owner.** Whoever gets a fact first-hand from its author passes it on to the effective owner,
-  who takes facts in and may not be reachable by the author (no card, not a contact). A departure that makes someone
-  else the owner is forwarded to them too. Either way, at most once per member and fact.
+  who takes facts in and may not be reachable by the author (no card, not a contact). When the effective owner
+  changes, every member passes the new owner the facts it holds that the roster doesn't show yet (the old owner may
+  have been the only one they reached). Either way, at most once per member and fact.
 - **After leaving.** A member who has left still passes a fact that reaches it over 1:1 to the roster's members who
   are its contacts, once. It may be the only link between the author and the people it invited.
 
@@ -254,7 +255,7 @@ The invitee sees "Alice added you to <name>", with Join or Decline.
      their bundles.
   3. Send `gsync` to the inviter.
 
-  The owner takes the acceptance into its next roster, and relays the card. A group that nobody can own any more can't
+  The owner takes the acceptance into its next roster, and relays the card. A group with nobody left to own it can't
   be joined.
 - **Decline:** send a `leave` fact. It goes to the inviter over 1:1 too, which still arrives if the chat is deleted
   right away.

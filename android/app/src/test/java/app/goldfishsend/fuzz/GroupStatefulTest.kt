@@ -406,6 +406,39 @@ class GroupStatefulTest {
     @Test
     fun departureThatOvertookTheInvitation() = scenario(1108L, listOf(Op(1, 0, 0, 0), Op(8, 169, 160, 0), Op(11, 0, 0, 0), Op(0, 101, 0, 0)))
 
+    /**
+     * Found by GroupScenarioFuzzTest (input reinvited-past-a-gap-after-the-owner-left): Carol, removed, was invited again
+     * past a gap; she asked for what she'd missed, but the owner had left. A re-invitation is taken on its owner's word.
+     */
+    @Test
+    fun reinvitedPastAGapAfterTheOwnerLeft() = scenario(
+        0L,
+        listOf(Op(8, 0, 0, 0), Op(2, 0, 212, 0), Op(8, 0, 255, 0), Op(3, 0, 67, 0), Op(0, 36, 0, 0), Op(8, 0, 83, 0), Op(2, 0, 102, 0), Op(1, 0, 0, 0)),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input departure-held-only-by-the-old-owner): Dave passed Mallory's departure on
+     * to Alice, the owner, who left; Bob took over without it. A new owner now gets the facts its members hold.
+     */
+    @Test
+    fun departureHeldOnlyByTheOldOwner() = scenario(
+        7L,
+        listOf(Op(2, 0, 223, 0), Op(8, 71, 109, 0), Op(0, 31, 0, 0), Op(0, 78, 0, 0), Op(0, 74, 0, 0), Op(8, 138, 185, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0)),
+    )
+
+    /**
+     * Seed 1236: Mallory, next in line, sent her departure only to some, and signed rosters as owner for the rest. An
+     * invitee who heard it decided the group had nobody left to own it, and for good.
+     */
+    @Test
+    fun selectiveDepartureOfTheNextOwner() = scenario(
+        1236L,
+        listOf(
+            Op(8, 188, 0, 0), Op(0, 184, 0, 0), Op(8, 158, 149, 0), Op(8, 12, 0, 0), Op(8, 251, 163, 96), Op(12, 0, 0, 0), Op(9, 0, 0, 0),
+            Op(1, 0, 0, 0), Op(8, 122, 181, 0), Op(2, 114, 43, 0), Op(0, 1, 0, 0),
+        ),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

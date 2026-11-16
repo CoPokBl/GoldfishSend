@@ -140,7 +140,8 @@ class GroupScenario(private val seed: Long) {
             0 -> {
                 val p = peer(op.a)
                 val m = model(p) ?: return
-                if (m.state == GroupModel.INVITED && m.roster?.roster?.role(p.id) == Role.INVITED) {
+                // Nobody can admit us while the group has no owner (everyone who could own it left).
+                if (m.state == GroupModel.INVITED && m.roster?.roster?.role(p.id) == Role.INVITED && m.view()?.owner != null) {
                     log("${p.name} joins")
                     p.join(gid)
                     joined += p.id
@@ -414,38 +415,34 @@ class GroupScenario(private val seed: Long) {
             return Failure("diverged: ${inGroup.map { p -> "${p.name} ${describe(p.view(gid))}" }}")
         }
         val r = views.first()
+        // Nobody left to manage it (the owner left, and no member to take over): nobody can join, nothing changes, and
+        // acceptances don't count (Membership.view). Then only agreement and safety are checked.
+        return (if (r.owner == null) null else liveness(r)) ?: safety(r)
+    }
+
+    private fun liveness(r: View): Failure? {
         for (p in honest) {
             val m = model(p)
             val role = r.role(p.id)
             val ok = when {
                 m == null -> role == null
                 role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED
-                // An invitee of a group nobody can manage any more (its owner left, no member to take over) is out.
-                role == Role.INVITED -> m.state == GroupModel.INVITED || (r.owner == null && m.state == GroupModel.REMOVED)
+                role == Role.INVITED -> m.state == GroupModel.INVITED
                 else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
             }
             if (!ok) {
                 return Failure("state: ${p.name} is ${m?.state} but $role in ${describe(r)}")
             }
         }
-        for (mem in r.members) {
-            if (mem.id != alice.id && mem.id !in added) {
-                return Failure("authority: ${who(mem.id)} is in the roster but nobody added them: ${describe(r)}")
-            }
-            if (mem.role == Role.OWNER && mem.id !in promoted && !ownerLeft) {
-                return Failure("authority: ${who(mem.id)} is the owner but nobody made them one: ${describe(r)}")
-            }
-        }
         for (p in honest) {
-            // In a group nobody can manage any more, a late acceptance doesn't count (see Membership.view).
-            if (p.id in joined && p.id !in churned && !r.isActive(p.id) && r.owner != null) {
+            if (p.id in joined && p.id !in churned && !r.isActive(p.id)) {
                 return Failure("lost member: ${p.name} joined and never left, but is ${r.role(p.id)} in ${describe(r)}")
             }
             if (p.id in added && p.id !in joined && p.id !in churned && r.role(p.id) != Role.INVITED) {
                 return Failure("lost invitation: ${p.name} is ${r.role(p.id)} in ${describe(r)}")
             }
         }
-        for (p in inGroup) {
+        for (p in honest.filter { joinedModel(it) != null }) {
             val cards = model(p)!!.cards
             for (q in honest.filter { it != p && r.isActive(it.id) }) {
                 val want = model(q)?.myCard?.card?.seq
@@ -454,7 +451,6 @@ class GroupScenario(private val seed: Long) {
                 }
             }
         }
-        val byBody = said.associateBy { it.body }
         for (s in said) {
             for (to in s.to) {
                 val rcpt = honest.firstOrNull { it.id == to } ?: continue
@@ -466,6 +462,19 @@ class GroupScenario(private val seed: Long) {
                 }
             }
         }
+        return null
+    }
+
+    private fun safety(r: View): Failure? {
+        for (mem in r.members) {
+            if (mem.id != alice.id && mem.id !in added) {
+                return Failure("authority: ${who(mem.id)} is in the roster but nobody added them: ${describe(r)}")
+            }
+            if (mem.role == Role.OWNER && mem.id !in promoted && !ownerLeft) {
+                return Failure("authority: ${who(mem.id)} is the owner but nobody made them one: ${describe(r)}")
+            }
+        }
+        val byBody = said.associateBy { it.body }
         for (p in peers) {
             for ((g, from, body) in p.texts) {
                 if (g != gid) {

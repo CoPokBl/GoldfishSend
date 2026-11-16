@@ -576,11 +576,6 @@ object Groups {
                         afterDeparture(cid, m)
                         "${memberName(s, m, e.by).name} removed you from the group."
                     }
-                    GroupEvent.Ended -> {
-                        dropOutbox(cid)
-                        afterDeparture(cid, m)
-                        "The owner left with nobody else left to manage the group, so it has ended."
-                    }
                     GroupEvent.YouLeft -> {
                         afterDeparture(cid, m)
                         "You left the group."

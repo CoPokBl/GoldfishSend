@@ -91,9 +91,6 @@ sealed class GroupEvent {
     data class Renamed(val by: String, val name: String) : GroupEvent()
     data class TimerChanged(val by: String, val secs: Long) : GroupEvent()
     data class YouWereRemoved(val by: String) : GroupEvent()
-
-    /** Invited to a group that nobody can manage any more (its owner left, and no member was left to take over). */
-    data object Ended : GroupEvent()
     data object YouLeft : GroupEvent()
 }
 
@@ -487,7 +484,7 @@ class GroupEngine(
             invitation(from, signed, direct)
             return
         }
-        onSignedRoster(m, signed, from)
+        onSignedRoster(m, signed, from, direct)
     }
 
     /** A roster for a group we don't know: an invitation if it came over 1:1 from the owner who signed it, listing us. */
@@ -518,10 +515,22 @@ class GroupEngine(
      * A roster for a group we know. The chain is linear: the next one (signed by the owner of ours) is taken; an older one
      * is old news; one further on means we missed some, so it's kept and we ask for what's in between.
      */
-    private fun onSignedRoster(m: GroupModel, signed: SignedRoster, from: String) {
+    private fun onSignedRoster(m: GroupModel, signed: SignedRoster, from: String, direct: Boolean) {
         val cur = m.roster ?: return
         val r = signed.roster
         if (r.ver <= cur.roster.ver || store.history(m.gid, signed.hashB64) != null) {
+            return
+        }
+        val mine = r.member(me)
+        if ((m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) && direct && r.by == from && r.owner == from &&
+            mine?.role == Role.INVITED && mine.since > m.since && r.ver > cur.roster.ver + 1
+        ) {
+            // Out of the group and invited again: like a first invitation, it's taken on its owner's word, gap or not (what
+            // we missed meanwhile isn't ours to know).
+            m.roster = signed
+            m.facts.clear()
+            store.addHistory(m.gid, signed)
+            settle(m, null, r.by)
             return
         }
         if (r.ver == cur.roster.ver + 1) {
@@ -587,7 +596,7 @@ class GroupEngine(
         }
         // A departure carries the newest roster the leaver had: it may be one we haven't seen (they signed it just before).
         f.last?.let { w ->
-            GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) }?.let { onSignedRoster(loaded, it, from) }
+            GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) }?.let { onSignedRoster(loaded, it, from, direct = false) }
         }
         val m = store.load(c.g) ?: return
         val r = m.roster?.roster ?: return
@@ -608,14 +617,19 @@ class GroupEngine(
         // An acceptance carries the newcomer's card: whoever learns they're in can reach them.
         f.card?.let { onCard(Content.GCard(c.g, it.data, it.sig)) }
         // The owner takes facts in, and may not be reachable by their author (no card, not a contact): whoever got it
-        // from the author passes it on. And a departure that makes someone else the owner must reach them.
-        val owner = store.load(c.g)?.view()?.owner
-        if (owner != null && owner != me && owner != from && owner != f.id && (from == f.id || owner != before?.owner)) {
-            if (m.cards[owner] != null && m.state == GroupModel.JOINED) {
-                io.sendGroup(m.gid, owner, c)
-            } else {
-                io.sendDirect(m.gid, owner, c)
-            }
+        // from the author passes it on. (If it made someone else the owner, settle has passed it on already.)
+        val after = store.load(c.g) ?: return
+        val owner = after.view()?.owner
+        if (owner != null && owner == before?.owner && owner != me && owner != from && owner != f.id && from == f.id) {
+            toOwner(after, owner, c)
+        }
+    }
+
+    private fun toOwner(m: GroupModel, owner: String, c: Content) {
+        if (m.cards[owner] != null && m.state == GroupModel.JOINED) {
+            io.sendGroup(m.gid, owner, c)
+        } else {
+            io.sendDirect(m.gid, owner, c)
         }
     }
 
@@ -762,11 +776,6 @@ class GroupEngine(
         } else if ((m.state == GroupModel.JOINED || m.state == GroupModel.INVITED) && (mine?.since != m.since || after.role(me) == null)) {
             m.state = GroupModel.REMOVED
             events += GroupEvent.YouWereRemoved(r.by)
-        } else if ((m.state == GroupModel.JOINED || m.state == GroupModel.INVITED) && after.owner == null) {
-            // The owner left, and no member was left to take over: the group is over (our acceptance, if we just sent one,
-            // came too late for anyone to take it in).
-            m.state = GroupModel.REMOVED
-            events += GroupEvent.Ended
         }
         if (before != null) {
             events += changes(before, after, by, leavers)
@@ -783,6 +792,15 @@ class GroupEngine(
             io.rotateInbox(m)
         }
         heldReady += m.gid
+        val owner = after.owner
+        if (before != null && owner != before.owner && owner != null && owner != me && (m.state == GroupModel.JOINED || m.state == GroupModel.INVITED)) {
+            // Someone else is the owner now: they take the facts in, and may not have heard the ones we hold.
+            for (f in m.facts) {
+                if (f.fact.id != owner && Membership.applies(r, f.fact)) {
+                    toOwner(m, owner, factContent(f))
+                }
+            }
+        }
         if (m.state == GroupModel.JOINED && after.owner == me && Membership.fold(r, m.facts.map { it.fact }, me) != r) {
             publish(m, null)
         }
