@@ -113,6 +113,16 @@ class MemoryGroupStore : GroupStore {
     }
 
     private val withdrawals = LinkedHashMap<String, Long>()
+    private val early = mutableListOf<Content.GFact>()
+
+    override fun addEarlyFact(gid: String, fact: Content.GFact) {
+        early += fact
+        while (early.size > 16) {
+            early.removeAt(0)
+        }
+    }
+
+    override fun takeEarlyFacts(gid: String): List<Content.GFact> = early.filter { it.g == gid }.also { early.removeAll(it) }
 
     override fun withdrawn(gid: String, by: String): Long? = withdrawals["$gid $by"]
 

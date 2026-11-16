@@ -5,6 +5,7 @@ import app.goldfishsend.group.GroupModel
 import app.goldfishsend.group.GroupStore
 import app.goldfishsend.group.HeldBlob
 import app.goldfishsend.group.FactLines
+import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.GroupCard
 import app.goldfishsend.proto.GroupCrypto
 import app.goldfishsend.proto.GroupJson
@@ -164,10 +165,28 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
         repo.kvPutString(WITHDRAWN, kept.joinToString("\n") { it.joinToString(" ") })
     }
 
+    /** Lines of `gid fact sig`, newest last, in one kv entry (a handful at most). */
+    private fun early(): List<List<String>> = repo.kvString(EARLY)?.lines()?.map { it.split(' ') }?.filter { it.size == 3 }.orEmpty()
+
+    override fun addEarlyFact(gid: String, fact: Content.GFact) {
+        val kept = (early() + listOf(listOf(gid, fact.fact, fact.sig))).takeLast(16)
+        repo.kvPutString(EARLY, kept.joinToString("\n") { it.joinToString(" ") })
+    }
+
+    override fun takeEarlyFacts(gid: String): List<Content.GFact> {
+        val all = early()
+        val mine = all.filter { it[0] == gid }
+        if (mine.isNotEmpty()) {
+            repo.kvPutString(EARLY, (all - mine.toSet()).joinToString("\n") { it.joinToString(" ") }.ifEmpty { null })
+        }
+        return mine.map { Content.GFact(it[0], it[1], it[2]) }
+    }
+
     fun cidOf(gid: String): Long? = db.queryOne("SELECT cid FROM groups WHERE gid = ?", gid) { it.getLong(0) }
 
     private companion object {
         const val WITHDRAWN = "group_withdrawn"
+        const val EARLY = "group_early_facts"
     }
 
     private fun trustedRoster(bytes: ByteArray, sig: ByteArray): SignedRoster? =

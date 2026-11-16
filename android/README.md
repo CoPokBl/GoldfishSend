@@ -90,7 +90,7 @@ local only.
 |---|---|
 | `fuzz/ParserFuzzTest` | Invite links (QR, pasted text, deep links), invite blobs, push payloads and E2E blobs, decrypted plaintext (padding and Content JSON), chunking, display names |
 | `fuzz/GroupReceiveFuzzTest` | One member receiving whatever a hostile member, invitee or stranger can send: raw blobs, forged or replayed rosters and cards, chunks in any order, claimed senders |
-| `fuzz/GroupStatefulTest`, `fuzz/GroupScenarioFuzzTest` | Random sequences of joins, leaves, removals, role and name changes, inbox rotations and messages, with pushes reordered, duplicated and delayed and a hostile member (who also forks from older rosters; `GroupScenarioFuzzTest.forks`), checked for convergence, authority, message delivery and that whoever is out can't read or post |
+| `fuzz/GroupStatefulTest`, `fuzz/GroupScenarioFuzzTest` | Random sequences of joins, leaves, removals, ownership and name changes, inbox rotations and messages, with pushes reordered, duplicated and delayed and a hostile member (who also signs rosters on older ones and departures carrying old rosters; `GroupScenarioFuzzTest.forks`), checked for convergence, authority, message delivery and that whoever is out can't read or post |
 | `PoisonMessageTest` | A message that fails to process is dropped (counted, logged without content); it never crashes the app or blocks what comes after |
 
 The Jazzer tests ([Jazzer](https://github.com/CodeIntelligenceTesting/jazzer), on the JUnit Platform next to the JUnit 4

@@ -128,6 +128,12 @@ interface GroupStore {
     /** Records one for [withdrawn]. Only the newest few (any group) are kept. */
     fun addWithdrawn(gid: String, by: String, ver: Long)
 
+    /** Keeps a fact for a group we don't know yet (it overtook our invitation). Only the newest few (any group) are kept. */
+    fun addEarlyFact(gid: String, fact: Content.GFact)
+
+    /** The facts kept by [addEarlyFact] for [gid], and forgets them. */
+    fun takeEarlyFacts(gid: String): List<Content.GFact>
+
     fun held(gid: String): List<HeldBlob>
 
     fun dropHeld(id: Long)
@@ -241,7 +247,10 @@ class GroupEngine(
             return false
         }
         val before = m.view()
-        val fact = GroupCrypto.signFact(identity.privateKey, Fact(g = m.gid, kind = FactKind.ACCEPT, id = me, since = m.since, ts = io.nowMillis() / 1000))
+        val fact = GroupCrypto.signFact(
+            identity.privateKey,
+            Fact(g = m.gid, kind = FactKind.ACCEPT, id = me, since = m.since, ts = io.nowMillis() / 1000, card = Signed(B64.enc(myCard.bytes), B64.enc(myCard.sig))),
+        )
         m.myCard = myCard
         m.state = GroupModel.JOINED
         m.facts += fact
@@ -500,6 +509,9 @@ class GroupEngine(
         store.save(fresh)
         store.addHistory(r.g, signed)
         io.onEvents(fresh, listOf(GroupEvent.Invited(from)))
+        for (f in store.takeEarlyFacts(r.g)) {
+            onFact(from, f, direct = true)
+        }
     }
 
     /**
@@ -555,7 +567,14 @@ class GroupEngine(
         if (f.g != c.g || f.id == me) {
             return
         }
-        val loaded = store.load(c.g) ?: return
+        val loaded = store.load(c.g)
+        if (loaded == null) {
+            // 1:1 messages aren't ordered: this may have overtaken our invitation (the owner left right after inviting us).
+            if (direct) {
+                store.addEarlyFact(c.g, c)
+            }
+            return
+        }
         if (loaded.state != GroupModel.JOINED && loaded.state != GroupModel.INVITED) {
             // Out of the group, we may still be the only link between its author and the members who are our contacts
             // (people we invited): it goes on to them over 1:1, once.
@@ -586,13 +605,16 @@ class GroupEngine(
             return
         }
         settle(m, before, f.id)
-        val ownerAfter = m.view()?.owner
-        // A departure that makes someone else the owner: they must hear it, and may not have the leaver's card.
-        if (f.kind == FactKind.LEAVE && ownerAfter != before?.owner && ownerAfter != null && ownerAfter != me && ownerAfter != from) {
-            if (m.cards[ownerAfter] != null && m.state == GroupModel.JOINED) {
-                io.sendGroup(m.gid, ownerAfter, c)
+        // An acceptance carries the newcomer's card: whoever learns they're in can reach them.
+        f.card?.let { onCard(Content.GCard(c.g, it.data, it.sig)) }
+        // The owner takes facts in, and may not be reachable by their author (no card, not a contact): whoever got it
+        // from the author passes it on. And a departure that makes someone else the owner must reach them.
+        val owner = store.load(c.g)?.view()?.owner
+        if (owner != null && owner != me && owner != from && owner != f.id && (from == f.id || owner != before?.owner)) {
+            if (m.cards[owner] != null && m.state == GroupModel.JOINED) {
+                io.sendGroup(m.gid, owner, c)
             } else {
-                io.sendDirect(m.gid, ownerAfter, c)
+                io.sendDirect(m.gid, owner, c)
             }
         }
     }

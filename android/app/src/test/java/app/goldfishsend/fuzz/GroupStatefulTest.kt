@@ -384,6 +384,28 @@ class GroupStatefulTest {
         ),
     )
 
+    // ---------- found under the owner design ----------
+
+    /**
+     * Found by GroupScenarioFuzzTest (input acceptance-the-new-owner-never-heard): Alice made Bob the owner while
+     * Mallory joined; Mallory's acceptance reached only Alice. First-hand recipients now pass facts on to the owner.
+     */
+    @Test
+    fun acceptanceTheNewOwnerNeverHeard() =
+        scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 75, 0), Op(4, 0, 11, 0), Op(0, 94, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input newcomer-card-only-the-old-owner-had): Carol joined after Alice, the
+     * owner, left; her card reached nobody who could pass it on. An acceptance now carries the newcomer's card.
+     */
+    @Test
+    fun newcomerCardOnlyTheOldOwnerHad() =
+        scenario(7L, listOf(Op(8, 255, 0, 0), Op(5, 0, 0, 0), Op(2, 0, 42, 0), Op(0, 166, 0, 0), Op(8, 255, 0, 0), Op(1, 0, 0, 0), Op(0, 42, 0, 0)))
+
+    /** Seed 1108: Alice left right after inviting; her departure overtook the invitation (1:1 isn't ordered) and was dropped. */
+    @Test
+    fun departureThatOvertookTheInvitation() = scenario(1108L, listOf(Op(1, 0, 0, 0), Op(8, 169, 160, 0), Op(11, 0, 0, 0), Op(0, 101, 0, 0)))
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

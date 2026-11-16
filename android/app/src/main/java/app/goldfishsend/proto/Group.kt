@@ -90,6 +90,8 @@ data class Fact(
     val ts: Long,
     /** On a departure: the newest roster the leaver held, so whoever takes over from them builds on it. */
     val last: Signed? = null,
+    /** On an acceptance: the member's card, so whoever learns they're in can reach them. */
+    val card: Signed? = null,
 ) {
     /** [last]'s version (0 if none, -1 if unreadable). */
     val lastVer: Long by lazy {
@@ -206,7 +208,7 @@ object GroupCrypto {
         if (f.v != 2 || f.since < 1 || (f.kind != FactKind.ACCEPT && f.kind != FactKind.LEAVE) || !verify(f.id, FACT_LABEL, bytes, sig)) {
             return null
         }
-        if (f.last != null && (f.kind != FactKind.LEAVE || f.lastVer < 1)) {
+        if ((f.last != null && (f.kind != FactKind.LEAVE || f.lastVer < 1)) || (f.card != null && f.kind != FactKind.ACCEPT)) {
             return null
         }
         return SignedFact(bytes, sig, f)
