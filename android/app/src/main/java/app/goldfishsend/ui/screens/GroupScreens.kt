@@ -208,14 +208,14 @@ private fun loadInfo(s: Session, cid: Long): GroupInfo? {
     val m = Groups.model(s, cid) ?: return null
     val me = Groups.me(s)
     val routes = s.repo.memberRoutes(cid)
-    val roster = m.roster?.roster ?: return null
+    val roster = m.view() ?: return null
     val rows = roster.members.map { rm ->
         val n = Groups.memberName(s, m, rm.id)
         MemberRow(
             rm.id, n.name, rm.role, rm.id == me, n.isContact, n.verified,
             routes[rm.id]?.let { it.pendingServerKey != null || it.unreachable } == true,
         )
-    }.sortedWith(compareBy<MemberRow>({ !it.isMe }, { it.role != Role.ADMIN }, { it.role == Role.INVITED }, { it.name.lowercase() }))
+    }.sortedWith(compareBy<MemberRow>({ !it.isMe }, { it.role != Role.OWNER }, { it.role == Role.INVITED }, { it.name.lowercase() }))
     return GroupInfo(m, me, rows)
 }
 
@@ -234,7 +234,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     var safetyFor by remember { mutableStateOf<MemberRow?>(null) }
     var confirmRemove by remember { mutableStateOf<MemberRow?>(null) }
     var confirmLeave by remember { mutableStateOf(false) }
-    var promoteFirst by remember { mutableStateOf(false) }
+    var confirmOwner by remember { mutableStateOf<MemberRow?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     val erasing = rememberWork()
@@ -242,9 +242,9 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     val c = contact ?: return
     val g = info ?: return
     val m = g.model
-    val r = m.roster?.roster
+    val r = m.view()
     val joined = m.state == GroupModel.JOINED
-    val amAdmin = joined && r?.isAdmin(g.me) == true
+    val amOwner = joined && r?.isOwner(g.me) == true
     val canEdit = Groups.canEditInfo(m, g.me)
 
     val work = rememberWork()
@@ -312,7 +312,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(start = 24.dp, top = 12.dp, bottom = 4.dp),
                 )
-                if (amAdmin && (r?.members?.size ?: 0) < RosterRules.MAX_MEMBERS) {
+                if (amOwner && (r?.members?.size ?: 0) < RosterRules.MAX_MEMBERS) {
                     SettingRow("Add members", null, Icons.Rounded.PersonAdd, onClick = { adding = true })
                 }
                 for (row in g.members) {
@@ -321,7 +321,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                         supportingContent = {
                             val parts = buildList {
                                 when (row.role) {
-                                    Role.ADMIN -> add("Admin")
+                                    Role.OWNER -> add("Owner")
                                     Role.INVITED -> add("Invited")
                                 }
                                 if (!row.isMe && !row.isContact) {
@@ -345,20 +345,11 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 SettingRow(
                     "Disappearing messages",
-                    timerLabel(c.timerSecs) + if (!canEdit && joined) " · set by admins" else "",
+                    timerLabel(c.timerSecs) + if (!canEdit && joined) " · set by the owner" else "",
                     Icons.Rounded.Timer,
                     enabled = canEdit,
                     onClick = { timer = true },
                 )
-                if (amAdmin) {
-                    SwitchRow(
-                        "Only admins can edit group info",
-                        "The name and disappearing-messages timer",
-                        Icons.Rounded.AdminPanelSettings,
-                        checked = r?.adminsOnly == true,
-                        onChange = { v -> act("Saving…") { Groups.setAdminsOnly(s, cid, v) } },
-                    )
-                }
                 val hiddenOn by rememberQuery(s) { q -> !q.decoy && q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
                 if (hiddenOn == true) {
                     SwitchRow(
@@ -372,7 +363,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                 SettingRow("Clear chat", "Delete all messages in this chat from this phone", Icons.Rounded.DeleteSweep, onClick = { confirmClear = true })
                 if (joined) {
                     SettingRow("Leave group", "You'll stop getting messages from this group", Icons.AutoMirrored.Rounded.Logout, onClick = {
-                        if (Groups.mustPromoteFirst(m, g.me)) promoteFirst = true else confirmLeave = true
+                        confirmLeave = true
                     })
                 } else {
                     SettingRow("Delete group", "Erase this group and its messages from this phone", Icons.Rounded.DeleteForever, onClick = {
@@ -396,19 +387,19 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                     colors = colors,
                     modifier = Modifier.clickable { safetyFor = row; selected = null },
                 )
-                if (amAdmin && row.role != Role.INVITED) {
-                    val isAdmin = row.role == Role.ADMIN
+                if (amOwner && row.role == Role.MEMBER) {
                     ListItem(
-                        headlineContent = { Text(if (isAdmin) "Remove as admin" else "Make admin") },
+                        headlineContent = { Text("Make owner") },
+                        supportingContent = { Text("They'll manage the group instead of you") },
                         leadingContent = { Icon(Icons.Rounded.AdminPanelSettings, null) },
                         colors = colors,
                         modifier = Modifier.clickable {
                             selected = null
-                            act("Updating ${row.name}…") { Groups.setAdmin(s, cid, row.id, !isAdmin) }
+                            confirmOwner = row
                         },
                     )
                 }
-                if (amAdmin) {
+                if (amOwner) {
                     ListItem(
                         headlineContent = { Text(if (row.role == Role.INVITED) "Cancel invitation" else "Remove from group", color = MaterialTheme.colorScheme.error) },
                         leadingContent = { Icon(Icons.Rounded.PersonRemove, null, tint = MaterialTheme.colorScheme.error) },
@@ -456,7 +447,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                         if (row.isContact) {
                             "Compare this with the number on ${row.name}'s phone."
                         } else {
-                            "${row.name} isn't in your contacts, so this number came from the group's admins. Compare it with them in person or on a call."
+                            "${row.name} isn't in your contacts, so this number came from the group's owner. Compare it with them in person or on a call."
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -513,17 +504,21 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
             }
         }
     }
-    if (promoteFirst) {
-        AlertDialog(
-            onDismissRequest = { promoteFirst = false },
-            title = { Text("Choose a new admin first") },
-            text = { Text("You're the only admin. Make someone else an admin (tap them in the member list), then leave.") },
-            confirmButton = { TextButton(onClick = { promoteFirst = false }) { Text("OK") } },
-        )
+    confirmOwner?.let { row ->
+        ConfirmDialog(
+            "Make ${row.name} the owner?", "Only the owner can add and remove people, rename the group or change its timer. You'll stay in the group.",
+            "Make owner", false, { confirmOwner = null },
+        ) { act("Updating ${row.name}…") { Groups.makeOwner(s, cid, row.id) } }
     }
     if (confirmLeave) {
+        val heir = if (r?.isOwner(g.me) == true) Groups.heir(m, g.me) else null
+        val owner = when {
+            r?.isOwner(g.me) != true -> ""
+            heir != null -> " ${g.members.firstOrNull { it.id == heir }?.name ?: "The next member"} will become the owner."
+            else -> " Nobody else can manage the group after you."
+        }
         ConfirmDialog(
-            "Leave ${c.name}?", "You'll stop getting messages from this group. The chat stays on this phone until you delete it.",
+            "Leave ${c.name}?", "You'll stop getting messages from this group. The chat stays on this phone until you delete it.$owner",
             "Leave", true, { confirmLeave = false },
         ) { act("Leaving the group…") { Groups.leave(s, cid) } }
     }

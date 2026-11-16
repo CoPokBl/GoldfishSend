@@ -106,8 +106,9 @@ adversary.
   review before any message is accepted.
 
 ### Groups
-Groups (`docs/groups.md`) are pairwise libsignal sessions to each member plus a signed member list (roster) and signed
-member cards. There's no group state on any server.
+Groups (`docs/groups.md`) are pairwise libsignal sessions to each member, plus a member list (roster) signed by the
+group's owner, members' own signed accepts and leaves (facts), and signed member cards. There's no group state on any
+server.
 - **The server** sees one ordinary mailbox per member per group, and N sends from the sender's IP when a message fans
   out (as N 1:1 messages would). It can't tell group traffic from 1:1 traffic, see who's in a group, or link two
   messages from the same member: the sender hint is a random-nonce HMAC only members can check.
@@ -115,17 +116,31 @@ member cards. There's no group state on any server.
   `sendSecret` only for that group). Members who aren't your contacts are marked unverified; you can compare safety
   numbers with each of them. A member can do what any contact can: keep what's said, and send junk to your group inbox
   (dropped unless it decrypts from a current member).
-- **Admins** decide membership. A malicious admin can add anyone, including someone impersonating a person (an
-  identity key the admin vouches for), remove people, or rename the group. Everyone sees these changes as signed
-  system lines, and the added person's safety number can be compared. Admins can't read anything sent before the new
-  member joined, and can't forge messages from other members.
-- **Non-admins** can only leave, accept or decline (and rename or set the timer if the group allows it). A forged or
-  modified roster is rejected unless an admin of the current roster signed it.
+- **The owner** decides membership, and is trusted to. A malicious owner can:
+  - add anyone, including someone impersonating a person (an identity key the owner vouches for);
+  - remove people, or rename the group;
+  - **equivocate:** sign two different rosters at the same version and show each to different members. Members would
+    disagree about who's in until the owner's next roster; this isn't detected. A member next in line can do the same
+    once the owner leaves, by sending their own departure to some members while signing as the owner for the rest.
+
+  Everyone sees the owner's changes as signed system lines, and the added person's safety number can be compared. The
+  owner can't read anything sent before a new member joined, and can't forge messages or facts from other members.
+- **Members** can only accept, decline or leave, by facts they sign about their own stint.
+  - **Replaying.** A fact about an earlier stint (before they were removed and invited again) is ignored.
+  - **Forging.** A forged or modified roster is rejected unless the current roster's owner signed it. The one
+    exception: the next member may sign once the owner has left, and only with the departures that make them next as
+    proof.
+  - **Flooding.** Facts are capped: one of each kind per stint, and 2 per member for stints we can't place yet.
 - **Removed members** stop receiving at once (nobody encrypts to them any more), and every remaining member moves to a
   new inbox, so they can't even send noise for long. What they received before stays with them. Their old sessions
   carry nothing new.
-- **Residual:** concurrent changes converge but can briefly differ between members; membership is eventually
-  consistent. If every admin loses their phone, membership can't change any more (members can still leave).
+- **The server** can drop, delay, reorder or replay messages. Replays and reordering change nothing (rosters are chained;
+  facts are idempotent). Dropping only delays: a member who misses rosters asks any member for the chain, which checks
+  itself.
+- **Residual:**
+  - **Eventual consistency.** Membership can briefly differ between members while facts and rosters travel.
+  - **A lost owner.** If the owner loses their phone (rather than leaving), membership can't change any more. Members
+    can still talk, accept, decline and leave.
 
 ### Strangers and abusers
 Anyone without a capability.
@@ -195,8 +210,8 @@ Malware with root, accessibility or notification access, or a keyboard that uplo
 - **Proof of work:** it isn't memory-hard.
 - **Server key:** `ServerKey` never expires. If it leaks, someone who can also intercept TLS can impersonate the server
   until you replace it, and replacing it warns every user.
-- **Group members who aren't contacts** are vouched for by an admin. Until you compare safety numbers with them, a
-  malicious admin could slip in an impostor.
+- **Group members who aren't contacts** are vouched for by the owner. Until you compare safety numbers with them, a
+  malicious owner could slip in an impostor.
 
 ## Advice for users
 - Scan QR codes in person when you can. Compare safety numbers for important contacts.

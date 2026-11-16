@@ -61,6 +61,10 @@ class GroupStatefulTest {
     }
 
     // ---------- found by randomScenarios, shrunk (see GroupFindingsTest for some of them written out) ----------
+    //
+    // Most of these were found under the earlier design, with admins and a fork rule (docs/groups-redesign.md), and say
+    // what went wrong then. The steps mean the same under the owner design (role changes are ownership transfers now),
+    // so each still runs, as a scenario its fix has to keep working.
 
     /** Bob joined before Alice's card reached him: his card went to no one, so nobody could write to him. */
     @Test
@@ -337,6 +341,262 @@ class GroupStatefulTest {
     @Test
     fun adminsRemoveEachOther() =
         scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 211, 0, 0), Op(3, 0, 16, 0)))
+
+    /**
+     * Seed 2549 (and the forks fuzzer, inputs last-admin-departure-lost*): Bob left before he heard Alice had made him an
+     * admin, then Alice left. Bob's departure lost the fork, and the only admin who could apply it was Bob, whose inbox
+     * was gone. The case that showed the fork rule couldn't be patched; now Bob's departure is a fact, and the next member
+     * takes over.
+     */
+    @Test
+    fun departureOfTheLastAdminLostAFork() = scenario(
+        7L,
+        listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 121, 0, 0), Op(11, 0, 0, 0), Op(4, 0, 186, 0), Op(1, 0, 0, 0), Op(0, 98, 0, 0), Op(1, 106, 0, 0)),
+    )
+
+    /**
+     * Bob removed Alice while she invited Dave. The removal won, and Dave, who only knows Alice, waited on an invitation
+     * nobody else knew of: Alice tells him it's off.
+     */
+    @Test
+    fun invitationLostToTheInvitersRemoval() =
+        scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 0, 0), Op(4, 0, 11, 0), Op(11, 0, 0, 0), Op(3, 56, 0, 0), Op(2, 0, 98, 0)))
+
+    /** Seed 2549 itself, shrunk under the fork rule (Mallory's forks around the same departures). */
+    @Test
+    fun seed2549() = scenario(
+        2549L,
+        listOf(
+            Op(2, 0, 138, 0), Op(11, 0, 0, 0), Op(12, 0, 0, 0), Op(8, 5, 0, 0), Op(12, 0, 0, 0), Op(8, 0, 0, 0), Op(12, 0, 0, 0),
+            Op(0, 101, 0, 0), Op(12, 0, 0, 0), Op(8, 0, 18, 248), Op(8, 84, 230, 185), Op(4, 0, 201, 0), Op(0, 178, 0, 0),
+            Op(1, 46, 0, 0), Op(1, 0, 0, 0),
+        ),
+    )
+
+    /** The scenario fuzzer's last finding under the fork rule (input removed-but-still-a-member): Carol out, yet a member. */
+    @Test
+    fun removedButStillAMember() = scenario(
+        1L,
+        listOf(
+            Op(2, 0, 98, 0), Op(8, 21, 94, 196), Op(0, 71, 0, 0), Op(3, 83, 0, 0), Op(0, 54, 0, 0), Op(0, 83, 0, 0), Op(2, 0, 102, 0),
+            Op(5, 0, 0, 0), Op(8, 0, 200, 0), Op(8, 229, 229, 229), Op(5, 0, 0, 254), Op(10, 29, 0, 1), Op(9, 0, 0, 0),
+            Op(8, 41, 125, 0), Op(8, 0, 136, 229), Op(11, 0, 0, 0), Op(0, 82, 0, 0), Op(4, 0, 38, 0),
+        ),
+    )
+
+    // ---------- found under the owner design ----------
+
+    /**
+     * Found by GroupScenarioFuzzTest (input acceptance-the-new-owner-never-heard): Alice made Bob the owner while
+     * Mallory joined; Mallory's acceptance reached only Alice. First-hand recipients now pass facts on to the owner.
+     */
+    @Test
+    fun acceptanceTheNewOwnerNeverHeard() =
+        scenario(0L, listOf(Op(11, 0, 0, 0), Op(0, 76, 0, 0), Op(8, 0, 75, 0), Op(4, 0, 11, 0), Op(0, 94, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input newcomer-card-only-the-old-owner-had): Carol joined after Alice, the
+     * owner, left; her card reached nobody who could pass it on. An acceptance now carries the newcomer's card.
+     */
+    @Test
+    fun newcomerCardOnlyTheOldOwnerHad() =
+        scenario(7L, listOf(Op(8, 255, 0, 0), Op(5, 0, 0, 0), Op(2, 0, 42, 0), Op(0, 166, 0, 0), Op(8, 255, 0, 0), Op(1, 0, 0, 0), Op(0, 42, 0, 0)))
+
+    /** Seed 1108: Alice left right after inviting; her departure overtook the invitation (1:1 isn't ordered) and was dropped. */
+    @Test
+    fun departureThatOvertookTheInvitation() = scenario(1108L, listOf(Op(1, 0, 0, 0), Op(8, 169, 160, 0), Op(11, 0, 0, 0), Op(0, 101, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest (input reinvited-past-a-gap-after-the-owner-left): Carol, removed, was invited again
+     * past a gap; she asked for what she'd missed, but the owner had left. A re-invitation is taken on its owner's word.
+     */
+    @Test
+    fun reinvitedPastAGapAfterTheOwnerLeft() = scenario(
+        0L,
+        listOf(Op(8, 0, 0, 0), Op(2, 0, 212, 0), Op(8, 0, 255, 0), Op(3, 0, 67, 0), Op(0, 36, 0, 0), Op(8, 0, 83, 0), Op(2, 0, 102, 0), Op(1, 0, 0, 0)),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input departure-held-only-by-the-old-owner): Dave passed Mallory's departure on
+     * to Alice, the owner, who left; Bob took over without it. A new owner now gets the facts its members hold.
+     */
+    @Test
+    fun departureHeldOnlyByTheOldOwner() = scenario(
+        7L,
+        listOf(Op(2, 0, 223, 0), Op(8, 71, 109, 0), Op(0, 31, 0, 0), Op(0, 78, 0, 0), Op(0, 74, 0, 0), Op(8, 138, 185, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0)),
+    )
+
+    /**
+     * Seed 1236: Mallory, next in line, sent her departure only to some, and signed rosters as owner for the rest. An
+     * invitee who heard it decided the group had nobody left to own it, and for good.
+     */
+    @Test
+    fun selectiveDepartureOfTheNextOwner() = scenario(
+        1236L,
+        listOf(
+            Op(8, 188, 0, 0), Op(0, 184, 0, 0), Op(8, 158, 149, 0), Op(8, 12, 0, 0), Op(8, 251, 163, 96), Op(12, 0, 0, 0), Op(9, 0, 0, 0),
+            Op(1, 0, 0, 0), Op(8, 122, 181, 0), Op(2, 114, 43, 0), Op(0, 1, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest (input reinvitation-kept-from-a-departure): Carol kept Alice's re-invitation as a
+     * roster beyond a gap (it came inside Alice's departure), and so ignored it when it came again as her invitation.
+     */
+    @Test
+    fun reinvitationKeptFromADeparture() = scenario(
+        2L,
+        listOf(
+            Op(2, 0, 238, 0), Op(2, 0, 212, 0), Op(8, 91, 128, 0), Op(8, 2, 49, 212), Op(3, 0, 67, 0), Op(0, 94, 0, 0), Op(8, 13, 13, 0),
+            Op(8, 100, 0, 0), Op(2, 0, 22, 0), Op(1, 13, 0, 0), Op(1, 0, 0, 0), Op(9, 0, 0, 0), Op(8, 0, 31, 0), Op(0, 1, 0, 0),
+        ),
+    )
+
+    /**
+     * Seed 1367: Mallory, next in line once Alice left, sent a departure carrying an old roster and went on signing as the
+     * owner: an owner equivocating. Members can't prevent that; the harness checks only safety then. (Before, a sync
+     * request was also suppressed for a gap whose first ask had gone to someone else.)
+     */
+    @Test
+    fun nextOwnerEquivocates() = scenario(
+        1367L,
+        listOf(
+            Op(8, 43, 0, 0), Op(0, 204, 0, 0), Op(8, 59, 38, 0), Op(8, 27, 30, 70), Op(2, 0, 113, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0),
+            Op(9, 0, 0, 0), Op(8, 209, 0, 0), Op(8, 0, 88, 0), Op(0, 253, 0, 0), Op(0, 11, 0, 0),
+        ),
+    )
+
+    /** Found by GroupScenarioFuzzTest.forks (input departures-in-a-group-nobody-owns): members of a dead group disagreed. */
+    @Test
+    fun departuresInAGroupNobodyOwns() =
+        scenario(7L, listOf(Op(2, 0, 223, 0), Op(8, 71, 109, 0), Op(0, 8, 0, 0), Op(0, 1, 0, 0), Op(12, 0, 0, 0), Op(1, 0, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest (input old-stints-card-kept): Carol joined an invitation already withdrawn, then
+     * joined again when re-invited; Alice kept the first card (same `seq`) and wrote to its deleted inbox.
+     */
+    @Test
+    fun oldStintsCardKept() =
+        scenario(0L, listOf(Op(2, 0, 98, 0), Op(2, 0, 212, 0), Op(8, 2, 125, 0), Op(3, 0, 67, 0), Op(2, 0, 102, 0), Op(0, 82, 0, 0), Op(11, 0, 0, 0), Op(0, 82, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input owner-whose-rosters-reached-nobody): Bob took over, signed two rosters
+     * nobody could receive (he had no one's card yet), and left. His departure carried only the newest, so Dave could
+     * never place it. A departure now carries the run of rosters its author signed.
+     */
+    @Test
+    fun ownerWhoseRostersReachedNobody() = scenario(
+        7L,
+        listOf(
+            Op(2, 0, 28, 0), Op(2, 0, 202, 0), Op(8, 255, 164, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(12, 0, 0, 109), Op(1, 0, 0, 0),
+            Op(0, 138, 0, 0), Op(8, 138, 199, 0), Op(5, 66, 0, 0), Op(1, 31, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest (input departure-heard-while-out): Carol, removed, heard Alice's departure, then was
+     * invited again; the departure had been dropped, so she kept Alice as the owner. Facts heard while out are kept.
+     */
+    @Test
+    fun departureHeardWhileOut() = scenario(
+        0L,
+        listOf(
+            Op(8, 21, 0, 0), Op(2, 0, 212, 0), Op(8, 2, 0, 0), Op(3, 0, 67, 0), Op(0, 94, 0, 0), Op(0, 36, 0, 0), Op(8, 125, 83, 0),
+            Op(2, 0, 102, 0), Op(1, 0, 0, 0), Op(1, 89, 0, 0), Op(8, 91, 75, 0), Op(11, 0, 0, 0), Op(0, 67, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input withdrawn-invitation-nobody-can-tell): Bob, the owner after Alice left,
+     * withdrew Dave's invitation; nobody still in could reach Dave. Now if Dave joins, Bob answers his acceptance.
+     */
+    @Test
+    fun withdrawnInvitationNobodyCanTell() {
+        scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(3, 81, 118, 0)))
+        scenario(7L, listOf(Op(2, 0, 28, 0), Op(8, 255, 0, 0), Op(0, 16, 0, 0), Op(11, 0, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(3, 81, 118, 0), Op(0, 3, 0, 0)))
+    }
+
+    /**
+     * Found by GroupScenarioFuzzTest (input owner-by-succession-after-a-handover): Alice made Dave the owner just as he
+     * left, then left herself; Bob, next in line, took over. Correct: the harness hadn't counted that as a succession.
+     */
+    @Test
+    fun ownerBySuccessionAfterAHandover() =
+        scenario(0L, listOf(Op(2, 0, 98, 0), Op(8, 21, 0, 0), Op(0, 71, 0, 0), Op(0, 83, 0, 0), Op(11, 0, 0, 0), Op(1, 78, 0, 0), Op(4, 0, 48, 0), Op(1, 0, 0, 0)))
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input old-card-after-joining-again): Dave, removed and invited again, joined;
+     * he only had Bob's card from before Bob's inbox moved, and Bob, holding a card of Dave's already, sent him nothing.
+     * Every member who learns of an acceptance now sends the newcomer its card.
+     */
+    @Test
+    fun oldCardAfterJoiningAgain() = scenario(
+        7L,
+        listOf(
+            Op(8, 223, 0, 0), Op(2, 0, 128, 0), Op(2, 0, 127, 0), Op(5, 0, 0, 0), Op(0, 1, 0, 0), Op(11, 0, 0, 0), Op(3, 0, 28, 0),
+            Op(10, 0, 0, 0), Op(2, 0, 28, 0), Op(0, 3, 0, 0), Op(8, 255, 255, 0), Op(10, 37, 0, 111), Op(7, 0, 0, 0), Op(8, 255, 255, 0),
+            Op(0, 103, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest (input sync-ask-that-could-not-go-out): Carol, invited, missed rosters and asked the
+     * owner, who wasn't her contact, so the ask went nowhere; once she had joined, a new ask was suppressed as a repeat.
+     */
+    @Test
+    fun syncAskThatCouldNotGoOut() = scenario(
+        0L,
+        listOf(
+            Op(2, 0, 98, 0), Op(8, 21, 0, 0), Op(8, 2, 0, 0), Op(0, 94, 0, 0), Op(0, 36, 0, 0), Op(8, 125, 0, 0), Op(2, 0, 102, 0),
+            Op(0, 98, 0, 0), Op(1, 0, 0, 0), Op(11, 0, 0, 0), Op(1, 78, 0, 0), Op(8, 78, 0, 0), Op(0, 82, 0, 0),
+        ),
+    )
+
+    /**
+     * Found by GroupScenarioFuzzTest.forks (input reinvited-while-still-invited): Dave got his re-invitation past a gap
+     * before the roster that had taken him out (still invited, or joined); he took that, and the re-invitation was never
+     * looked at again. A kept re-invitation now counts once we're out.
+     */
+    @Test
+    fun reinvitedWhileStillInvited() {
+        scenario(
+            7L,
+            listOf(
+                Op(8, 223, 224, 0), Op(2, 0, 128, 0), Op(8, 0, 0, 0), Op(0, 31, 0, 0), Op(0, 64, 0, 0), Op(8, 255, 255, 0), Op(8, 255, 255, 0),
+                Op(8, 255, 255, 0), Op(8, 255, 255, 0), Op(8, 223, 255, 0), Op(3, 0, 28, 0), Op(8, 223, 224, 0), Op(2, 0, 128, 0), Op(1, 0, 0, 0),
+                Op(8, 0, 0, 0), Op(8, 255, 255, 0),
+            ),
+        )
+        scenario(
+            7L,
+            listOf(
+                Op(8, 223, 224, 0), Op(2, 0, 128, 0), Op(8, 0, 0, 0), Op(0, 31, 0, 0), Op(0, 64, 0, 0), Op(0, 8, 0, 0), Op(8, 255, 255, 0),
+                Op(8, 255, 255, 0), Op(8, 255, 255, 0), Op(8, 255, 255, 0), Op(8, 223, 255, 0), Op(3, 0, 28, 0), Op(8, 223, 224, 0),
+                Op(2, 0, 128, 0), Op(1, 0, 0, 0), Op(8, 255, 255, 0), Op(8, 255, 112, 111), Op(8, 0, 255, 0),
+            ),
+        )
+    }
+
+    /** Seed 3839: Mallory, the owner by succession, signed two rosters at one version (her forks): equivocation, safety only. */
+    @Test
+    fun seed3839OwnerEquivocates() = scenario(3839L, GroupScenario.generate(3839L, length(3839L)))
+
+    /**
+     * Found by GroupScenarioFuzzTest and .forks (inputs removal-to-an-old-stints-card, withdrawal-to-an-old-stints-card):
+     * Carol (or Alice) was invited again, then removed; the removal went to a card of hers from an earlier stint, whose
+     * inbox was gone. Invitees are now reached over 1:1 first.
+     */
+    @Test
+    fun removalToAnOldStintsCard() {
+        scenario(2L, listOf(Op(2, 0, 212, 0), Op(11, 0, 0, 0), Op(3, 0, 67, 0), Op(0, 42, 0, 0), Op(2, 0, 212, 0), Op(11, 0, 0, 0), Op(3, 0, 67, 0)))
+        scenario(
+            7L,
+            listOf(
+                Op(8, 255, 0, 0), Op(5, 0, 0, 0), Op(0, 44, 0, 0), Op(8, 255, 255, 0), Op(8, 0, 255, 0), Op(2, 0, 42, 0), Op(1, 0, 0, 0),
+                Op(8, 255, 0, 0), Op(8, 255, 255, 0), Op(8, 0, 0, 0), Op(8, 0, 185, 0), Op(0, 42, 0, 0), Op(2, 44, 0, 0), Op(3, 44, 0, 0),
+            ),
+        )
+    }
 
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 

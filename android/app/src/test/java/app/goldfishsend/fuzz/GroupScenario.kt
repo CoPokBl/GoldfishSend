@@ -6,6 +6,8 @@ import app.goldfishsend.core.ReceiveGuard
 import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupModel
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.Fact
+import app.goldfishsend.proto.FactKind
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.GroupBlob
@@ -17,6 +19,7 @@ import app.goldfishsend.proto.RosterMember
 import app.goldfishsend.proto.RosterOp
 import app.goldfishsend.proto.RosterRules
 import app.goldfishsend.proto.SignedRoster
+import app.goldfishsend.proto.View
 
 /**
  * One step of a group scenario. Its numbers are read against the state at that point (see [GroupScenario.apply]): a step
@@ -35,10 +38,10 @@ class Failure(val message: String, val cause: Throwable? = null) {
 
 /**
  * Alice creates a group and invites Bob and Mallory; Carol and Dave can be added. Mallory is a member who also misbehaves:
- * she replays and forges rosters and cards, claims to be others, sends junk chunks, and lends a stranger (Sam) cards. Pushes
- * are delivered in random order, duplicated, or held back and delivered later. After the steps, everything still queued
- * is delivered, then the invariants are checked: honest members agree, nobody did what only an admin may, nothing honest
- * was lost, and those who are out can't read or post.
+ * she replays and forges rosters, facts and cards, claims to be others, sends junk chunks, and lends a stranger (Sam)
+ * cards. Pushes are delivered in random order, duplicated, or held back and delivered later. After the steps, everything
+ * still queued is delivered, then the invariants are checked: honest members agree, nobody did what only the owner may,
+ * nothing honest was lost, and those who are out can't read or post.
  */
 class GroupScenario(private val seed: Long) {
     private val net = GroupNet()
@@ -55,6 +58,12 @@ class GroupScenario(private val seed: Long) {
     // What honest actions and Mallory's own did, for the invariants.
     private val added = mutableSetOf<String>()
     private val promoted = mutableSetOf(alice.id)
+
+    /** An owner left at some point: someone took over by succession. */
+    private var ownerLeft = false
+
+    /** The newest roster Mallory claimed to hold when she sent a departure of hers (her client carried on regardless). */
+    private var malloryLeftAt: Long? = null
     private val churned = mutableSetOf<String>()
     private val joined = mutableSetOf<String>()
 
@@ -134,7 +143,8 @@ class GroupScenario(private val seed: Long) {
             0 -> {
                 val p = peer(op.a)
                 val m = model(p) ?: return
-                if (m.state == GroupModel.INVITED && m.roster?.roster?.role(p.id) == Role.INVITED) {
+                // Nobody can admit us while the group has no owner (everyone who could own it left).
+                if (m.state == GroupModel.INVITED && m.roster?.roster?.role(p.id) == Role.INVITED && m.view()?.owner != null) {
                     log("${p.name} joins")
                     p.join(gid)
                     joined += p.id
@@ -145,6 +155,9 @@ class GroupScenario(private val seed: Long) {
                 val m = model(p) ?: return
                 if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
                     return
+                }
+                if (m.view()?.isOwner(p.id) == true) {
+                    ownerLeft = true
                 }
                 if (p.engine.leave(m)) {
                     log("${p.name} leaves")
@@ -164,24 +177,20 @@ class GroupScenario(private val seed: Long) {
                 }
             }
             4 -> admin(op) { a, t ->
-                val admin = op.c % 2 == 0
-                if (admin && t == mallory) {
+                if (op.c % 2 != 0 || t == mallory) {
                     return@admin
                 }
-                if (a.publish(gid, RosterOp.SetRole(t.id, if (admin) Role.ADMIN else Role.MEMBER)) != null) {
-                    log("${a.name} makes ${t.name} ${if (admin) "admin" else "member"}")
-                    if (admin) {
-                        promoted += t.id
-                    }
+                if (a.publish(gid, RosterOp.MakeOwner(t.id)) != null) {
+                    log("${a.name} makes ${t.name} the owner")
+                    promoted += t.id
                 }
             }
             5 -> {
                 val p = peer(op.a)
                 joinedModel(p) ?: return
                 val change = when (Math.floorMod(op.b, 3)) {
-                    0 -> RosterOp.Meta(name = "Trip ${Math.floorMod(op.c, 100)}")
                     1 -> RosterOp.Meta(timer = listOf(0L, 30L, 3600L, 86400L)[Math.floorMod(op.c, 4)])
-                    else -> RosterOp.Meta(adminsOnly = op.c % 2 == 0)
+                    else -> RosterOp.Meta(name = "Trip ${Math.floorMod(op.c, 100)}")
                 }
                 if (p.publish(gid, change) != null) {
                     log("${p.name} sets $change")
@@ -219,7 +228,7 @@ class GroupScenario(private val seed: Long) {
         val a = peer(op.a)
         val t = peer(op.b)
         val m = joinedModel(a) ?: return
-        if (a == t || m.roster?.roster?.isAdmin(a.id) != true) {
+        if (a == t || m.view()?.isOwner(a.id) != true) {
             return
         }
         block(a, t)
@@ -258,7 +267,12 @@ class GroupScenario(private val seed: Long) {
         when (Math.floorMod(op.a, 8)) {
             0 -> {
                 val history = mallory.store.historySince(gid, 0)
-                if (history.isNotEmpty()) {
+                val facts = heard.toList()
+                if (op.c % 2 == 1 && facts.isNotEmpty()) {
+                    val f = facts[Math.floorMod(op.c / 2, facts.size)]
+                    log("mallory replays ${who(f.fact.id)}'s ${f.fact.kind} (${f.fact.since}) to ${target.name}")
+                    toTarget(target, GroupEngine.factContent(f))
+                } else if (history.isNotEmpty()) {
                     val r = history[Math.floorMod(op.c, history.size)]
                     log("mallory replays v${r.roster.ver} by ${who(r.roster.by)} to ${target.name}")
                     toTarget(target, GroupEngine.rosterContent(r))
@@ -320,49 +334,67 @@ class GroupScenario(private val seed: Long) {
         val base = cur.roster
         val change: Roster = when (Math.floorMod(c, 5)) {
             0 -> base.copy(members = base.members.filter { it.id != target.id })
-            1 -> base.copy(members = base.members + RosterMember(sam.id, Role.MEMBER))
-            2 -> base.copy(members = base.members.map { if (it.id == mallory.id) it.copy(role = Role.ADMIN) else it })
-            3 -> base.copy(members = base.members.map { if (it.role == Role.ADMIN) it.copy(role = Role.MEMBER) else it } +
-                listOf(RosterMember(mallory.id, Role.ADMIN)).filter { base.role(mallory.id) == null })
+            1 -> base.copy(members = base.members + RosterMember(sam.id, Role.MEMBER, base.ver + 1))
+            2 -> base.copy(members = base.members.map { if (it.id == mallory.id) it.copy(role = Role.OWNER) else it })
+            3 -> base.copy(members = base.members.map { if (it.role == Role.OWNER) it.copy(role = Role.MEMBER) else it } +
+                listOf(RosterMember(mallory.id, Role.OWNER, base.ver + 1)).filter { base.role(mallory.id) == null })
             else -> base.copy(name = "Owned")
         }
-        val stamped = when (Math.floorMod(c / 5, 4)) {
-            0 -> RosterRules.successor(cur, change, mallory.id, now / 1000)
+        // Her own departure as "proof" that she's the successor: it isn't (it doesn't end anyone else's stint).
+        val proof = listOfNotNull(myLeave(base)?.wire())
+        val stamped = when (Math.floorMod(c / 5, 5)) {
+            0 -> RosterRules.successor(cur, change, mallory.id, now / 1000, emptyList())
             1 -> change.copy(by = mallory.id, ts = now / 1000)
-            2 -> RosterRules.successor(cur, change, mallory.id, now / 1000).copy(ver = base.ver + 3)
-            else -> RosterRules.successor(cur, change, alice.id, now / 1000)
+            2 -> RosterRules.successor(cur, change, mallory.id, now / 1000, emptyList()).copy(ver = base.ver + 3)
+            3 -> RosterRules.successor(cur, change, mallory.id, now / 1000, proof)
+            else -> RosterRules.successor(cur, change, alice.id, now / 1000, emptyList())
         }
         log("mallory forges v${stamped.ver} (${Math.floorMod(c, 5)}) to ${target.name}")
         toTarget(target, GroupEngine.rosterContent(GroupCrypto.signRoster(mallory.identity.privateKey, stamped)))
     }
 
     /**
-     * Mallory signs a change of her own on a roster some versions back (a rename, or her own departure), grinding its
-     * hash, and sends it to everyone: a fork she'd like to win.
+     * Mallory goes back to a roster some versions old and, from there, either signs a change of her own on it as if she
+     * were its owner (a fork she'd like to win), or her departure from the stint it lists, carrying that old roster as
+     * the newest she knows (a successor taking over from it would fork). Either goes to everyone.
      */
     private fun forkAttack(op: Op) {
         model(mallory) ?: return
         var at = mallory.store.load(gid)?.roster ?: return
         repeat(1 + Math.floorMod(op.a, 4)) {
-            at = mallory.store.history(gid, at.roster.prev) ?: return@repeat
+            at = mallory.store.history(gid, at.roster.prev)?.takeIf { it.roster.ver == at.roster.ver - 1 } ?: return@repeat
         }
         val base = at.roster
-        if (base.role(mallory.id) == null) {
-            return
+        val mine = base.member(mallory.id) ?: return
+        val content: Content = if (op.c % 3 == 0) {
+            val f = GroupCrypto.signFact(
+                mallory.identity.privateKey,
+                Fact(g = gid, kind = FactKind.LEAVE, id = mallory.id, since = mine.since, ts = now / 1000 + Math.floorMod(op.b, 8), last = listOf(at.wire())),
+            )
+            if (model(mallory)?.roster?.roster?.member(mallory.id)?.since == mine.since) {
+                churned += mallory.id
+            }
+            malloryLeftAt = minOf(malloryLeftAt ?: base.ver, base.ver)
+            log("mallory leaves from v${base.ver} (stint ${mine.since})")
+            GroupEngine.factContent(f)
+        } else {
+            val change = base.copy(name = "Fork ${msg++}")
+            log("mallory forks at v${base.ver}")
+            GroupEngine.rosterContent(GroupCrypto.signRoster(mallory.identity.privateKey, RosterRules.successor(at, change, mallory.id, now / 1000, emptyList())))
         }
-        val leave = base.adminsOnly || op.c % 3 == 0
-        val change = if (leave) base.copy(members = base.members.filter { it.id != mallory.id }) else base.copy(name = "Fork ${msg++}")
-        val best = (0 until 1 + Math.floorMod(op.b, 8)).map { i ->
-            GroupCrypto.signRoster(mallory.identity.privateKey, RosterRules.successor(at, change, mallory.id, now / 1000 + i))
-        }.maxWithOrNull { x, y -> RosterRules.compareUnsigned(x.hash, y.hash) } ?: return
-        if (leave) {
-            churned += mallory.id
-        }
-        log("mallory forks at v${base.ver} (${if (leave) "leave" else "rename"})")
         for (t in honest) {
-            toTarget(t, GroupEngine.rosterContent(best))
+            toTarget(t, content)
         }
     }
+
+    /** A departure of Mallory's from her stint in [r], if she has one there. */
+    private fun myLeave(r: Roster) = r.member(mallory.id)?.let {
+        GroupCrypto.signFact(mallory.identity.privateKey, Fact(g = gid, kind = FactKind.LEAVE, id = mallory.id, since = it.since, ts = now / 1000))
+    }
+
+    /** Facts Mallory has seen (she's a member: they reach her), for replaying. */
+    private val heard: List<app.goldfishsend.proto.SignedFact>
+        get() = honest.flatMap { p -> model(p)?.facts.orEmpty() }.distinctBy { it.key }
 
     private fun toTarget(target: Peer, content: Content) {
         val card = mallory.store.routes[gid]?.get(target.id)?.card
@@ -382,30 +414,57 @@ class GroupScenario(private val seed: Long) {
         if (inGroup.isEmpty()) {
             return null
         }
-        val rosters = inGroup.map { it.roster(gid) }
-        if (rosters.map { it.hashB64 }.toSet().size != 1) {
-            return Failure("diverged: ${inGroup.map { p -> "${p.name} v${p.roster(gid).roster.ver} ${describe(p.roster(gid).roster)}" }}")
+        val views = inGroup.map { it.view(gid) }
+        if (equivocated()) {
+            // Mallory became the owner (next in line once others left) and signed rosters after her own departure: an
+            // owner equivocating, which members can't prevent (docs/threat-model.md). Only safety is checked.
+            return safety(views.first())
         }
-        val r = rosters.first().roster
+        if (views.all { it.owner == null }) {
+            // Nobody left to manage it, for everyone: nobody can join, talk or change anything any more, and who's still
+            // listed isn't kept in step (there's no owner to pass facts on). Only safety is checked.
+            return safety(views.first())
+        }
+        if (inGroup.map { it.roster(gid).hashB64 + " " + describe(it.view(gid)) }.toSet().size != 1) {
+            return Failure("diverged: ${inGroup.map { p -> "${p.name} ${describe(p.view(gid))}" }}")
+        }
+        val r = views.first()
+        // Nobody left to manage it (the owner left, and no member to take over): nobody can join, nothing changes, and
+        // acceptances don't count (Membership.view). Then only agreement and safety are checked.
+        return (if (r.owner == null) null else liveness(r)) ?: safety(r)
+    }
+
+    /** [p] is invited, and nobody honest still in [r] has them as a contact. */
+    private fun unreachable(p: Peer, r: View): Boolean = honest.none { q -> q != p && r.isActive(q.id) && p.id in q.contacts }
+
+    /**
+     * Mallory, the owner at some point (next in line once others left), equivocated: two rosters of hers at one version,
+     * or rosters signed after a departure of hers.
+     */
+    private fun equivocated(): Boolean {
+        val hers = honest.flatMap { p -> p.store.historySince(gid, 0).filter { it.roster.by == mallory.id } }.distinctBy { it.hashB64 }
+        if (hers.groupBy { it.roster.ver }.any { it.value.size > 1 }) {
+            return true
+        }
+        val at = malloryLeftAt ?: return false
+        return hers.any { it.roster.ver > at }
+    }
+
+    private fun liveness(r: View): Failure? {
         for (p in honest) {
             val m = model(p)
             val role = r.role(p.id)
             val ok = when {
                 m == null -> role == null
-                role == Role.ADMIN || role == Role.MEMBER -> m.state == GroupModel.JOINED
+                role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED
                 role == Role.INVITED -> m.state == GroupModel.INVITED
+                // A withdrawn invitation nobody can tell them about: they have no inbox yet, and none of the members they
+                // know is still in. They find out if they join (the owner answers their acceptance).
+                role == null && m.state == GroupModel.INVITED -> unreachable(p, r)
                 else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
             }
             if (!ok) {
                 return Failure("state: ${p.name} is ${m?.state} but $role in ${describe(r)}")
-            }
-        }
-        for (mem in r.members) {
-            if (mem.id != alice.id && mem.id !in added) {
-                return Failure("authority: ${who(mem.id)} is in the roster but nobody added them: ${describe(r)}")
-            }
-            if (mem.role == Role.ADMIN && mem.id !in promoted) {
-                return Failure("authority: ${who(mem.id)} is admin but nobody made them one: ${describe(r)}")
             }
         }
         for (p in honest) {
@@ -416,7 +475,7 @@ class GroupScenario(private val seed: Long) {
                 return Failure("lost invitation: ${p.name} is ${r.role(p.id)} in ${describe(r)}")
             }
         }
-        for (p in inGroup) {
+        for (p in honest.filter { joinedModel(it) != null }) {
             val cards = model(p)!!.cards
             for (q in honest.filter { it != p && r.isActive(it.id) }) {
                 val want = model(q)?.myCard?.card?.seq
@@ -425,7 +484,6 @@ class GroupScenario(private val seed: Long) {
                 }
             }
         }
-        val byBody = said.associateBy { it.body }
         for (s in said) {
             for (to in s.to) {
                 val rcpt = honest.firstOrNull { it.id == to } ?: continue
@@ -437,6 +495,20 @@ class GroupScenario(private val seed: Long) {
                 }
             }
         }
+        return null
+    }
+
+    private fun safety(r: View): Failure? {
+        for (mem in r.members) {
+            if (mem.id != alice.id && mem.id !in added) {
+                return Failure("authority: ${who(mem.id)} is in the roster but nobody added them: ${describe(r)}")
+            }
+            // Someone made owner (or Alice) who left hands it to the next member: then anyone may be the owner by now.
+            if (mem.role == Role.OWNER && mem.id !in promoted && !ownerLeft && promoted.none { it in churned }) {
+                return Failure("authority: ${who(mem.id)} is the owner but nobody made them one: ${describe(r)}")
+            }
+        }
+        val byBody = said.associateBy { it.body }
         for (p in peers) {
             for ((g, from, body) in p.texts) {
                 if (g != gid) {
@@ -457,7 +529,7 @@ class GroupScenario(private val seed: Long) {
     /** Whoever is out now tries to post through every card they still have. Nobody may take it. */
     private fun afterwards(): Failure? {
         val inGroup = honest.filter { joinedModel(it) != null }
-        val r = inGroup.firstOrNull()?.roster(gid)?.roster ?: return null
+        val r = inGroup.firstOrNull()?.view(gid) ?: return null
         val before = honest.associateWith { it.texts.size }
         for (x in peers.filter { !r.isActive(it.id) && model(it) != null }) {
             for ((id, card) in x.store.routes[gid].orEmpty()) {
@@ -476,8 +548,8 @@ class GroupScenario(private val seed: Long) {
         return null
     }
 
-    private fun describe(r: Roster) = "v${r.ver} by ${who(r.by)} " + r.members.joinToString(",", "[", "]") { "${who(it.id)}:${it.role.take(1)}" } +
-        " \"${r.name}\""
+    private fun describe(v: View) = "v${v.roster.ver} by ${who(v.roster.by)} " + v.members.joinToString(",", "[", "]") { "${who(it.id)}:${it.role.take(1)}" } +
+        " \"${v.name}\""
 
     companion object {
         @Volatile

@@ -132,25 +132,26 @@ class PoisonMessageTest {
         net.deliverAll()
         bob.join(gid)
         net.deliverAll()
-        // Bob gets Carol's texts before anything telling him she joined (Alice relays that): they're held.
+        // Bob gets Carol's texts before anything telling him she joined (her acceptance, or Alice's roster): they're held.
         val late = mutableListOf<GroupNet.Envelope>()
         net.filter = { e ->
             val fromAlice = e is GroupNet.Envelope.ToInbox && e.to == bob && e.from == alice || e is GroupNet.Envelope.Direct && e.to == bob
-            if (fromAlice) {
+            val carolsAcceptance = e is GroupNet.Envelope.ToInbox && e.to == bob && e.from == carol && e.what == "GFact"
+            if (fromAlice || carolsAcceptance) {
                 late += e
             }
-            !fromAlice
+            !fromAlice && !carolsAcceptance
         }
         carol.join(gid)
         carol.say(gid, "poison")
         carol.say(gid, "fine")
         net.deliverAll()
-        assertEquals(Role.INVITED, bob.roster(gid).roster.role(carol.id))
+        assertEquals(Role.INVITED, bob.view(gid).role(carol.id))
         assertEquals(2, bob.store.held(gid).size)
         net.filter = { true }
         net.queue.addAll(late)
         net.deliverAll()
-        assertEquals(Role.MEMBER, bob.roster(gid).roster.role(carol.id))
+        assertEquals(Role.MEMBER, bob.view(gid).role(carol.id))
         assertEquals(alice.roster(gid).hashB64, bob.roster(gid).hashB64)
         assertTrue(bob.texts.any { it.third == "fine" })
         assertEquals(listOf("held group message"), drops)

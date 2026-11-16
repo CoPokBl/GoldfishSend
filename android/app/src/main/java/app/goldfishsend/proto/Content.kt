@@ -88,6 +88,11 @@ sealed class Content {
     @SerialName("gleave")
     data class GLeave(val g: String) : Content()
 
+    /** A member's signed accept or leave (docs/groups.md, "Facts"). */
+    @Serializable
+    @SerialName("gfact")
+    data class GFact(val g: String, val fact: String, val sig: String) : Content()
+
     /** The group this content belongs to, or null for 1:1 content. */
     val groupId: String?
         get() = when (this) {
@@ -98,6 +103,7 @@ sealed class Content {
             is GCard -> g
             is GSync -> g
             is GLeave -> g
+            is GFact -> g
             else -> null
         }
 

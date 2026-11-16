@@ -54,8 +54,8 @@ class GroupSimulationTest {
     fun createInviteJoinAndMessageBetweenNonContacts() {
         threeMembers()
         assertConverged(alice, bob, carol)
-        val r = alice.roster(gid).roster
-        assertEquals(listOf(Role.ADMIN, Role.MEMBER, Role.MEMBER), listOf(alice.id, bob.id, carol.id).map { r.role(it) })
+        val r = alice.view(gid)
+        assertEquals(listOf(Role.OWNER, Role.MEMBER, Role.MEMBER), listOf(alice.id, bob.id, carol.id).map { r.role(it) })
         // Everyone has everyone else's card.
         assertEquals(setOf(alice.id, carol.id), bob.model(gid).cards.keys)
         assertEquals(setOf(alice.id, bob.id), carol.model(gid).cards.keys)
@@ -85,21 +85,22 @@ class GroupSimulationTest {
     }
 
     @Test
-    fun concurrentAdminChangesConvergeAndBothSurvive() {
+    fun ownershipMovesAndOnlyTheOwnerChangesTheGroup() {
         threeMembers()
-        alice.publish(gid, RosterOp.SetRole(bob.id, Role.ADMIN))
-        net.deliverAll()
-        assertTrue(bob.roster(gid).roster.isAdmin(bob.id))
-        // Both admins change the roster before seeing each other's change.
         assertNotNull(alice.publish(gid, RosterOp.Meta(name = "Road trip")))
+        alice.publish(gid, RosterOp.MakeOwner(bob.id))
+        net.deliverAll()
+        assertTrue(carol.view(gid).isOwner(bob.id))
+        assertTrue(alice.events.any { it.second == GroupEvent.OwnerChanged(alice.id, bob.id) })
+        // Alice is a member now: she can't sign a roster any more.
+        assertEquals(null, alice.publish(gid, RosterOp.Meta(timer = 60)))
         assertNotNull(bob.publish(gid, RosterOp.Meta(timer = 3600)))
         net.deliverAll()
         assertConverged(alice, bob, carol)
-        val r = carol.roster(gid).roster
-        // The loser re-applied its change on top of the winner, so both are in.
+        val r = carol.view(gid)
         assertEquals("Road trip", r.name)
         assertEquals(3600L, r.timer)
-        assertTrue(r.ver >= 4)
+        assertEquals(Role.MEMBER, r.role(alice.id))
     }
 
     @Test
@@ -114,7 +115,7 @@ class GroupSimulationTest {
         assertEquals(GroupModel.REMOVED, carol.model(gid).state)
         assertTrue(carol.events.any { it.second == GroupEvent.YouWereRemoved(alice.id) })
         assertConverged(alice, bob)
-        assertEquals(listOf(alice.id, bob.id), bob.roster(gid).roster.ids())
+        assertEquals(listOf(alice.id, bob.id), bob.view(gid).ids())
         // The remaining members moved to new inboxes (new cards) and told each other.
         assertEquals(2L, alice.model(gid).cards[bob.id]!!.card.seq)
         assertEquals(2L, bob.model(gid).cards[alice.id]!!.card.seq)
@@ -141,6 +142,7 @@ class GroupSimulationTest {
         net.deliverAll()
         assertEquals(GroupModel.LEFT, bob.model(gid).state)
         assertTrue(alice.events.any { it.second == GroupEvent.Left(bob.id) })
+        assertEquals(listOf(alice.id, carol.id), carol.view(gid).ids())
         assertEquals(listOf(alice.id, carol.id), carol.roster(gid).roster.ids())
         assertFalse(carol.model(gid).cards.containsKey(bob.id))
         alice.say(gid, "bye bob")
@@ -149,16 +151,31 @@ class GroupSimulationTest {
         assertTrue(texts(carol).contains("bye bob"))
     }
 
+    /** Once "the last admin must promote someone first": now leaving always works, and the group passes on. */
     @Test
-    fun lastAdminMustPromoteBeforeLeaving() {
+    fun anOwnerWhoLeavesHandsTheGroupToTheNextMember() {
         threeMembers()
-        assertFalse(alice.engine.leave(alice.model(gid)))
-        alice.publish(gid, RosterOp.SetRole(carol.id, Role.ADMIN))
-        net.deliverAll()
         assertTrue(alice.engine.leave(alice.model(gid)))
         net.deliverAll()
-        assertTrue(carol.roster(gid).roster.isAdmin(carol.id))
-        assertEquals(listOf(bob.id, carol.id), bob.roster(gid).roster.ids())
+        assertConverged(bob, carol)
+        assertTrue(carol.view(gid).isOwner(bob.id))
+        assertEquals(listOf(bob.id, carol.id), carol.roster(gid).roster.ids())
+        assertTrue(carol.events.any { it.second == GroupEvent.Left(alice.id) })
+        // Bob can manage it, and does.
+        assertNotNull(bob.publish(gid, RosterOp.Meta(name = "Bob's trip")))
+        net.deliverAll()
+        assertEquals("Bob's trip", carol.view(gid).name)
+    }
+
+    @Test
+    fun anOwnerCanChooseWhoTakesOver() {
+        threeMembers()
+        alice.publish(gid, RosterOp.MakeOwner(carol.id))
+        alice.engine.leave(alice.model(gid))
+        net.deliverAll()
+        assertConverged(bob, carol)
+        assertTrue(bob.view(gid).isOwner(carol.id))
+        assertEquals(listOf(bob.id, carol.id), bob.view(gid).ids())
     }
 
     @Test
@@ -170,20 +187,20 @@ class GroupSimulationTest {
         carol.engine.leave(carol.model(gid))
         net.deliverAll()
         assertConverged(alice, bob)
-        assertEquals(listOf(alice.id, bob.id), alice.roster(gid).roster.ids())
+        assertEquals(listOf(alice.id, bob.id), alice.view(gid).ids())
     }
 
     @Test
     fun missedRostersAreRecoveredWithSync() {
         threeMembers()
-        // Bob misses everything Alice sends for a while: Dave's invitation and Carol's promotion.
+        // Bob misses everything Alice sends for a while: Dave's invitation and a timer change.
         net.filter = { e -> !(e is GroupNet.Envelope.ToInbox && e.to == bob && e.from == alice) }
         alice.publish(gid, RosterOp.Add(listOf(dave.id)))
         net.deliverAll()
         dave.join(gid)
         net.filter = { e -> !(e is GroupNet.Envelope.ToInbox && e.to == bob && e.from == alice) && !(e.to() == bob && e.from() == dave) }
         net.deliverAll()
-        alice.publish(gid, RosterOp.SetRole(carol.id, Role.ADMIN))
+        alice.publish(gid, RosterOp.Meta(timer = 60))
         net.deliverAll()
         assertTrue(net.dropped > 0)
         assertTrue(bob.roster(gid).roster.ver < alice.roster(gid).roster.ver)
@@ -202,14 +219,13 @@ class GroupSimulationTest {
     }
 
     /**
-     * Found on the emulator: Bob joins (v2) while Carol, still invited, never hears about it. Carol then joins on top of v1,
-     * so her acceptance is a concurrent v2 that may lose the tie. Whichever wins, everyone must end up agreeing that Bob
-     * and Carol are both members, and Bob and Carol must be able to talk, even when the first thing Carol hears afterwards is
-     * a later roster from Alice. Repeated so both tie outcomes are covered.
+     * Found on the emulator: Bob joins while Carol, still invited, never hears about it; then Carol joins. Everyone must
+     * end up agreeing that Bob and Carol are both members, and Bob and Carol must be able to talk, even when the first
+     * thing Carol hears afterwards is a later roster from Alice.
      */
     @Test
     fun aLateJoinOnAStaleRosterStillLands() {
-        repeat(8) { run ->
+        repeat(2) { run ->
             val net = GroupNet()
             val a = net.peer("alice")
             val b = net.peer("bob")
@@ -233,8 +249,8 @@ class GroupSimulationTest {
             net.deliverAll()
             val hashes = listOf(a, b, c).map { it.roster(g).hashB64 }.toSet()
             assertEquals("run $run: rosters differ: ${listOf(a, b, c).map { it.roster(g).roster.ver }}", 1, hashes.size)
-            val r = a.roster(g).roster
-            assertEquals("run $run", listOf(Role.ADMIN, Role.MEMBER, Role.MEMBER), listOf(a.id, b.id, c.id).map { r.role(it) })
+            val r = a.model(g).view()!!
+            assertEquals("run $run", listOf(Role.OWNER, Role.MEMBER, Role.MEMBER), listOf(a.id, b.id, c.id).map { r.role(it) })
             b.say(g, "hi carol")
             c.say(g, "hi bob")
             net.deliverAll()
@@ -263,13 +279,13 @@ class GroupSimulationTest {
     }
 
     @Test
-    fun nonAdminsCantChangeMembership() {
+    fun onlyTheOwnerChangesMembership() {
         threeMembers()
         // Carol's client is modified: it signs a roster removing Bob and sends it to everyone.
         assertEquals(null, carol.publish(gid, RosterOp.Remove(listOf(bob.id))))
         val base = carol.roster(gid)
         val forged = app.goldfishsend.proto.RosterRules.successor(
-            base, base.roster.copy(members = base.roster.members.filter { it.id != bob.id }), carol.id, 0,
+            base, base.roster.copy(members = base.roster.members.filter { it.id != bob.id }), carol.id, 0, emptyList(),
         )
         val signed = app.goldfishsend.proto.GroupCrypto.signRoster(carol.identity.privateKey, forged)
         for (to in listOf(alice, bob)) {

@@ -1,6 +1,5 @@
 package app.goldfishsend.proto
 
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.signal.libsignal.protocol.IdentityKey
@@ -38,44 +37,94 @@ data class GroupCard(
     val seq: Long,
 )
 
+/** Signed bytes as they travel inside another document: b64u bytes and b64u signature. */
 @Serializable
-data class RosterMember(val id: String, val role: String)
+data class Signed(val data: String, val sig: String)
 
+/** [since]: the version of the roster that invited them, which names this stint of theirs in the group. */
+@Serializable
+data class RosterMember(val id: String, val role: String, val since: Long)
+
+/**
+ * The member list, signed by its owner. [proof]: when the owner of the roster before this one has left, the departures
+ * (signed facts) that make [by] their successor.
+ */
 @Serializable
 data class Roster(
-    val v: Int = 1,
+    val v: Int = 2,
     val g: String,
     val ver: Long,
     val prev: String = "",
     val name: String,
     val timer: Long = 0,
-    val adminsOnly: Boolean = true,
     val members: List<RosterMember>,
     val by: String,
     val ts: Long,
+    val proof: List<Signed> = emptyList(),
 ) {
-    fun role(id: String): String? = members.firstOrNull { it.id == id }?.role
+    fun member(id: String): RosterMember? = members.firstOrNull { it.id == id }
 
-    fun isAdmin(id: String): Boolean = role(id) == Role.ADMIN
+    fun role(id: String): String? = member(id)?.role
 
-    /** In the roster and past the invitation stage. */
-    fun isActive(id: String): Boolean = role(id).let { it == Role.ADMIN || it == Role.MEMBER }
+    val owner: String? get() = members.firstOrNull { it.role == Role.OWNER }?.id
 
     fun ids(): List<String> = members.map { it.id }
 }
 
 object Role {
-    const val ADMIN = "admin"
+    const val OWNER = "owner"
     const val MEMBER = "member"
     const val INVITED = "invited"
 
-    val ALL = setOf(ADMIN, MEMBER, INVITED)
+    val ALL = setOf(OWNER, MEMBER, INVITED)
+}
+
+/** A member's signed statement about their own stint ([since]): they accepted the invitation, or left (or declined). */
+@Serializable
+data class Fact(
+    val v: Int = 2,
+    val g: String,
+    val kind: String,
+    val id: String,
+    val since: Long,
+    val ts: Long,
+    /**
+     * On a departure: the newest rosters the leaver held, oldest first (the run they signed themselves at the end of
+     * their chain, or else just the newest), so whoever takes over from them builds on them.
+     */
+    val last: List<Signed> = emptyList(),
+    /** On an acceptance: the member's card, so whoever learns they're in can reach them. */
+    val card: Signed? = null,
+) {
+    /** The newest of [last]'s versions (0 if none, -1 if any is unreadable). */
+    val lastVer: Long by lazy {
+        if (last.isEmpty()) {
+            return@lazy 0L
+        }
+        runCatching {
+            last.maxOf { w -> GroupJson.decodeFromString(Roster.serializer(), B64.dec(w.data).toString(Charsets.UTF_8)).ver }
+        }.getOrDefault(-1L)
+    }
+}
+
+object FactKind {
+    const val ACCEPT = "accept"
+    const val LEAVE = "leave"
 }
 
 /** Exact bytes as signed, plus the parsed value. Nothing is ever re-serialised for verification. */
 class SignedRoster(val bytes: ByteArray, val sig: ByteArray, val roster: Roster) {
     val hash: ByteArray = Hash.sha256(bytes)
     val hashB64: String = B64.enc(hash)
+
+    fun wire() = Signed(B64.enc(bytes), B64.enc(sig))
+}
+
+class SignedFact(val bytes: ByteArray, val sig: ByteArray, val fact: Fact) {
+    /** One fact of each kind counts per stint. */
+    val key: String get() = "${fact.id} ${fact.since} ${fact.kind}"
+
+    fun wire() = Signed(B64.enc(bytes), B64.enc(sig))
 }
 
 class SignedCard(val bytes: ByteArray, val sig: ByteArray, val card: GroupCard)
@@ -89,11 +138,15 @@ val GroupJson = Json {
 
 object GroupCrypto {
     private val CARD_LABEL = "gf/group-card/v1".utf8()
-    private val ROSTER_LABEL = "gf/group-roster/v1".utf8()
+    private val ROSTER_LABEL = "gf/group-roster/v2".utf8()
+    private val FACT_LABEL = "gf/group-fact/v2".utf8()
     private val HINT_LABEL = "gf/group-hint/v1".utf8()
     const val HINT_NONCE = 16
     const val HINT_MAC = 16
     const val HINT_KEY = 32
+
+    /** Rosters a departure carries at most (see [Fact.last]). */
+    const val MAX_LAST = 8
 
     /** A b64u identity key in canonical form (33 bytes, DJB type 0x05), or null. */
     fun identityBytes(id: String): ByteArray? = try {
@@ -127,9 +180,14 @@ object GroupCrypto {
         return SignedRoster(bytes, priv.calculateSignature(ROSTER_LABEL + bytes), roster)
     }
 
+    fun signFact(priv: ECPrivateKey, fact: Fact): SignedFact {
+        val bytes = GroupJson.encodeToString(Fact.serializer(), fact).utf8()
+        return SignedFact(bytes, priv.calculateSignature(FACT_LABEL + bytes), fact)
+    }
+
     /** Parses a roster and checks its signature under `by`. Structure is checked separately ([RosterRules.wellFormed]). */
     fun openRoster(bytes: ByteArray, sig: ByteArray): SignedRoster? {
-        if (bytes.size > 64 * 1024) {
+        if (bytes.size > 96 * 1024) {
             return null
         }
         val r = try {
@@ -137,11 +195,34 @@ object GroupCrypto {
         } catch (e: Exception) {
             return null
         }
-        if (r.v != 1 || !verify(r.by, ROSTER_LABEL, bytes, sig)) {
+        if (r.v != 2 || !verify(r.by, ROSTER_LABEL, bytes, sig)) {
             return null
         }
         return SignedRoster(bytes, sig, r)
     }
+
+    fun openRoster(w: Signed): SignedRoster? = runCatching { openRoster(B64.dec(w.data), B64.dec(w.sig)) }.getOrNull()
+
+    /** Parses a fact and checks its signature under `id` and its form. Whether it applies is [Membership]'s business. */
+    fun openFact(bytes: ByteArray, sig: ByteArray): SignedFact? {
+        if (bytes.size > 96 * 1024) {
+            return null
+        }
+        val f = try {
+            GroupJson.decodeFromString(Fact.serializer(), bytes.toString(Charsets.UTF_8))
+        } catch (e: Exception) {
+            return null
+        }
+        if (f.v != 2 || f.since < 1 || (f.kind != FactKind.ACCEPT && f.kind != FactKind.LEAVE) || !verify(f.id, FACT_LABEL, bytes, sig)) {
+            return null
+        }
+        if ((f.last.isNotEmpty() && (f.kind != FactKind.LEAVE || f.lastVer < 1 || f.last.size > MAX_LAST)) || (f.card != null && f.kind != FactKind.ACCEPT)) {
+            return null
+        }
+        return SignedFact(bytes, sig, f)
+    }
+
+    fun openFact(w: Signed): SignedFact? = runCatching { openFact(B64.dec(w.data), B64.dec(w.sig)) }.getOrNull()
 
     /**
      * Parses a card and checks its signature under `id`, the bundle's prekey signatures under the same key, and the field
@@ -213,28 +294,109 @@ class GroupBlob(val type: Int, val nonce: ByteArray, val mac: ByteArray, val bod
     }
 }
 
-/** A membership or settings change, re-applied on top of a concurrent winner if ours lost (docs/groups.md, rule 3). */
-@Serializable
-sealed class RosterOp {
-    /** The changed roster (members and settings only; the caller stamps version, prev, author and time), or null if not applicable. */
-    abstract fun apply(base: Roster, me: String): Roster?
+/**
+ * The membership everyone acts on (docs/groups.md, "The view"): the roster with the facts held for its stints applied.
+ * [members] keeps the roster's order; roles are effective ones: the [owner] (who may sign the next roster) is `owner`, an
+ * invitee who accepted is `member`, and anyone whose stint ended is gone.
+ */
+class View(val roster: Roster, val members: List<RosterMember>, val owner: String?) {
+    fun member(id: String): RosterMember? = members.firstOrNull { it.id == id }
 
-    @Serializable
-    @SerialName("add")
+    fun role(id: String): String? = member(id)?.role
+
+    fun isOwner(id: String): Boolean = owner == id
+
+    /** In the group and past the invitation stage. */
+    fun isActive(id: String): Boolean = role(id).let { it == Role.OWNER || it == Role.MEMBER }
+
+    fun ids(): List<String> = members.map { it.id }
+
+    val name: String get() = roster.name
+    val timer: Long get() = roster.timer
+}
+
+/** Facts against a roster: pure functions, so every member who holds the same ones computes the same view. */
+object Membership {
+    /**
+     * Whether [f] is about a stint [r] lists (and, for an acceptance, one still invited). A departure that carries a
+     * roster newer than [r] waits until [r] has caught up with it: whoever takes over from the leaver must build on it.
+     */
+    fun applies(r: Roster, f: Fact): Boolean {
+        val m = r.member(f.id) ?: return false
+        return f.g == r.g && m.since == f.since && (f.kind == FactKind.LEAVE || m.role == Role.INVITED) && f.lastVer in 0..r.ver
+    }
+
+    /** Not about a stint of [r], and not one that may come later either: over, or never was. */
+    fun stale(r: Roster, f: Fact): Boolean = !applies(r, f) && f.since <= r.ver && f.lastVer in 0..r.ver
+
+    /** Members of [r] whose stint a held departure ended. */
+    fun gone(r: Roster, facts: Collection<Fact>): Set<String> =
+        facts.filter { it.kind == FactKind.LEAVE && applies(r, it) }.map { it.id }.toSet()
+
+    /**
+     * Who may sign the roster after [r]: its owner, unless they left; then the first `member`, in roster order, who hasn't.
+     * Only departures count, never acceptances, so of two honest members only one can believe it's them.
+     */
+    fun owner(r: Roster, facts: Collection<Fact>): String? {
+        val gone = gone(r, facts)
+        r.owner?.takeIf { it !in gone }?.let { return it }
+        return r.members.firstOrNull { it.role == Role.MEMBER && it.id !in gone }?.id
+    }
+
+    /**
+     * The view. With nobody left to own the group (the owner and every member left), it's over: acceptances nobody took
+     * in don't count either, so everyone still listed is only invited, whatever they heard.
+     */
+    fun view(r: Roster, facts: Collection<Fact>): View {
+        val gone = gone(r, facts)
+        val owner = owner(r, facts)
+        val accepted = if (owner == null) emptySet() else facts.filter { it.kind == FactKind.ACCEPT && applies(r, it) }.map { it.id }.toSet()
+        val members = r.members.filter { it.id !in gone }.map {
+            val role = when {
+                it.id == owner -> Role.OWNER
+                it.role == Role.OWNER -> Role.MEMBER
+                it.role == Role.INVITED && it.id in accepted -> Role.MEMBER
+                else -> it.role
+            }
+            if (role == it.role) it else it.copy(role = role)
+        }
+        return View(r, members, owner)
+    }
+
+    /**
+     * The roster [me] signs after [base] if they're its effective owner: departures taken out, acceptances made members,
+     * [me] the owner.
+     */
+    fun fold(base: Roster, facts: Collection<Fact>, me: String): Roster {
+        val v = view(base, facts)
+        return base.copy(members = v.members.map { if (it.role == Role.OWNER && it.id != me) it.copy(role = Role.MEMBER) else it })
+    }
+
+    /**
+     * The departures the roster after [base] carries as its proof: every one it folds. They make a successor's signature
+     * checkable on its own, and tell members who missed a departure that it was one (not a removal).
+     */
+    fun departures(base: Roster, facts: Collection<Fact>): List<Fact> =
+        facts.filter { it.kind == FactKind.LEAVE && applies(base, it) }.distinctBy { it.id }
+}
+
+/** A change only the owner makes. Facts held are folded in first ([Membership.fold]). */
+sealed class RosterOp {
+    /** The changed roster (members and settings only; the caller stamps version, prev, author and time), or null. */
+    abstract fun apply(base: Roster, me: String, ver: Long): Roster?
+
     data class Add(val ids: List<String>) : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? {
+        override fun apply(base: Roster, me: String, ver: Long): Roster? {
             val fresh = ids.distinct().filter { base.role(it) == null && it != me }
             if (fresh.isEmpty()) {
                 return null
             }
-            return base.copy(members = base.members + fresh.map { RosterMember(it, Role.INVITED) })
+            return base.copy(members = base.members + fresh.map { RosterMember(it, Role.INVITED, ver) })
         }
     }
 
-    @Serializable
-    @SerialName("remove")
     data class Remove(val ids: List<String>) : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? {
+        override fun apply(base: Roster, me: String, ver: Long): Roster? {
             val drop = ids.toSet() - me
             if (base.members.none { it.id in drop }) {
                 return null
@@ -243,78 +405,27 @@ sealed class RosterOp {
         }
     }
 
-    @Serializable
-    @SerialName("role")
-    data class SetRole(val id: String, val role: String) : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? {
-            val cur = base.role(id) ?: return null
-            if (cur == Role.INVITED || cur == role || role == Role.INVITED || role !in Role.ALL) {
+    /** Hands ownership to a member; we stay on as a member. */
+    data class MakeOwner(val id: String) : RosterOp() {
+        override fun apply(base: Roster, me: String, ver: Long): Roster? {
+            if (base.role(id) != Role.MEMBER || base.role(me) != Role.OWNER) {
                 return null
             }
-            return base.copy(members = base.members.map { if (it.id == id) it.copy(role = role) else it })
+            return base.copy(members = base.members.map {
+                when (it.id) {
+                    id -> it.copy(role = Role.OWNER)
+                    me -> it.copy(role = Role.MEMBER)
+                    else -> it
+                }
+            })
         }
     }
 
-    @Serializable
-    @SerialName("meta")
-    data class Meta(val name: String? = null, val timer: Long? = null, val adminsOnly: Boolean? = null) : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? {
-            val next = base.copy(name = name ?: base.name, timer = timer ?: base.timer, adminsOnly = adminsOnly ?: base.adminsOnly)
+    data class Meta(val name: String? = null, val timer: Long? = null) : RosterOp() {
+        override fun apply(base: Roster, me: String, ver: Long): Roster? {
+            val next = base.copy(name = name ?: base.name, timer = timer ?: base.timer)
             return if (next == base) null else next
         }
-    }
-
-    @Serializable
-    @SerialName("leave")
-    data object Leave : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? =
-            if (base.role(me) == null) null else base.copy(members = base.members.filter { it.id != me })
-    }
-
-    /**
-     * An admin records an invitee's acceptance that lost a version tie (the invitee signed it, but a concurrent roster won).
-     * Only used when we hold that signed acceptance; see GroupEngine.enforceAcceptance.
-     */
-    @Serializable
-    @SerialName("admit")
-    data class Admit(val id: String) : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? =
-            if (base.role(id) != Role.INVITED) null else base.copy(members = base.members.map { if (it.id == id) it.copy(role = Role.MEMBER) else it })
-    }
-
-    @Serializable
-    @SerialName("accept")
-    data object Accept : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? =
-            if (base.role(me) != Role.INVITED) null else base.copy(members = base.members.map { if (it.id == me) it.copy(role = Role.MEMBER) else it })
-    }
-
-    /** Several changes in one roster: what a member re-applies after losing a fork. */
-    @Serializable
-    @SerialName("batch")
-    data class Batch(val ops: List<RosterOp>) : RosterOp() {
-        override fun apply(base: Roster, me: String): Roster? {
-            var r = base
-            var changed = false
-            for (op in ops) {
-                op.apply(r, me)?.let {
-                    r = it
-                    changed = true
-                }
-            }
-            return r.takeIf { changed }
-        }
-    }
-
-    fun encode(): String = OpJson.encodeToString(serializer(), this)
-
-    companion object {
-        private val OpJson = Json {
-            classDiscriminator = "op"
-            ignoreUnknownKeys = true
-        }
-
-        fun decode(s: String): RosterOp? = runCatching { OpJson.decodeFromString(serializer(), s) }.getOrNull()
     }
 }
 
@@ -322,107 +433,53 @@ sealed class RosterOp {
 object RosterRules {
     const val MAX_MEMBERS = 100
 
-    /** Rule 1 (structure): this group, at most 100 members, no duplicates, valid ids and roles, at least one admin. */
+    /** Rule 1 (structure): this group, 1 to 100 members, no duplicates, valid ids and roles, exactly one owner. */
     fun wellFormed(r: Roster, g: String): Boolean {
-        if (r.v != 1 || r.g != g || r.ver < 1 || r.members.isEmpty() || r.members.size > MAX_MEMBERS) {
+        if (r.v != 2 || r.g != g || r.ver < 1 || r.members.isEmpty() || r.members.size > MAX_MEMBERS || r.proof.size > MAX_MEMBERS) {
             return false
         }
         if (r.members.map { it.id }.toSet().size != r.members.size) {
             return false
         }
-        if (r.members.any { it.role !in Role.ALL || !GroupCrypto.isIdentity(it.id) }) {
+        if (r.members.any { it.role !in Role.ALL || !GroupCrypto.isIdentity(it.id) || it.since !in 1..r.ver }) {
             return false
         }
-        if (r.members.none { it.role == Role.ADMIN }) {
+        if (r.members.count { it.role == Role.OWNER } != 1) {
             return false
         }
         if (Sanitize.name(r.name) == null || r.timer !in 0..Sanitize.MAX_TIMER_SECS) {
             return false
         }
-        return GroupCrypto.isIdentity(r.by) && (r.ver == 1L || r.prev.isNotEmpty())
-    }
-
-    /**
-     * Rule 2 (authority) of [r] over the roster it changes, [base]. An admin may change anything. Anyone may remove
-     * themselves (leave or decline), and an invited member may accept. If `adminsOnly` is off, an active member may also
-     * change the name and timer, and nothing else.
-     */
-    fun authorized(base: Roster, r: Roster): Boolean {
-        val by = r.by
-        if (base.isAdmin(by)) {
-            return true
-        }
-        val baseRole = base.role(by) ?: return false
-        val newRole = r.role(by)
-        val others = base.members.filter { it.id != by }.toSet() == r.members.filter { it.id != by }.toSet()
-        val metaSame = r.name == base.name && r.timer == base.timer && r.adminsOnly == base.adminsOnly
-        if (!others) {
+        if (!GroupCrypto.isIdentity(r.by)) {
             return false
         }
-        if (metaSame) {
-            return newRole == null || (baseRole == Role.INVITED && newRole == Role.MEMBER)
-        }
-        return !base.adminsOnly && r.adminsOnly == base.adminsOnly && newRole == baseRole && baseRole != Role.INVITED
+        return if (r.ver == 1L) r.prev.isEmpty() && r.owner == r.by && r.proof.isEmpty() else r.prev.isNotEmpty()
     }
-
-    /** [r] can follow [parent]: one version on, and allowed by rule 2. */
-    fun validChild(parent: Roster, r: Roster): Boolean = r.prev.isNotEmpty() && r.ver == parent.ver + 1 && authorized(parent, r)
 
     /**
-     * Fork choice (rule 3): whether branch [a] beats branch [b], both growing from [fork]. Each runs from the fork's child
-     * to the tip on that side. In order:
-     * 1. A branch that takes out the author of the other's first roster wins (a removal beats the removed member's
-     *    change, a departure stands against the leaver's own concurrent change).
-     * 2. More changes made by admins wins: a member who isn't one can't outweigh them, however many rosters they sign.
-     * 3. More distinct authors wins: one member can't outweigh several.
-     * 4. The larger hash of the first roster wins.
+     * Rule 2: [r] can follow [parent]: one version on, signed by the parent's effective owner given the departures in
+     * [proof] (and no others: the roster has to carry what it relies on), none of them listed any more, and every stint
+     * carried over unchanged (a new one starts at [r]'s version, as an invitation).
      */
-    fun beats(fork: Roster, a: List<SignedRoster>, b: List<SignedRoster>): Boolean {
-        val a0 = a.first().roster
-        val b0 = b.first().roster
-        if (a0.by != b0.by) {
-            val aDrops = fork.role(b0.by) != null && a.last().roster.role(b0.by) == null
-            val bDrops = fork.role(a0.by) != null && b.last().roster.role(a0.by) == null
-            if (aDrops != bDrops) {
-                return aDrops
-            }
+    fun validChild(parent: Roster, r: Roster, proof: List<Fact>): Boolean {
+        if (r.ver != parent.ver + 1 || r.prev.isEmpty()) {
+            return false
         }
-        val aw = adminChanges(fork, a)
-        val bw = adminChanges(fork, b)
-        if (aw != bw) {
-            return aw > bw
+        if (proof.size != r.proof.size || proof.any { it.kind != FactKind.LEAVE || !Membership.applies(parent, it) } ||
+            proof.map { it.id }.toSet().size != proof.size
+        ) {
+            return false
         }
-        val aa = a.map { it.roster.by }.toSet().size
-        val ba = b.map { it.roster.by }.toSet().size
-        if (aa != ba) {
-            return aa > ba
+        if (Membership.owner(parent, proof) != r.by || proof.any { f -> r.member(f.id)?.since == f.since }) {
+            return false
         }
-        return compareUnsigned(a.first().hash, b.first().hash) > 0
-    }
-
-    private fun adminChanges(fork: Roster, branch: List<SignedRoster>): Int {
-        var parent = fork
-        var n = 0
-        for (s in branch) {
-            if (parent.isAdmin(s.roster.by)) {
-                n++
-            }
-            parent = s.roster
+        return r.members.all { m ->
+            val p = parent.member(m.id)
+            (p != null && p.since == m.since) || (m.role == Role.INVITED && m.since == r.ver)
         }
-        return n
-    }
-
-    fun compareUnsigned(a: ByteArray, b: ByteArray): Int {
-        for (i in 0 until minOf(a.size, b.size)) {
-            val d = (a[i].toInt() and 0xff) - (b[i].toInt() and 0xff)
-            if (d != 0) {
-                return d
-            }
-        }
-        return a.size - b.size
     }
 
     /** Stamps a changed roster as the successor of [base]. */
-    fun successor(base: SignedRoster, changed: Roster, me: String, nowSecs: Long): Roster =
-        changed.copy(v = 1, ver = base.roster.ver + 1, prev = base.hashB64, by = me, ts = nowSecs)
+    fun successor(base: SignedRoster, changed: Roster, me: String, nowSecs: Long, proof: List<Signed>): Roster =
+        changed.copy(v = 2, ver = base.roster.ver + 1, prev = base.hashB64, by = me, ts = nowSecs, proof = proof)
 }

@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 5
+    const val VERSION = 6
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -214,9 +214,25 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 6) {
+                for (s in V6) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Groups v2 (one owner, membership facts). Groups made before can't be read any more, and nothing was released. */
+    internal val V6 = listOf(
+        "DELETE FROM contacts WHERE is_group = 1",
+        "ALTER TABLE groups DROP COLUMN pending_op",
+        "ALTER TABLE groups DROP COLUMN pending_hash",
+        // Our stint: the `since` of our entry in the roster.
+        "ALTER TABLE groups ADD COLUMN since INTEGER NOT NULL DEFAULT 0",
+        // The facts held (docs/groups.md, "Facts"), one `fact sig` (b64u) per line.
+        "ALTER TABLE groups ADD COLUMN facts TEXT",
+    )
 
     /** Group chats (docs/groups.md). A group is a `contacts` row with is_group = 1, so chats, timers and wipes cover it. */
     internal val V5 = listOf(
