@@ -5,6 +5,8 @@ import app.goldfishsend.group.GroupEvent
 import app.goldfishsend.group.GroupIo
 import app.goldfishsend.group.GroupModel
 import app.goldfishsend.group.GroupStore
+import app.goldfishsend.core.ReceiveGuard
+import app.goldfishsend.db.MAX_CHUNKS_PER_CONTACT
 import app.goldfishsend.group.HeldBlob
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.CardBundle
@@ -45,7 +47,7 @@ class MemoryGroupStore : GroupStore {
 
     private val rows = HashMap<String, Row>()
     private val historyRows = HashMap<String, MutableMap<String, SignedRoster>>()
-    private val chunks = HashMap<String, MutableMap<Int, String>>()
+    private val chunks = LinkedHashMap<String, java.util.TreeMap<Int, String>>()
     private val heldRows = HashMap<String, MutableList<HeldBlob>>()
     private var heldSeq = 0L
 
@@ -56,17 +58,25 @@ class MemoryGroupStore : GroupStore {
         val r = rows[gid] ?: return null
         return GroupModel(
             gid, r.state, r.roster, r.cards.toMutableMap(), r.myCard, r.invitedBy,
-            r.pendingOp?.let { app.goldfishsend.proto.RosterOp.decode(it) }, r.pendingHash,
+            app.goldfishsend.group.Pending.decode(r.pendingOp, r.pendingHash),
         )
     }
 
     override fun save(m: GroupModel) {
-        rows[m.gid] = Row(m.state, m.roster, m.cards.toMap(), m.myCard, m.invitedBy, m.pendingOp?.encode(), m.pendingHash)
+        val (ops, hashes) = app.goldfishsend.group.Pending.encode(m.pending)
+        rows[m.gid] = Row(m.state, m.roster, m.cards.toMap(), m.myCard, m.invitedBy, ops, hashes)
         routes.getOrPut(m.gid) { HashMap() }.putAll(m.cards)
     }
 
-    override fun addHistory(gid: String, r: SignedRoster) {
-        historyRows.getOrPut(gid) { LinkedHashMap() }[r.hashB64] = r
+    /** Like RepoGroupStore.addHistory: siblings capped per version, nothing kept 200 versions behind the newest. */
+    override fun addHistory(gid: String, r: SignedRoster, sibling: Boolean) {
+        val rows = historyRows.getOrPut(gid) { LinkedHashMap() }
+        if (sibling && rows.values.count { it.roster.ver == r.roster.ver } >= GroupEngine.MAX_SIBLINGS) {
+            return
+        }
+        rows.putIfAbsent(r.hashB64, r)
+        val newest = rows.values.maxOf { it.roster.ver }
+        rows.values.removeAll { it.roster.ver < newest - 200 }
     }
 
     override fun history(gid: String, hashB64: String): SignedRoster? = historyRows[gid]?.get(hashB64)
@@ -74,24 +84,47 @@ class MemoryGroupStore : GroupStore {
     override fun historySince(gid: String, since: Long): List<SignedRoster> =
         historyRows[gid]?.values?.filter { it.roster.ver > since }?.sortedBy { it.roster.ver }.orEmpty()
 
+    /** Like Repo.storeChunk and assembleChunks: bounded per group (oldest dropped), complete once parts 0 until [parts] are there. */
     override fun storeChunk(gid: String, key: String, part: Int, parts: Int, data: String): String? {
-        val m = chunks.getOrPut("$gid/$key") { HashMap() }
+        val all = chunks.filterKeys { it.startsWith("$gid/") }
+        if (all.values.sumOf { it.size } >= MAX_CHUNKS_PER_CONTACT) {
+            all.keys.first().let { chunks.remove(it) }
+        }
+        val m = chunks.getOrPut("$gid/$key") { java.util.TreeMap() }
         m[part] = data
-        if (m.size != parts) {
+        if (m.size != parts || m.keys.toList() != (0 until parts).toList()) {
             return null
         }
         chunks.remove("$gid/$key")
-        return (0 until parts).joinToString("") { m[it]!! }
+        return m.values.joinToString("")
     }
 
+    fun chunkRows(gid: String): Int = chunks.filterKeys { it.startsWith("$gid/") }.values.sumOf { it.size }
+
+    /** Bounded like RepoGroupStore.hold. */
     override fun hold(gid: String, hintKey: ByteArray, blob: ByteArray) {
-        heldRows.getOrPut(gid) { mutableListOf() } += HeldBlob(++heldSeq, hintKey, blob)
+        val rows = heldRows.getOrPut(gid) { mutableListOf() }
+        if (rows.size < 200) {
+            rows += HeldBlob(++heldSeq, hintKey, blob)
+        }
     }
 
     override fun held(gid: String): List<HeldBlob> = heldRows[gid].orEmpty().toList()
 
     override fun dropHeld(id: Long) {
         heldRows.values.forEach { l -> l.removeAll { it.id == id } }
+    }
+
+    private val withdrawals = LinkedHashMap<String, Long>()
+
+    override fun withdrawn(gid: String, by: String): Long? = withdrawals["$gid $by"]
+
+    override fun addWithdrawn(gid: String, by: String, ver: Long) {
+        val v = withdrawals.remove("$gid $by")
+        withdrawals["$gid $by"] = maxOf(ver, v ?: ver)
+        while (withdrawals.size > 32) {
+            withdrawals.remove(withdrawals.keys.first())
+        }
     }
 }
 
@@ -116,10 +149,37 @@ class GroupNet {
     /** Reorders what's queued at the start of [deliverAll] (pushes aren't ordered). */
     var reorder: ((List<Envelope>) -> List<Envelope>)? = null
 
-    fun peer(name: String): Peer = Peer(name, this).also { peers += it }
+    /** The members' clock (roster timestamps). Tests that need reproducible roster hashes set a fixed one. */
+    var clock: () -> Long = { System.currentTimeMillis() }
+
+    /** Debug output: who each delivery goes to. */
+    var trace: ((String) -> Unit)? = null
+
+    fun peer(name: String, identity: IdentityKeyPair = IdentityKeyPair.generate()): Peer = Peer(name, this, identity).also { peers += it }
+
+    /** Delivers one envelope, then runs what each member does after a call (held messages, inbox rotation, waiting texts). */
+    fun deliver(e: Envelope) {
+        trace?.invoke(
+            when (e) {
+                is Envelope.ToInbox -> "  ${e.from.name} -> ${e.to.name} (group)"
+                is Envelope.Direct -> "  ${e.from.name} -> ${e.to.name} (1:1) ${e.content.javaClass.simpleName}"
+            },
+        )
+        when (e) {
+            is Envelope.ToInbox -> e.to.onInbox(e.sendSecret, e.blob)
+            is Envelope.Direct -> e.to.engine.onDirect(e.from.id, e.content)
+        }
+        for (p in peers) {
+            p.runDeferred()
+        }
+    }
 
     /** Delivers everything queued (and whatever that causes), in order. */
     fun deliverAll(limit: Int = 100_000) {
+        // Local actions since the last delivery (publish, join) can free held messages too.
+        for (p in peers) {
+            p.runDeferred()
+        }
         reorder?.let { r ->
             val batch = r(queue.toList())
             queue.clear()
@@ -133,25 +193,21 @@ class GroupNet {
                 dropped++
                 continue
             }
-            when (e) {
-                is Envelope.ToInbox -> e.to.onInbox(e.sendSecret, e.blob)
-                is Envelope.Direct -> e.to.engine.onDirect(e.from.id, e.content)
-            }
-            for (p in peers) {
-                p.runDeferred()
-            }
+            deliver(e)
         }
     }
 }
 
-class Peer(val name: String, private val net: GroupNet) {
-    val identity: IdentityKeyPair = IdentityKeyPair.generate()
+class Peer(val name: String, private val net: GroupNet, val identity: IdentityKeyPair = IdentityKeyPair.generate()) {
     val id: String = B64.enc(identity.publicKey.serialize())
     val signal = LastResortStore(identity, 1 + Rand.int(16000))
     val store = MemoryGroupStore()
     val contacts = mutableSetOf<String>()
     val events = mutableListOf<Pair<String, GroupEvent>>()
     val texts = mutableListOf<Triple<String, String, String>>()
+
+    /** A text with this body makes the text handler throw, like a bug or a storage error would. */
+    var failOnText: String? = null
 
     /** gid → our inboxes (newest last): sendSecret → hint key. */
     val inboxes = HashMap<String, LinkedHashMap<String, ByteArray>>()
@@ -206,18 +262,20 @@ class Peer(val name: String, private val net: GroupNet) {
 
     /** What the app does for a text: one gtext per member with a card. */
     /** Like the app: every active member gets it, and members whose card we don't have yet get it once it arrives. */
-    fun say(gid: String, body: String) {
+    fun say(gid: String, body: String, wireId: String = Content.newId()): List<String> {
         val m = model(gid)
         check(m.state == GroupModel.JOINED)
-        val content = Content.GText(gid, Content.newId(), body, System.currentTimeMillis())
+        val content = Content.GText(gid, wireId, body, System.currentTimeMillis())
         val r = m.roster!!.roster
-        for (to in r.members.map { it.id }.filter { it != id && r.isActive(it) }) {
-            if (m.cards[to] != null) {
-                sendGroup(gid, to, content)
+        val to = r.members.map { it.id }.filter { it != id && r.isActive(it) }
+        for (t in to) {
+            if (m.cards[t] != null) {
+                sendGroup(gid, t, content)
             } else {
-                waiting += Triple(gid, to, content)
+                waiting += Triple(gid, t, content)
             }
         }
+        return to
     }
 
     private val waiting = mutableListOf<Triple<String, String, Content>>()
@@ -253,10 +311,24 @@ class Peer(val name: String, private val net: GroupNet) {
     }
 
     fun runDeferred() {
+        replayHeld()
         while (deferred.isNotEmpty()) {
             deferred.removeFirst()()
         }
         flushWaiting()
+    }
+
+    /** Like Groups.replayHeld, after each call: each held message on its own; one that fails is dropped, the rest still go. */
+    fun replayHeld() {
+        while (true) {
+            val ready = engine.readyHeld()
+            if (ready.isEmpty()) {
+                return
+            }
+            for ((g, h) in ready) {
+                ReceiveGuard.run("held group message") { engine.replayHeld(g, h) } ?: store.dropHeld(h.id)
+            }
+        }
     }
 
     fun roster(gid: String) = model(gid).roster!!
@@ -277,10 +349,18 @@ class Peer(val name: String, private val net: GroupNet) {
         override fun onEvents(m: GroupModel, events: List<GroupEvent>) {
             for (e in events) {
                 this@Peer.events += m.gid to e
+                // Like Groups.AppIo: what's still queued to someone who left or was removed is dropped.
+                when (e) {
+                    is GroupEvent.Removed -> waiting.removeAll { it.first == m.gid && it.second in e.ids }
+                    is GroupEvent.Left -> waiting.removeAll { it.first == m.gid && it.second == e.id }
+                    is GroupEvent.YouWereRemoved, GroupEvent.YouLeft -> waiting.removeAll { it.first == m.gid }
+                    else -> Unit
+                }
             }
         }
 
         override fun onText(m: GroupModel, from: String, t: Content.GText) {
+            check(t.body != failOnText) { "handler failed" }
             texts += Triple(m.gid, from, t.body)
         }
 
@@ -301,6 +381,6 @@ class Peer(val name: String, private val net: GroupNet) {
 
         override fun validServer(url: String): Boolean = url.startsWith("https://")
 
-        override fun nowMillis(): Long = System.currentTimeMillis()
+        override fun nowMillis(): Long = net.clock()
     }
 }

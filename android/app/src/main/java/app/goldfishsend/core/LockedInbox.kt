@@ -3,6 +3,7 @@ package app.goldfishsend.core
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Rand
 import java.io.File
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.signal.libsignal.protocol.ecc.ECKeyPair
@@ -43,14 +44,31 @@ object LockedInbox {
 
     /** Opens and processes everything queued while locked, oldest first. */
     suspend fun drain(s: Session) = mutex.withLock {
-        val files = dir().listFiles()?.sortedBy { it.lastModified() } ?: return@withLock
-        if (files.isEmpty()) {
+        if (dir().listFiles().isNullOrEmpty()) {
             return@withLock
         }
         val priv = Graph.inboxPrivateKey(s)
+        drainDir(dir(), { priv.open(it, INFO, ByteArray(0)) }) { kind, body ->
+            when (kind) {
+                KIND_PUSH -> Messenger.handle(s, body)
+                KIND_ENDPOINT -> Mailboxes.onNewEndpoint(
+                    s,
+                    app.goldfishsend.proto.ProtoJson.decodeFromString(PushEndpointData.serializer(), body.toString(Charsets.UTF_8)),
+                )
+            }
+        }
+    }
+
+    /**
+     * Processes the items in [dir], oldest first. Each attempt is counted in the file name before the item is processed,
+     * so an item that keeps failing, or that kills the process (a native crash, out of memory), is tried at most
+     * [MAX_RETRIES] times in all instead of on every unlock, and never holds up the items behind it.
+     */
+    internal suspend fun drainDir(dir: File, open: (ByteArray) -> ByteArray?, handle: suspend (Byte, ByteArray) -> Unit) {
+        val files = dir.listFiles()?.sortedBy { it.lastModified() } ?: return
         for (f in files) {
             val pt = try {
-                priv.open(f.readBytes(), INFO, ByteArray(0))
+                open(f.readBytes())
             } catch (e: Exception) {
                 null
             }
@@ -59,38 +77,33 @@ object LockedInbox {
                 f.delete()
                 continue
             }
-            val body = pt.copyOfRange(1, pt.size)
-            val ok = try {
-                when (pt[0]) {
-                    KIND_PUSH -> Messenger.handle(s, body)
-                    KIND_ENDPOINT -> Mailboxes.onNewEndpoint(
-                        s,
-                        app.goldfishsend.proto.ProtoJson.decodeFromString(PushEndpointData.serializer(), body.toString(Charsets.UTF_8)),
-                    )
-                }
-                true
-            } catch (e: Exception) {
-                android.util.Log.w("LockedInbox", "item failed: ${e.javaClass.simpleName}")
-                false
-            }
-            if (ok) {
-                f.delete()
-            } else {
-                retryLater(f)
+            val claimed = claim(f) ?: continue
+            try {
+                handle(pt[0], pt.copyOfRange(1, pt.size))
+                claimed.delete()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // Kept (already counted) for the next drain.
+                ReceiveGuard.log?.invoke("locked inbox item failed: ${e.javaClass.simpleName}")
             }
         }
     }
 
-    /** Keeps a failed item for a later drain, up to [MAX_RETRIES] times. */
-    private fun retryLater(f: File) {
+    /** Counts an attempt: renames the item to its next try, or deletes it once it has had [MAX_RETRIES]. */
+    private fun claim(f: File): File? {
         val parts = f.name.split('.')
         val tries = parts.getOrNull(1)?.toIntOrNull() ?: MAX_RETRIES
-        if (tries + 1 >= MAX_RETRIES) {
+        if (tries >= MAX_RETRIES) {
             f.delete()
-        } else {
-            f.renameTo(File(f.parentFile, "${parts[0]}.${tries + 1}.bin"))
+            ReceiveGuard.drop("locked inbox", RetriesExhausted())
+            return null
         }
+        val next = File(f.parentFile, "${parts[0]}.${tries + 1}.bin")
+        return if (f.renameTo(next)) next else f
     }
+
+    private class RetriesExhausted : Exception()
 
     /** Creates a fresh key pair. The old private key is overwritten in the DB (secure_delete zeroes the freed page). */
     fun rotateKeys(s: Session) {

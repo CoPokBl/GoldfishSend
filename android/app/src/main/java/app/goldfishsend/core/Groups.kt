@@ -56,8 +56,6 @@ object Groups {
         }
     }
 
-    private const val TAG = "Groups"
-
     /** Group content is chunked for the worst case (a first, PreKey message to a member). */
     const val MAX_PLAINTEXT = Padding.MAX_PREKEY_PLAINTEXT
 
@@ -75,6 +73,28 @@ object Groups {
     fun model(s: Session, cid: Long): GroupModel? = s.repo.groupRef(cid)?.let { store(s).load(it.gid) }
 
     private suspend fun <T> locked(s: Session, block: () -> T): T = s.lock.withLock { s.db.tx { block() } }
+
+    /** Runs [block] on an engine under the lock in one transaction, then delivers the held messages it freed. */
+    private suspend fun <T> withEngine(s: Session, block: (GroupEngine) -> T): T {
+        val e = engine(s)
+        val r = locked(s) { block(e) }
+        replayHeld(s, e)
+        return r
+    }
+
+    /** Each held message in a transaction of its own: one that fails is dropped, and the rest still go. */
+    private suspend fun replayHeld(s: Session, e: GroupEngine) {
+        while (true) {
+            val ready = locked(s) { e.readyHeld() }
+            if (ready.isEmpty()) {
+                return
+            }
+            for ((gid, h) in ready) {
+                ReceiveGuard.runSuspend("held group message") { locked(s) { e.replayHeld(gid, h) } }
+                    ?: locked(s) { store(s).dropHeld(h.id) }
+            }
+        }
+    }
 
     // ---------- create, join, leave ----------
 
@@ -113,11 +133,11 @@ object Groups {
         }
         val (mb, serverKey) = inbox(s)
         val hintKey = Rand.bytes(GroupCrypto.HINT_KEY)
-        val ok = locked(s) {
-            val fresh = model(s, cid) ?: return@locked false
+        val ok = withEngine(s) { e ->
+            val fresh = model(s, cid) ?: return@withEngine false
             val card = newCard(s, fresh.gid, mb, hintKey, serverKey, seq = 1, bundle = null)
             s.repo.bindGroupInbox(mb.id, cid, hintKey)
-            engine(s).join(fresh, card)
+            e.join(fresh, card)
         }
         if (!ok) {
             throw GroupException("Couldn't join. The invitation may have changed; try again.")
@@ -128,12 +148,12 @@ object Groups {
 
     /** Declines an invitation, or leaves. The last admin has to make someone else an admin first. */
     suspend fun leave(s: Session, cid: Long) {
-        val ok = locked(s) {
-            val m = model(s, cid) ?: return@locked true
+        val ok = withEngine(s) { e ->
+            val m = model(s, cid) ?: return@withEngine true
             if (m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED) {
-                return@locked true
+                return@withEngine true
             }
-            engine(s).leave(m)
+            e.leave(m)
         }
         if (!ok) {
             throw GroupException("Make someone else an admin before you leave.")
@@ -149,12 +169,12 @@ object Groups {
     }
 
     private suspend fun change(s: Session, cid: Long, op: RosterOp): Boolean {
-        val done = locked(s) {
-            val m = model(s, cid) ?: return@locked false
+        val done = withEngine(s) { e ->
+            val m = model(s, cid) ?: return@withEngine false
             if (m.state != GroupModel.JOINED) {
-                return@locked false
+                return@withEngine false
             }
-            engine(s).publish(m, op) != null
+            e.publish(m, op) != null
         }
         s.db.notifyChanged()
         Outbox.kick()
@@ -284,12 +304,7 @@ object Groups {
         val cid = mb.contactId ?: return
         val hintKey = mb.hintKey ?: return
         val gid = s.repo.groupRef(cid)?.gid ?: return
-        try {
-            locked(s) { engine(s).receive(gid, hintKey, raw) }
-        } catch (e: Exception) {
-            Log.w(TAG, "dropping group message: ${e.javaClass.simpleName}")
-            return
-        }
+        ReceiveGuard.runSuspend("group message") { withEngine(s) { it.receive(gid, hintKey, raw) } } ?: return
         Mailboxes.onMessageOnMailbox(s, s.repo.mailbox(mb.id) ?: mb)
         s.db.notifyChanged()
         // A member's card may just have arrived, unblocking rows that were waiting for it.
@@ -297,13 +312,9 @@ object Groups {
     }
 
     /** Group content over a 1:1 session (invitations, forwarded cards, rosters for invitees). */
-    fun onDirect(s: Session, contactId: Long, content: Content) {
+    suspend fun onDirect(s: Session, contactId: Long, content: Content) {
         val key = s.repo.contact(contactId)?.identityKey ?: return
-        try {
-            engine(s).onDirect(B64.enc(key), content)
-        } catch (e: Exception) {
-            Log.w(TAG, "dropping group content: ${e.javaClass.simpleName}")
-        }
+        ReceiveGuard.runSuspend("group content") { withEngine(s) { it.onDirect(B64.enc(key), content) } }
         s.db.notifyChanged()
         Outbox.kick()
     }

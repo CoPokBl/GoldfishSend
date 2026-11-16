@@ -37,9 +37,8 @@ class GroupModel(
     var myCard: SignedCard?,
     /** Who invited us (identity key, b64u). */
     var invitedBy: String?,
-    /** The change behind the roster we published last, kept to re-apply it if a concurrent roster wins (rule 3). */
-    var pendingOp: RosterOp?,
-    var pendingHash: String?,
+    /** Our recent changes, kept to re-apply them if a concurrent roster wins (rule 3). Oldest first. */
+    val pending: MutableList<Pending>,
 ) {
     /** Cards of members the last accepted roster removed, in memory only, so the system line can still name them. */
     val departed: MutableMap<String, SignedCard> = mutableMapOf()
@@ -49,6 +48,25 @@ class GroupModel(
         const val JOINED = 1
         const val REMOVED = 2
         const val LEFT = 3
+    }
+}
+
+/** A roster change of ours, and the roster (b64u hash) we published it in. */
+class Pending(val op: RosterOp, val hash: String) {
+    companion object {
+        /** At most this many are kept. An admin's own change and the ones it makes for others (admit, remove) can overlap. */
+        const val MAX = 4
+
+        /** In the store's two text columns, one per line. */
+        fun encode(list: List<Pending>): Pair<String?, String?> =
+            if (list.isEmpty()) null to null else list.joinToString("\n") { it.op.encode() } to list.joinToString("\n") { it.hash }
+
+        fun decode(ops: String?, hashes: String?): MutableList<Pending> {
+            if (ops == null || hashes == null) {
+                return mutableListOf()
+            }
+            return ops.lines().zip(hashes.lines()).mapNotNull { (o, h) -> RosterOp.decode(o)?.let { Pending(it, h) } }.toMutableList()
+        }
     }
 }
 
@@ -77,7 +95,11 @@ interface GroupStore {
     /** Writes the group and replaces its card set with [GroupModel.cards]. */
     fun save(m: GroupModel)
 
-    fun addHistory(gid: String, r: SignedRoster)
+    /**
+     * Stores a roster we accepted, or (with [sibling]) a valid one we didn't take, so that rosters built on it can be
+     * checked. Siblings are capped per version ([GroupEngine.MAX_SIBLINGS]): any member can sign as many as they like.
+     */
+    fun addHistory(gid: String, r: SignedRoster, sibling: Boolean = false)
 
     fun history(gid: String, hashB64: String): SignedRoster?
 
@@ -88,6 +110,12 @@ interface GroupStore {
     fun storeChunk(gid: String, key: String, part: Int, parts: Int, data: String): String?
 
     fun hold(gid: String, hintKey: ByteArray, blob: ByteArray)
+
+    /** The newest roster version from [by] that left us out of [gid] while we had no invitation to it, or null. */
+    fun withdrawn(gid: String, by: String): Long?
+
+    /** Records one for [withdrawn]. Only the newest few (any group) are kept. */
+    fun addWithdrawn(gid: String, by: String, ver: Long)
 
     fun held(gid: String): List<HeldBlob>
 
@@ -149,7 +177,7 @@ class GroupEngine(
         )
         require(RosterRules.wellFormed(r, gid)) { "bad roster" }
         val signed = GroupCrypto.signRoster(identity.privateKey, r)
-        val m = GroupModel(gid, GroupModel.JOINED, signed, mutableMapOf(), myCard, null, null, null)
+        val m = GroupModel(gid, GroupModel.JOINED, signed, mutableMapOf(), myCard, null, mutableListOf())
         store.addHistory(gid, signed)
         store.save(m)
         io.onEvents(m, listOf(GroupEvent.Created))
@@ -173,8 +201,10 @@ class GroupEngine(
         }
         val signed = GroupCrypto.signRoster(identity.privateKey, next)
         dbg { "publish v${next.ver} op=${op.javaClass.simpleName}" }
-        m.pendingOp = op
-        m.pendingHash = signed.hashB64
+        m.pending += Pending(op, signed.hashB64)
+        while (m.pending.size > Pending.MAX) {
+            m.pending.removeAt(0)
+        }
         val cardsBefore = m.cards.toMap()
         accept(m, signed)
         broadcast(m, base.roster, signed, cardsBefore)
@@ -193,7 +223,8 @@ class GroupEngine(
         for (id in m.cards.keys) {
             io.sendGroup(m.gid, id, cardContent(myCard))
         }
-        m.invitedBy?.let { requestSync(m, it, 0) }
+        // Over 1:1 where possible: if the invitation was withdrawn meanwhile, the inviter can still tell us (see onSync).
+        m.invitedBy?.let { if (!io.sendDirect(m.gid, it, Content.GSync(m.gid, 0))) requestSync(m, it, 0) }
         return true
     }
 
@@ -225,7 +256,7 @@ class GroupEngine(
             io.onEvents(m, listOf(GroupEvent.YouLeft))
         }
         // The cards stay until the goodbyes above are delivered; nothing new is sent once we've left.
-        m.pendingOp = null
+        m.pending.clear()
         store.save(m)
         return true
     }
@@ -366,7 +397,7 @@ class GroupEngine(
     /**
      * A message from someone our roster still lists as invited: their acceptance hasn't reached us yet (pushes arrive out of
      * order, and concurrent joins can need a round of re-applying). Keep it until it does, bounded like other held blobs.
-     * It's already decrypted (the session has moved on), so it's kept as content, then replayed by [processHeld].
+     * It's already decrypted (the session has moved on), so it's kept as content, then replayed by [replayHeld].
      */
     private fun holdFromInvitee(gid: String, from: String, content: Content) {
         val m = store.load(gid) ?: return
@@ -395,10 +426,18 @@ class GroupEngine(
         val m = store.load(c.g)
         if (m == null) {
             // An invitation: over 1:1, from its author, who is an admin in it and lists us as invited.
-            if (!direct || r.by != from || !r.isAdmin(from) || r.role(me) != Role.INVITED) {
+            if (!direct || r.by != from || !r.isAdmin(from)) {
                 return
             }
-            val fresh = GroupModel(c.g, GroupModel.INVITED, signed, mutableMapOf(), null, from, null, null)
+            if (r.role(me) == null) {
+                // 1:1 messages aren't ordered: this may be the invitation being withdrawn, ahead of the invitation.
+                store.addWithdrawn(c.g, from, r.ver)
+                return
+            }
+            if (r.role(me) != Role.INVITED || (store.withdrawn(c.g, from) ?: 0) > r.ver) {
+                return
+            }
+            val fresh = GroupModel(c.g, GroupModel.INVITED, signed, mutableMapOf(), null, from, mutableListOf())
             store.addHistory(c.g, signed)
             store.save(fresh)
             io.onEvents(fresh, listOf(GroupEvent.Invited(from)))
@@ -422,13 +461,34 @@ class GroupEngine(
                 val cardsBefore = m.cards.toMap()
                 accept(m, signed)
                 relay(m, signed, cardsBefore)
+                // The branch that lost may hold someone's departure or acceptance, or our removal: none can be lost.
+                for (lost in lostBranch(m, cur, signed)) {
+                    enforceOwnRemoval(m, lost)
+                    enforceDeparture(m, lost.roster)
+                    enforceAcceptance(m, lost.roster)
+                }
             }
             RosterRules.Decision.Keep -> {
-                store.addHistory(c.g, signed)
+                store.addHistory(c.g, signed, sibling = true)
+                enforceOwnRemoval(m, signed)
                 enforceDeparture(m, r)
                 enforceAcceptance(m, r)
             }
             is RosterRules.Decision.Ignore -> if (d.reason != "same") {
+                // Too old to take, but others may have taken it and build on it: keep it if it was a valid change.
+                if (d.reason == "old" && store.history(c.g, r.prev)?.let { RosterRules.authorized(it.roster, r) } == true) {
+                    store.addHistory(c.g, signed, sibling = true)
+                }
+                // A newer roster by a non-admin that we can't place (we missed what it builds on), passed on by an admin:
+                // ask that admin for the history. Once we have its parent, a sync wouldn't tell us more.
+                if (r.ver > cur.roster.ver && from != r.by && cur.roster.isAdmin(from) && m.state == GroupModel.JOINED &&
+                    store.history(c.g, r.prev) == null
+                ) {
+                    requestSync(m, from, cur.roster.ver)
+                }
+                if (d.reason == "old") {
+                    enforceOwnRemoval(m, signed)
+                }
                 enforceDeparture(m, r)
                 enforceAcceptance(m, r)
             }
@@ -441,9 +501,58 @@ class GroupEngine(
      */
     private fun enforceAcceptance(m: GroupModel, r: Roster) {
         val cur = m.roster?.roster ?: return
-        if (r.role(r.by) == Role.MEMBER && cur.role(r.by) == Role.INVITED && r.by != me && m.state == GroupModel.JOINED && cur.isAdmin(me)) {
+        if (r.role(r.by) == Role.MEMBER && cur.role(r.by) == Role.INVITED && r.by != me && m.state == GroupModel.JOINED && cur.isAdmin(me) &&
+            madeSince(m, r) { it.role(r.by) == Role.INVITED }
+        ) {
             publish(m, RosterOp.Admit(r.by))
         }
+    }
+
+    /** The rosters from [old] back to where it and [winner] meet, newest first (a few at most). */
+    private fun lostBranch(m: GroupModel, old: SignedRoster, winner: SignedRoster): List<SignedRoster> {
+        val theirs = HashSet<String>()
+        var w: SignedRoster? = winner
+        repeat(BRANCH) {
+            w = w?.also { theirs += it.hashB64 }?.let { store.history(m.gid, it.roster.prev) }
+        }
+        val lost = mutableListOf<SignedRoster>()
+        var o: SignedRoster? = old
+        while (o != null && o.hashB64 !in theirs && lost.size < BRANCH) {
+            lost += o
+            o = store.history(m.gid, o.roster.prev)
+        }
+        return lost
+    }
+
+    /**
+     * An admin's roster that leaves us out, but that we can't take: it lost a tie here, or we had moved on. Whatever the
+     * others took after it, nobody sends it to us, since we're not in it: so if it's from our current stint, we're out.
+     */
+    private fun enforceOwnRemoval(m: GroupModel, signed: SignedRoster) {
+        val r = signed.roster
+        val cur = m.roster?.roster ?: return
+        if (r.role(me) != null || cur.role(me) == null || r.by == me || (m.state != GroupModel.JOINED && m.state != GroupModel.INVITED)) {
+            return
+        }
+        val parent = store.history(m.gid, r.prev)?.roster ?: cur
+        if (parent.isAdmin(r.by) && madeSince(m, r) { it.role(me) != null }) {
+            accept(m, signed)
+        }
+    }
+
+    /**
+     * Whether [r] was made during its author's current stint, the run of our rosters back from the current one in which
+     * [listed] holds for them. Anyone holding an older acceptance or departure (from before they were removed and added
+     * again) could otherwise replay it to make an admin admit or remove them. Where our history has a gap (skipped
+     * versions, not synced yet), only a roster newer than the gap counts; the sync brings the rest.
+     */
+    private fun madeSince(m: GroupModel, r: Roster, listed: (Roster) -> Boolean): Boolean {
+        var cur = m.roster ?: return false
+        while (listed(cur.roster)) {
+            cur = store.history(m.gid, cur.roster.prev)?.takeIf { it.roster.ver < cur.roster.ver } ?: return r.ver > cur.roster.ver
+        }
+        // cur is the last roster before the stint; the stint's first roster is its successor, which r must build on or after.
+        return r.ver > cur.roster.ver + 1
     }
 
     /**
@@ -452,7 +561,9 @@ class GroupEngine(
      */
     private fun enforceDeparture(m: GroupModel, r: Roster) {
         val cur = m.roster?.roster ?: return
-        if (r.role(r.by) == null && cur.role(r.by) != null && r.by != me && m.state == GroupModel.JOINED && cur.isAdmin(me)) {
+        if (r.role(r.by) == null && cur.role(r.by) != null && r.by != me && m.state == GroupModel.JOINED && cur.isAdmin(me) &&
+            madeSince(m, r) { it.role(r.by) != null }
+        ) {
             publish(m, RosterOp.Remove(listOf(r.by)))
         }
     }
@@ -490,6 +601,16 @@ class GroupEngine(
         m.cards[id] = card
         store.save(m)
         io.onCard(m, id)
+        // A newcomer has only the cards that existed when they were sent some: ours may be missing (we joined at about the
+        // same time, and the admin passed theirs on before ours arrived) or old (we moved inbox since). Ours goes to them now.
+        val mine = m.myCard
+        if (existing == null && m.state == GroupModel.JOINED && mine != null) {
+            io.sendGroup(m.gid, id, cardContent(mine))
+            // Rosters relayed before we could reach them (no card yet) didn't reach them either.
+            if (m.roster?.roster?.isAdmin(me) == true) {
+                m.roster?.let { io.sendGroup(m.gid, id, rosterContent(it)) }
+            }
+        }
         // A newcomer's first card only reaches the members they already knew: admins pass it on to everyone else.
         if (existing == null && m.state == GroupModel.JOINED && m.roster?.roster?.isAdmin(me) == true) {
             val content = cardContent(card)
@@ -504,7 +625,13 @@ class GroupEngine(
     private fun onSync(from: String, c: Content.GSync) {
         val m = store.load(c.g) ?: return
         val cur = m.roster ?: return
-        if (m.state != GroupModel.JOINED || !cur.roster.isAdmin(me) || cur.roster.role(from) == null) {
+        if (m.state != GroupModel.JOINED || !cur.roster.isAdmin(me)) {
+            return
+        }
+        if (cur.roster.role(from) == null) {
+            // Someone who's out but doesn't know it (the roster removing them never reached them, for example it came
+            // before the invitation, and they joined): they get that roster, and nothing newer.
+            removalOf(m, from)?.let { io.sendDirect(c.g, from, rosterContent(it)) }
             return
         }
         // From the version before theirs: their copy of `have` may be a concurrent sibling that lost, and they need the winner.
@@ -529,6 +656,18 @@ class GroupEngine(
         }
     }
 
+    /** The roster in our chain that took [id] out: the oldest one back from the current roster that doesn't list them. */
+    private fun removalOf(m: GroupModel, id: String): SignedRoster? {
+        var cur = m.roster ?: return null
+        while (true) {
+            val parent = store.history(m.gid, cur.roster.prev)?.takeIf { it.roster.ver < cur.roster.ver } ?: return null
+            if (parent.roster.role(id) != null) {
+                return cur
+            }
+            cur = parent
+        }
+    }
+
     private fun onLeave(from: String, c: Content.GLeave) {
         val m = store.load(c.g) ?: return
         // Stop sending to them at once. Their self-removal roster does the rest.
@@ -540,44 +679,61 @@ class GroupEngine(
     // ---------- roster application ----------
 
     private fun accept(m: GroupModel, signed: SignedRoster) {
-        val old = m.roster?.roster
+        val prior = m.roster
+        val old = prior?.roster
         m.roster = signed
         store.addHistory(m.gid, signed)
-        val events = diff(m, old, signed.roster)
-        // Our published change is no longer pending once someone else's roster builds on it.
-        if (signed.roster.by != me && signed.roster.prev == m.pendingHash) {
-            m.pendingOp = null
-            m.pendingHash = null
-        }
+        // Out of the group, only a roster built on the one that took us out invites us again: a concurrent one that still
+        // lists us (it lost to our departure or removal elsewhere) isn't an invitation.
+        val events = diff(m, old, signed.roster, reinvite = prior == null || descends(m, signed, prior))
         store.save(m)
         if (events.isNotEmpty()) {
             io.onEvents(m, events)
         }
         reapplyLost(m, signed)
-        processHeld(m.gid)
+        heldReady += m.gid
     }
 
     /**
-     * We accepted someone else's roster while a change of ours was still pending, and that roster doesn't contain it (our
-     * change was on a sibling that lost, possibly one we never learned about). Publish it again on top.
+     * We accepted someone else's roster while changes of ours were still pending, and that roster neither contains one nor
+     * builds on it (our change was on a sibling that lost, possibly one we never learned about). Publish it again on top.
+     * A roster that builds on our change and lacks it was changed back on purpose. A change stays pending even once it's
+     * in: the roster that took it in can itself lose to a sibling later.
      */
     private fun reapplyLost(m: GroupModel, signed: SignedRoster) {
-        val op = m.pendingOp ?: return
-        if (signed.roster.by == me || m.state != GroupModel.JOINED) {
+        if (m.pending.isEmpty() || signed.roster.by == me || m.state != GroupModel.JOINED) {
             return
         }
-        if (op.apply(signed.roster, me) == null) {
-            // Already reflected (or no longer possible): nothing to redo.
-            m.pendingOp = null
-            m.pendingHash = null
+        val redo = mutableListOf<RosterOp>()
+        val before = m.pending.size
+        m.pending.removeAll { p ->
+            val mine = store.history(m.gid, p.hash)
+            when {
+                // Long built on (or forgotten): settled.
+                mine == null || signed.roster.ver > mine.roster.ver + SETTLED -> true
+                p.op.apply(signed.roster, me) != null && !descends(m, signed, mine) -> redo.add(p.op)
+                else -> false
+            }
+        }
+        if (m.pending.size != before) {
             store.save(m)
-            return
         }
-        dbg { "re-applying lost ${op.javaClass.simpleName} on v${signed.roster.ver}" }
-        publish(m, op)
+        for (op in redo) {
+            dbg { "re-applying lost ${op.javaClass.simpleName} on v${m.roster?.roster?.ver}" }
+            publish(m, op)
+        }
     }
 
-    private fun diff(m: GroupModel, old: Roster?, new: Roster): List<GroupEvent> {
+    /** Whether [r] is [base] or built on it, as far as our history tells. A gap in it counts as yes. */
+    private fun descends(m: GroupModel, r: SignedRoster, base: SignedRoster): Boolean {
+        var cur = r
+        while (cur.roster.ver > base.roster.ver) {
+            cur = store.history(m.gid, cur.roster.prev)?.takeIf { it.roster.ver < cur.roster.ver } ?: return true
+        }
+        return cur.hashB64 == base.hashB64
+    }
+
+    private fun diff(m: GroupModel, old: Roster?, new: Roster, reinvite: Boolean): List<GroupEvent> {
         val by = new.by
         val events = mutableListOf<GroupEvent>()
         val oldIds = old?.ids().orEmpty().toSet()
@@ -597,7 +753,7 @@ class GroupEngine(
                 m.state = GroupModel.REMOVED
                 events += GroupEvent.YouWereRemoved(by)
             }
-        } else if (new.role(me) == Role.INVITED && (m.state == GroupModel.REMOVED || m.state == GroupModel.LEFT)) {
+        } else if (new.role(me) == Role.INVITED && (m.state == GroupModel.REMOVED || m.state == GroupModel.LEFT) && reinvite) {
             m.state = GroupModel.INVITED
             m.invitedBy = by
             events += GroupEvent.Invited(by)
@@ -671,28 +827,44 @@ class GroupEngine(
         }
     }
 
-    private fun processHeld(gid: String) {
-        val held = store.held(gid)
-        if (held.isEmpty()) {
-            return
-        }
-        for (h in held) {
-            store.dropHeld(h.id)
-        }
-        for (h in held) {
-            if (h.hintKey.contentEquals(HELD_CONTENT)) {
-                val from = B64.enc(h.blob.copyOfRange(0, IDENTITY_LEN))
-                val content = runCatching { Content.decode(h.blob.copyOfRange(IDENTITY_LEN, h.blob.size)) }.getOrNull()
-                content?.let { onContent(gid, from, it, direct = false) }
-            } else {
-                receive(gid, h.hintKey, h.blob)
-            }
+    /** Groups whose roster changed in this engine's calls, so their held messages may be deliverable now. */
+    private val heldReady = LinkedHashSet<String>()
+
+    /**
+     * The held messages that may be deliverable now (their group's roster changed since the last call). The caller replays
+     * each with [replayHeld] in its own transaction, once the change that freed them is stored: a held message that fails
+     * then only drops itself, instead of undoing that change (and wedging the group) every time it's retried.
+     */
+    fun readyHeld(): List<Pair<String, HeldBlob>> {
+        val gids = heldReady.toList()
+        heldReady.clear()
+        return gids.flatMap { g -> store.held(g).map { g to it } }
+    }
+
+    /** Delivers one held message, or holds it again if it still can't be. */
+    fun replayHeld(gid: String, h: HeldBlob) {
+        store.dropHeld(h.id)
+        if (h.hintKey.contentEquals(HELD_CONTENT)) {
+            val from = B64.enc(h.blob.copyOfRange(0, IDENTITY_LEN))
+            val content = runCatching { Content.decode(h.blob.copyOfRange(IDENTITY_LEN, h.blob.size)) }.getOrNull()
+            content?.let { onContent(gid, from, it, direct = false) }
+        } else {
+            receive(gid, h.hintKey, h.blob)
         }
     }
 
     companion object {
         val LOCAL = SignalProtocolAddress("self", 1)
         private const val PREKEY = 3
+
+        /** Versions after which our own change, built on by others, no longer needs watching. */
+        private const val SETTLED = 10
+
+        /** How far back a lost branch is checked for departures and acceptances. */
+        private const val BRANCH = 16
+
+        /** Rosters we didn't take, kept per version (see [GroupStore.addHistory]). */
+        const val MAX_SIBLINGS = 16
 
         /** Marks a held row as already-decrypted content from an invitee (a real hint key is 32 bytes). */
         private val HELD_CONTENT = byteArrayOf(0x43)

@@ -49,8 +49,8 @@ inside their card. Every member sends to it. The server sees one ordinary mailbo
 - `seq` grows with every new card from that member. A receiver keeps the highest `seq` per member and ignores older ones.
 - `bundle` lets other members start a PQXDH session with this member. The prekeys are this group's own and are kept
   until the member leaves or publishes a new card. The Kyber prekey is a last-resort key, reused by every initiator.
-- Receivers check that `sig` verifies under `id`, that `bundle`'s signatures verify under `id`, that `g` is this group,
-  and that `inbox.server` passes the usual contact-server checks.
+- Receivers check that `sig` verifies under `id`, that `bundle`'s signatures verify under `id` and its keys parse, that
+  `g` is this group, and that `inbox.server` passes the usual contact-server checks.
 
 ### Roster (signed by an admin)
 ```json
@@ -71,23 +71,41 @@ For a received roster R, with current roster C:
    themselves (leaving), or turning their own `invited` into `member` (accepting).
 3. **Order:**
    - If `R.ver == C.ver + 1` and `R.prev == hash(C)`, accept.
-   - If `R.ver == C.ver` and `hash(R) != hash(C)` (two admins changed it at once), keep the one with the larger hash.
+   - If `R.ver == C.ver` and `hash(R) != hash(C)` (two admins changed it at once), keep the one with the larger hash,
+     except that a roster removing the other's author wins (an invitee's acceptance loses to the invitation being
+     withdrawn). If both remove each other's author, the larger hash wins.
    - **Our own changes aren't lost.** Whenever we accept someone else's roster while a change of ours is still pending
-     and that roster doesn't contain it (our change lost a tie, possibly to a sibling we never saw), we re-apply it on
-     top as the next version. A change is no longer pending once a roster by someone else builds on it.
+     and that roster neither contains it nor builds on it, through any number of versions (our change lost a tie,
+     possibly to a sibling we never saw), we re-apply it on top as the next version. A roster that builds on our change
+     and lacks it was changed back on purpose. A change stays pending even once it's in, since the roster that took it
+     in can still lose a tie, until it's 10 versions old. Our last 4 changes are pending (an admin's own change and the
+     admits and removals it makes for others below can overlap).
+   - Rosters we don't take (a lost tie, or an older version that's a valid change on its parent) are kept, at most 16
+     per version, so that rosters others build on them can still be checked.
    - If `R.ver > C.ver` but it doesn't chain onto C (we missed some versions, or it builds on a concurrent sibling we
      never saw), accept only if `R.by` is an admin in C, then ask that admin for the missing history with `gsync`.
    - Otherwise ignore it.
    - **Departures can't be lost.** A roster signed by X that doesn't list X means "X is leaving" (or declining),
      whatever its version. If it lost a tie or arrived too late to apply, the leaver won't try again, so an admin who
-     sees it while X is still in C publishes a roster removing X.
+     sees it while X is still in C publishes a roster removing X. The same when a roster we had taken loses a tie
+     later: the losing branch (back to where it meets the winner) may hold someone's departure (or acceptance).
+   - **Removals can't be lost on the removed member's side.** A roster by an admin (of its parent) that leaves us out
+     and that we can't keep (it lost a tie here, now or later, or we had moved on) still means we're out: nothing
+     the others take after it reaches us, since we're not in it.
    - **Acceptances can't be lost either.** Likewise, a roster signed by X that makes X a `member` while C still lists X
      as `invited` is X's acceptance: an admin who sees it but can't apply it publishes a roster making X a member.
      (Found on a real device: two invitees who join at about the same time produce concurrent rosters.)
+   - Both only count if they're newer than X's current stint (the run of our rosters back from C that list X, or list
+     X as invited): an old departure or acceptance, from before X was removed and added again, can be replayed by
+     anyone who kept it.
+   - A newer roster by a non-admin whose parent we don't have (we missed what came before), passed on by an admin:
+     ask that admin for the history with `gsync`.
 4. **Diff against the old roster:**
    - **Removed members:** stop sending to them. Their card is kept only until what's already queued to them (the roster
      that removed them) is delivered, then deleted, and so is their session once they're in no other group.
    - **If we were removed:** mark the group "You were removed" and stop sending.
+   - **Once out** (removed, left or declined), only a roster built on the one that took us out invites us again. A
+     concurrent roster that still lists us isn't an invitation.
    - **If anyone was removed:** rotate our group inbox (a new mailbox and a new card with a new `hintKey`), send the
      new card to the remaining members, and delete the old mailbox after a 15-day drain.
 
@@ -96,10 +114,17 @@ Members only reach the members whose cards they have, and a member's view can la
 admin forwarded when inviting them). Admins, who keep every card, close the gaps:
 - **Rosters by non-admins** (accepting, leaving, declining, or a rename when `adminsOnly` is off): an admin who accepts
   one sends it on to every member whose card they have.
-- **A newcomer's first card:** an admin who receives a member's first card sends it on to every other member.
+- **A newcomer's first card:** an admin who receives a member's first card sends it on to every other member. Every
+  member who receives someone's first card sends them their own (the newcomer's copy may be missing or old: cards
+  change when inboxes rotate), and admins also send the current roster (rosters relayed before the newcomer could be
+  reached didn't reach them).
 - **Invited members** have no inbox yet: rosters reach them only over 1:1, from an author who has them as a contact. An
   admin relaying a roster sends it to invitees over 1:1 too, so they don't build their acceptance on a stale roster.
-  On joining they send `gsync` to their inviter.
+  On joining they send `gsync` to their inviter, over 1:1 if they can. A roster that arrives over 1:1 from an admin of
+  it, for a group we don't know, and leaves us out, voids an older invitation from that admin arriving after it (1:1
+  messages aren't ordered either). The newest 32 are remembered.
+- **`gsync` from someone who's out** (the roster removing them never reached them, for example it arrived before the
+  invitation, and they joined): an admin answers over 1:1 with the roster that removed them, and nothing newer.
 - **`gsync` answers start one version early:** the rosters from `have` onwards (not just after it), because the asker's
   copy of version `have` may be a concurrent sibling that lost, and they need the winner.
 
