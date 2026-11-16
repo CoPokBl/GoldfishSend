@@ -151,7 +151,8 @@ class GroupDeviceTest {
         val bobCid = Groups.store(bob).cidOf(gid)!!
         assertEquals(GroupModel.INVITED, Groups.model(bob, bobCid)!!.state)
         assertTrue(bob.repo.messages(bobCid, System.currentTimeMillis()).any { it.kind == MsgKind.SYSTEM && it.body.contains("invited you") })
-        assertNotNull(Groups.model(bob, bobCid)!!.cards[id(alice)])
+        // The invitation is the roster alone: Bob gets Alice's card once she lets him in.
+        assertNull(Groups.model(bob, bobCid)!!.cards[id(alice)])
 
         // Bob joins.
         val (bobInbox, bobHint, bobCard) = inboxAndCard(bob, gid, "bob")
@@ -167,6 +168,7 @@ class GroupDeviceTest {
         route(listOf(alice, bob))
         assertEquals(Role.MEMBER, Groups.model(alice, aliceCid)!!.view()!!.role(id(bob)))
         assertEquals(Groups.model(alice, aliceCid)!!.roster!!.hashB64, Groups.model(bob, bobCid)!!.roster!!.hashB64)
+        assertNotNull(Groups.model(bob, bobCid)!!.cards[id(alice)])
 
         // Messages both ways, stored per sender, crypto-shredded like any other.
         Groups.sendText(bob, bobCid, "hi alice")

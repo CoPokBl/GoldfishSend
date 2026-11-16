@@ -205,7 +205,10 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           disable-animations: true
           working-directory: android
-          script: ./gradlew -Pgf.abis=x86_64 :app:connectedDebugAndroidTest
+          # AGP reports success when the APK fails to install (no tests run), so check that tests actually ran.
+          script: |
+            ./gradlew -Pgf.abis=x86_64 :app:connectedDebugAndroidTest
+            grep -rqs '<testcase' app/build/outputs/androidTest-results/connected || (echo "::error::No device tests ran." && exit 1)
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
