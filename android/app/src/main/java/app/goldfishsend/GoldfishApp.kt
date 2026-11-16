@@ -13,6 +13,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import app.goldfishsend.core.AppVisibility
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Notifier
+import app.goldfishsend.core.ReceiveGuard
 import app.goldfishsend.core.launchSafe
 import app.goldfishsend.security.AppLock
 import app.goldfishsend.security.Wiper
@@ -26,6 +27,7 @@ class GoldfishApp : Application() {
             StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder().detectAll().penaltyLog().build())
         }
         Graph.init(this)
+        ReceiveGuard.log = { android.util.Log.w("GoldfishSend", it) }
         Notifier.ensureChannel(this)
         // Order matters: the restart and inactivity wipes must run before anything can open the DB.
         Wiper.checkBoot(this, fromBootBroadcast = false)

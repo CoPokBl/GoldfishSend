@@ -136,12 +136,8 @@ internal object GroupKit {
                         val to = profiles.first { id(it) == peerKey }
                         val sender = to.repo.personByIdentity(B64.dec(id(from)))!!
                         if (whole.groupId != null) {
-                            to.lock.lock()
-                            try {
-                                to.db.tx { Groups.onDirect(to, sender.id, whole) }
-                            } finally {
-                                to.lock.unlock()
-                            }
+                            // Takes the session lock itself, like Messenger.
+                            Groups.onDirect(to, sender.id, whole)
                         }
                     } else {
                         val to = profiles.first { id(it) == member }

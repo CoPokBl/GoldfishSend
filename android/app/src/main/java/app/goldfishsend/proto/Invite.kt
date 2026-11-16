@@ -29,7 +29,7 @@ data class InviteBundle(
     fun encode(): ByteArray = BundleJson.encodeToString(serializer(), this).utf8()
 
     companion object {
-        fun decode(bytes: ByteArray): InviteBundle = BundleJson.decodeFromString(serializer(), bytes.toString(Charsets.UTF_8))
+        fun decode(bytes: ByteArray): InviteBundle = BundleJson.decodeUntrusted(serializer(), bytes.toString(Charsets.UTF_8))
     }
 }
 

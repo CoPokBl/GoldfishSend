@@ -19,6 +19,7 @@ android/.gradle/
 android/**/build/
 android/local.properties
 android/.kotlin/
+android/app/.cifuzz-corpus/
 android/captures/
 *.keystore
 *.jks

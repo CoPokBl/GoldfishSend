@@ -6,6 +6,8 @@ import kotlinx.serialization.json.Json
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.ecc.ECPrivateKey
+import org.signal.libsignal.protocol.ecc.ECPublicKey
+import org.signal.libsignal.protocol.kem.KEMPublicKey
 
 /** Group wire formats (docs/groups.md). Android-free, so the JVM tests use exactly this code. */
 
@@ -165,7 +167,10 @@ object GroupCrypto {
                 validServer(c.inbox.server) &&
                 c.bundle.deviceId == 1 &&
                 key.verifySignature(B64.dec(c.bundle.signedPreKey), B64.dec(c.bundle.signedPreKeySig)) &&
-                key.verifySignature(B64.dec(c.bundle.kyberPreKey), B64.dec(c.bundle.kyberPreKeySig))
+                key.verifySignature(B64.dec(c.bundle.kyberPreKey), B64.dec(c.bundle.kyberPreKeySig)) &&
+                // Signed garbage would pass the checks above, then fail every member's encryption to this card.
+                ECPublicKey(B64.dec(c.bundle.signedPreKey)).let { true } &&
+                KEMPublicKey(B64.dec(c.bundle.kyberPreKey)).let { true }
         } catch (e: Exception) {
             false
         }
@@ -369,9 +374,14 @@ object RosterRules {
             r.ver == c.ver -> {
                 val base = parent(r.prev)
                 val ok = if (base != null) authorized(base, r) else c.isAdmin(r.by)
+                // A removal beats a concurrent change by the person removed (typically their acceptance of the invitation
+                // being withdrawn): otherwise they could stay in by winning the tie.
+                val inKicks = r.role(c.by) == null && c.role(c.by) != null && r.by != c.by
+                val curKicks = c.role(r.by) == null && r.role(r.by) != null && c.by != r.by
+                val wins = if (inKicks != curKicks) inKicks else compareUnsigned(incoming.hash, current.hash) > 0
                 when {
                     !ok -> Decision.Ignore("unauthorized")
-                    compareUnsigned(incoming.hash, current.hash) > 0 -> Decision.Replace
+                    wins -> Decision.Replace
                     else -> Decision.Keep
                 }
             }

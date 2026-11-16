@@ -133,6 +133,8 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        // JUnit Platform for the Jazzer fuzz tests; the vintage engine keeps running the JUnit 4 tests.
+        unitTests.all { it.useJUnitPlatform() }
     }
 }
 
@@ -217,6 +219,11 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     testImplementation("com.squareup.okhttp3:mockwebserver3:5.5.1")
+    testImplementation(platform("org.junit:junit-bom:5.14.1"))
+    testImplementation("com.code-intelligence:jazzer-junit:0.30.0")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine")
+    testRuntimeOnly("org.junit.vintage:junit-vintage-engine")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
 }
@@ -224,4 +231,20 @@ dependencies {
 // libsignal-client's desktop classes (used by JVM unit tests) target Java 21.
 tasks.withType<Test>().configureEach {
     javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) })
+    // -Pgf.fuzz runs the selected @FuzzTest coverage-guided (see README.md, "Fuzzing"). Without it, fuzz tests only replay
+    // their committed inputs.
+    if (project.hasProperty("gf.fuzz")) {
+        environment("JAZZER_FUZZ", "1")
+        // Coverage feedback from the app and its JSON parser, not just the test classes.
+        systemProperty("jazzer.instrumentation_includes", "app.goldfishsend.**:kotlinx.serialization.**")
+        (project.findProperty("gf.fuzz") as String?)?.takeIf { it.isNotBlank() }?.let { systemProperty("jazzer.max_duration", it) }
+        outputs.upToDateWhen { false }
+    }
+    // -Pgf.groupFuzz.minutes=10 (or .seeds, .start): a longer run of the random group scenarios (GroupStatefulTest).
+    for (k in listOf("start", "seeds", "minutes", "replay")) {
+        (project.findProperty("gf.groupFuzz.$k") as String?)?.let {
+            systemProperty("gf.groupFuzz.$k", it)
+            outputs.upToDateWhen { false }
+        }
+    }
 }

@@ -525,8 +525,15 @@ class ServerApi(
         else -> ApiException("bad_server", 502, retryAfterSeconds = 300)
     }
 
-    private fun <T> decode(r: GatewayCodec.InnerResponse, ser: KSerializer<T>): T =
+    /**
+     * A 2xx body that doesn't parse (a broken or hostile server: a contact picks their own) is an API error like any other,
+     * so callers back off. kotlinx.serialization doesn't only throw SerializationException on malformed JSON.
+     */
+    private fun <T> decode(r: GatewayCodec.InnerResponse, ser: KSerializer<T>): T = try {
         lenient.decodeFromString(ser, r.body.toString(Charsets.UTF_8))
+    } catch (e: Exception) {
+        throw ApiException("bad_server", 502, retryAfterSeconds = 300, cause = e)
+    }
 
     companion object {
         /**

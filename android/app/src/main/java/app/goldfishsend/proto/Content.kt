@@ -1,5 +1,6 @@
 package app.goldfishsend.proto
 
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.serializer
@@ -103,10 +104,22 @@ sealed class Content {
     fun encode(): ByteArray = ProtoJson.encodeToString(serializer(), this).utf8()
 
     companion object {
-        fun decode(bytes: ByteArray): Content = ProtoJson.decodeFromString(serializer(), bytes.toString(Charsets.UTF_8))
+        fun decode(bytes: ByteArray): Content = ProtoJson.decodeUntrusted(serializer(), bytes.toString(Charsets.UTF_8))
 
         fun newId(): String = B64.enc(Rand.bytes(12))
     }
+}
+
+/**
+ * Decodes JSON from someone else. Anything malformed is an [IllegalArgumentException] (kotlinx.serialization's own
+ * SerializationException is one); the parser also throws others, for example StringIndexOutOfBoundsException on `{"v":"7`.
+ */
+fun <T> Json.decodeUntrusted(ser: KSerializer<T>, text: String): T = try {
+    decodeFromString(ser, text)
+} catch (e: IllegalArgumentException) {
+    throw e
+} catch (e: RuntimeException) {
+    throw IllegalArgumentException("malformed JSON", e)
 }
 
 val ProtoJson = Json {

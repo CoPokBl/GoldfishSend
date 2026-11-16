@@ -66,7 +66,12 @@ object Messenger {
     /** A PreKey message from an existing contact carried a different identity key than the one we trust. */
     private class IdentityChanged(val contactId: Long, val newKey: ByteArray) : Exception()
 
+    /** One message. Whatever goes wrong with it, it's dropped and the next one is processed ([ReceiveGuard]). */
     private suspend fun receive(s: Session, tag: ByteArray, raw: ByteArray) {
+        ReceiveGuard.runSuspend("message") { receiveOne(s, tag, raw) }
+    }
+
+    private suspend fun receiveOne(s: Session, tag: ByteArray, raw: ByteArray) {
         val mb = s.repo.mailboxByTag(tag) ?: return
         if (mb.purpose == Mailbox.PURPOSE_GROUP) {
             // A group inbox: only group blobs (docs/groups.md), from whichever member the sender hint names.
@@ -157,8 +162,7 @@ object Messenger {
         }
         if (c0.groupId != null) {
             // Group content over our 1:1 session: invitations, forwarded cards, rosters while invited.
-            s.lock.withLock { s.db.tx { Groups.onDirect(s, cid, c0) } }
-            Outbox.kick()
+            Groups.onDirect(s, cid, c0)
             return
         }
         when (val c = c0) {

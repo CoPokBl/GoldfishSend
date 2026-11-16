@@ -80,6 +80,37 @@ without AOT compilation and with the baseline profile:
 
 Use a physical device for absolute numbers. Emulator results are only good for comparisons.
 
+### Fuzzing
+
+Everything that decodes bytes or text from someone else is fuzzed, as is the group protocol. `testDebugUnitTest` (and so
+CI) replays the committed inputs and 150 seeded group scenarios, about 7 s more than the other tests; longer runs are
+local only.
+
+| Test | What it covers |
+|---|---|
+| `fuzz/ParserFuzzTest` | Invite links (QR, pasted text, deep links), invite blobs, push payloads and E2E blobs, decrypted plaintext (padding and Content JSON), chunking, display names |
+| `fuzz/GroupReceiveFuzzTest` | One member receiving whatever a hostile member, invitee or stranger can send: raw blobs, forged or replayed rosters and cards, chunks in any order, claimed senders |
+| `fuzz/GroupStatefulTest`, `fuzz/GroupScenarioFuzzTest` | Random sequences of joins, leaves, removals, role and name changes, inbox rotations and messages, with pushes reordered, duplicated and delayed and a hostile member, checked for convergence, authority, message delivery and that whoever is out can't read or post |
+| `PoisonMessageTest` | A message that fails to process is dropped (counted, logged without content); it never crashes the app or blocks what comes after |
+
+The Jazzer tests ([Jazzer](https://github.com/CodeIntelligenceTesting/jazzer), on the JUnit Platform next to the JUnit 4
+tests) take their inputs from `app/src/test/resources/app/goldfishsend/fuzz/<Test>Inputs/<method>/`. To fuzz one of them
+(one at a time; the duration is optional):
+
+```sh
+./gradlew :app:testDebugUnitTest -Pgf.fuzz=10m --tests 'app.goldfishsend.fuzz.GroupReceiveFuzzTest.hostileMember'
+```
+
+The corpus it builds goes to `app/.cifuzz-corpus/` (not committed). A finding is written as a `crash-…` file into the
+inputs directory above, where it replays from then on: fix the bug, rename the file after it and commit it.
+`GroupScenarioFuzzTest` also prints the failing scenario shrunk, as below.
+
+For a longer run of the seeded group scenarios: `-Pgf.groupFuzz.minutes=10` (or `-Pgf.groupFuzz.seeds=5000`, and
+`-Pgf.groupFuzz.start=` to begin elsewhere) with `--tests 'app.goldfishsend.fuzz.GroupStatefulTest'`. A failing seed is
+shrunk to a short list of steps, printed ready to paste into a regression test in `GroupStatefulTest`. To see what each
+member decides along the way, replay it: `-Pgf.groupFuzz.replay="<seed>; Op(…), …"` with
+`--tests 'app.goldfishsend.fuzz.GroupStatefulTest.replay' -i`.
+
 ### Verifying your download
 
 Official releases are signed with a single key whose certificate SHA-256 fingerprint is:
