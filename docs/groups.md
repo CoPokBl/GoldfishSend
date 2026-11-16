@@ -227,8 +227,8 @@ or a head we know changes, for every active member of our view:
 
 Besides members:
 - **Joined, not taken in yet:** we owe the owner our state (our acceptance in it), once per head of ours: through
-  their card if we have it, else over 1:1. Once the owner shows a head ahead of ours, we ask instead. Until the owner takes us in we don't
-  know who else is in, so we send nothing to the group (the app says it's waiting).
+  their card if we have it, else over 1:1. Once the owner shows a head ahead of ours, we ask instead. Until the owner
+  takes us in we don't know who else is in, so we send nothing to the group (the app says it's waiting).
 - **Taken out:** a member the owner removes is owed the rosters that say so (from the head they last showed, or their
   stint, the newest 50), over 1:1 or through their old card. If that's lost, they go on writing to the group: the
   owner recognises them by the hint of a blob it can no longer attribute to a member, doesn't read it, and sends the
