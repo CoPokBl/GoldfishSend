@@ -231,6 +231,16 @@ class GroupStatefulTest {
         ),
     )
 
+    /**
+     * Found by GroupScenarioFuzzTest.forks: Bob left, then moved to the branch that won (which still listed him invited)
+     * and took a roster on it as an invitation. Only a branch on which he was out can invite him again.
+     */
+    @Test
+    fun leftThenInvitedByAStaleBranch() = scenario(
+        5L,
+        listOf(Op(11, 0, 0, 0), Op(2, 0, 252, 0), Op(12, 0, 0, 0), Op(0, 1, 0, 0), Op(5, 0, 0, 0), Op(8, 0, 85, 0), Op(1, 222, 0, 0), Op(1, 181, 0, 0), Op(8, 255, 255, 0)),
+    )
+
     private fun length(seed: Long) = 30 + (seed % 50).toInt()
 
     private fun scenario(seed: Long, ops: List<Op>) {

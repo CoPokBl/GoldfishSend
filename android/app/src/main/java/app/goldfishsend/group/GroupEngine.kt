@@ -764,9 +764,7 @@ class GroupEngine(
         val old = prior?.roster
         m.roster = signed
         store.addHistory(m.gid, signed)
-        // Out of the group, only a roster built on the one that took us out invites us again: a concurrent one that still
-        // lists us (it lost to our departure or removal elsewhere) isn't an invitation.
-        val events = diff(m, old, signed.roster, reinvite = prior == null || descends(m, signed, prior))
+        val events = diff(m, old, signed.roster, reinvite = prior == null || reinvited(m, signed))
         store.save(m)
         if (events.isNotEmpty()) {
             io.onEvents(m, events)
@@ -809,6 +807,18 @@ class GroupEngine(
             dbg { "re-applying lost ${op.javaClass.simpleName} on v${m.roster?.roster?.ver}" }
             publish(m, op)
         }
+    }
+
+    /**
+     * Out of the group, whether [r] (which lists us) invites us again: somewhere down its line we were out. A branch that
+     * listed us all along (it lost to our departure or removal elsewhere) isn't an invitation. A gap counts as yes.
+     */
+    private fun reinvited(m: GroupModel, r: SignedRoster): Boolean {
+        var x = r
+        while (x.roster.role(me) != null) {
+            x = store.history(m.gid, x.roster.prev)?.takeIf { it.roster.ver < x.roster.ver } ?: return x.roster.prev.isNotEmpty()
+        }
+        return true
     }
 
     /** Whether [r] is [base] or built on it, as far as our history tells. A gap in it counts as yes. */
