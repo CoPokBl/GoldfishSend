@@ -151,4 +151,85 @@ class GroupFindingsTest {
             everyone(alice, carol) { p -> assertEquals(null, p.roster(gid).roster.role(bob.id)) }
         }
     }
+
+    /**
+     * Fork choice: Bob renames on top of his own acceptance, which a concurrent change of Alice's (an admin) beats. Bob's
+     * rename is re-signed on top of Alice's change, and everyone ends on the same roster with both.
+     */
+    @Test
+    fun aMemberOnABranchThatLostRebasesOntoTheWinner() {
+        alice.create(gid, "Trip", bob, carol)
+        net.deliverAll()
+        alice.publish(gid, RosterOp.Meta(adminsOnly = false))
+        net.deliverAll()
+        bob.join(gid)
+        carol.join(gid)
+        net.deliverAll()
+        // Neither hears the other before building on their own.
+        val held = mutableListOf<GroupNet.Envelope>()
+        net.filter = { e -> !((e.to() == alice && e.from() == bob) || (e.to() == bob && e.from() == alice)).also { if (it) held += e } }
+        alice.publish(gid, RosterOp.Meta(timer = 3600))
+        bob.publish(gid, RosterOp.Meta(name = "Bob's"))
+        bob.publish(gid, RosterOp.Meta(name = "Bob's again"))
+        net.deliverAll()
+        net.filter = { true }
+        net.queue.addAll(held)
+        net.deliverAll()
+        everyone(alice, bob, carol) { p ->
+            assertEquals(p.name, alice.roster(gid).hashB64, p.roster(gid).hashB64)
+            assertEquals(3600L, p.roster(gid).roster.timer)
+            assertEquals("Bob's again", p.roster(gid).roster.name)
+        }
+    }
+
+    /**
+     * Mallory, removed, forks from the roster before her removal: a long chain of renames, hashes ground to win ties.
+     * Her branch has no admin's change in it and leaves out nobody, so the removal stands; and it costs little traffic.
+     */
+    @Test
+    fun aRemovedMembersForkCantUndoTheRemoval() {
+        val mallory = net.peer("mallory")
+        alice.befriend(mallory)
+        alice.create(gid, "Trip", bob, mallory)
+        net.deliverAll()
+        alice.publish(gid, RosterOp.Meta(adminsOnly = false))
+        net.deliverAll()
+        bob.join(gid)
+        mallory.join(gid)
+        net.deliverAll()
+        val before = mallory.roster(gid)
+        val routes = mallory.store.routes[gid].orEmpty().filterKeys { it != mallory.id }
+        alice.publish(gid, RosterOp.Remove(listOf(mallory.id)))
+        net.deliverAll()
+        var tip = before
+        val chain = (1..6).map { i ->
+            val change = tip.roster.copy(name = "Mine $i")
+            (0 until 16).map { t -> GroupCrypto.signRoster(mallory.identity.privateKey, app.goldfishsend.proto.RosterRules.successor(tip, change, mallory.id, 99L + t)) }
+                .maxWith { x, y -> app.goldfishsend.proto.RosterRules.compareUnsigned(x.hash, y.hash) }
+                .also { tip = it }
+        }
+        val sent = net.delivered
+        for (r in chain) {
+            for ((_, card) in routes) {
+                mallory.sendWithCard(card.card, GroupEngine.rosterContent(r))
+            }
+        }
+        net.deliverAll()
+        everyone(alice, bob) { p ->
+            assertNull(p.name, p.roster(gid).roster.role(mallory.id))
+            assertEquals(alice.roster(gid).hashB64, p.roster(gid).hashB64)
+        }
+        // Mallory's own sends, and nothing much in reply.
+        assertTrue("${net.delivered - sent} deliveries", net.delivered - sent <= chain.size * routes.size + 10)
+    }
+
+    private fun GroupNet.Envelope.to(): Peer = when (this) {
+        is GroupNet.Envelope.ToInbox -> to
+        is GroupNet.Envelope.Direct -> to
+    }
+
+    private fun GroupNet.Envelope.from(): Peer = when (this) {
+        is GroupNet.Envelope.ToInbox -> from
+        is GroupNet.Envelope.Direct -> from
+    }
 }

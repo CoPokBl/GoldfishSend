@@ -15,7 +15,6 @@ import app.goldfishsend.proto.Roster
 import app.goldfishsend.proto.RosterMember
 import app.goldfishsend.proto.RosterOp
 import app.goldfishsend.proto.RosterRules
-import app.goldfishsend.proto.RosterRules.Decision
 import app.goldfishsend.proto.SignedRoster
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -180,43 +179,44 @@ class GroupProtocolTest {
     // --- ordering ---
 
     @Test
-    fun sequentialChangesAreAccepted() {
+    fun aChildIsOneVersionOnAndAllowed() {
         val v1 = signed(roster())
         val v2 = next(v1, { it.copy(name = "Renamed") })
-        assertEquals(Decision.Accept(false), RosterRules.decide(v1, v2) { null })
-        // Out of order: an old roster is ignored, so is the same one again.
-        assertTrue(RosterRules.decide(v2, v1) { null } is Decision.Ignore)
-        assertTrue(RosterRules.decide(v2, v2) { null } is Decision.Ignore)
-        // A member's successor that doesn't chain is ignored; an admin's means we missed versions.
-        val v3 = next(v2, { it.copy(name = "Again") })
-        val v4 = next(v3, { it.copy(name = "And again") })
-        assertEquals(Decision.Accept(true), RosterRules.decide(v2, v4) { null })
-        val bySelf = next(v3, { r -> r.copy(members = r.members.filter { it.id != idb }) }, by = idb)
-        assertTrue(RosterRules.decide(v2, bySelf) { null } is Decision.Ignore)
-        // A member's unauthorized change at the next version is ignored.
+        assertTrue(RosterRules.validChild(v1.roster, v2.roster))
+        assertFalse(RosterRules.validChild(v2.roster, v1.roster))
+        // Skipping versions isn't a child.
+        assertFalse(RosterRules.validChild(v1.roster, v2.roster.copy(ver = 5)))
+        // A member's change to others isn't allowed; their own departure is.
         val kick = next(v2, { r -> r.copy(members = r.members.filter { it.id != idc }) }, by = idb)
-        assertEquals(Decision.Ignore("unauthorized"), RosterRules.decide(v2, kick) { null })
+        assertFalse(RosterRules.validChild(v2.roster, kick.roster))
+        val leave = next(v2, { r -> r.copy(members = r.members.filter { it.id != idb }) }, by = idb)
+        assertTrue(RosterRules.validChild(v2.roster, leave.roster))
     }
 
     @Test
-    fun concurrentChangesBreakTiesByHash() {
+    fun forkChoice() {
         val v1 = signed(roster(members = listOf(RosterMember(ida, Role.ADMIN), RosterMember(idb, Role.ADMIN), RosterMember(idc, Role.MEMBER))))
         val x = next(v1, { it.copy(name = "By A") }, by = ida)
         val y = next(v1, { it.copy(timer = 60) }, by = idb)
-        val parent = { h: String -> if (h == v1.hashB64) v1.roster else null }
-        val xy = RosterRules.decide(x, y, parent)
-        val yx = RosterRules.decide(y, x, parent)
-        // Exactly one side switches, and both agree on the winner.
-        if (RosterRules.compareUnsigned(y.hash, x.hash) > 0) {
-            assertEquals(Decision.Replace, xy)
-            assertEquals(Decision.Keep, yx)
-        } else {
-            assertEquals(Decision.Keep, xy)
-            assertEquals(Decision.Replace, yx)
+        // Two admins: the larger hash, and both sides agree.
+        val xWins = RosterRules.beats(v1.roster, listOf(x), listOf(y))
+        assertEquals(!xWins, RosterRules.beats(v1.roster, listOf(y), listOf(x)))
+        assertEquals(RosterRules.compareUnsigned(x.hash, y.hash) > 0, xWins)
+        // A member's branch never outweighs an admin's, however long.
+        val open = signed(roster(members = v1.roster.members, adminsOnly = false))
+        val byAdmin = next(open, { it.copy(name = "Admin") }, by = ida)
+        var byMember = next(open, { it.copy(name = "Member 1") }, by = idc)
+        val chain = mutableListOf(byMember)
+        repeat(5) { i ->
+            byMember = next(byMember, { it.copy(name = "Member ${i + 2}") }, by = idc)
+            chain += byMember
         }
-        // A concurrent change by a plain member is still checked against the parent.
-        val z = next(v1, { r -> r.copy(members = r.members.filter { it.id != idb }) }, by = idc)
-        assertEquals(Decision.Ignore("unauthorized"), RosterRules.decide(x, z, parent))
+        assertTrue(RosterRules.beats(open.roster, listOf(byAdmin), chain))
+        assertFalse(RosterRules.beats(open.roster, chain, listOf(byAdmin)))
+        // Taking out the other branch's author wins, even against an admin.
+        val kickB = next(v1, { r -> r.copy(members = r.members.filter { it.id != idb }) }, by = ida)
+        assertTrue(RosterRules.beats(v1.roster, listOf(kickB), listOf(y)))
+        assertFalse(RosterRules.beats(v1.roster, listOf(y), listOf(kickB)))
     }
 
     @Test

@@ -99,8 +99,13 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
 
     override fun addHistory(gid: String, r: SignedRoster, sibling: Boolean) {
         val cid = cidOf(gid) ?: return
-        if (sibling && db.long("SELECT COUNT(*) FROM group_rosters WHERE cid = ? AND ver = ?", cid, r.roster.ver) >= GroupEngine.MAX_SIBLINGS) {
-            return
+        if (sibling) {
+            val held = db.query("SELECT roster, sig FROM group_rosters WHERE cid = ? AND ver = ?", cid, r.roster.ver) { c ->
+                trustedRoster(c.getBlob(0), c.getBlob(1))?.roster
+            }.filterNotNull()
+            if (!GroupEngine.siblingFits(held, r.roster)) {
+                return
+            }
         }
         db.exec(
             "INSERT OR IGNORE INTO group_rosters (cid, ver, hash, roster, sig) VALUES (?, ?, ?, ?, ?)",

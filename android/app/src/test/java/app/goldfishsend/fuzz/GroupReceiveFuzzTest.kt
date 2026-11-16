@@ -311,6 +311,7 @@ class GroupReceiveFuzzTest {
         })
 
         init {
+            GroupEngine.forgetAsked()
             for (r in W.honest.filter { it.roster.ver <= start.roster.ver }) {
                 store.addHistory(W.gid, r)
             }

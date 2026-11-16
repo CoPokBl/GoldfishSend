@@ -289,6 +289,23 @@ sealed class RosterOp {
             if (base.role(me) != Role.INVITED) null else base.copy(members = base.members.map { if (it.id == me) it.copy(role = Role.MEMBER) else it })
     }
 
+    /** Several changes in one roster: what a member re-applies after losing a fork. */
+    @Serializable
+    @SerialName("batch")
+    data class Batch(val ops: List<RosterOp>) : RosterOp() {
+        override fun apply(base: Roster, me: String): Roster? {
+            var r = base
+            var changed = false
+            for (op in ops) {
+                op.apply(r, me)?.let {
+                    r = it
+                    changed = true
+                }
+            }
+            return r.takeIf { changed }
+        }
+    }
+
     fun encode(): String = OpJson.encodeToString(serializer(), this)
 
     companion object {
@@ -348,47 +365,51 @@ object RosterRules {
         return !base.adminsOnly && r.adminsOnly == base.adminsOnly && newRole == baseRole && baseRole != Role.INVITED
     }
 
-    sealed class Decision {
-        /** Accept. [needSync]: versions were skipped, so ask an admin for the history. */
-        data class Accept(val needSync: Boolean) : Decision()
+    /** [r] can follow [parent]: one version on, and allowed by rule 2. */
+    fun validChild(parent: Roster, r: Roster): Boolean = r.prev.isNotEmpty() && r.ver == parent.ver + 1 && authorized(parent, r)
 
-        /** Same version, and the incoming one has the larger hash: it replaces ours. */
-        data object Replace : Decision()
-
-        /** Same version, ours has the larger hash: keep it. */
-        data object Keep : Decision()
-
-        data class Ignore(val reason: String) : Decision()
+    /**
+     * Fork choice (rule 3): whether branch [a] beats branch [b], both growing from [fork]. Each runs from the fork's child
+     * to the tip on that side. In order:
+     * 1. A branch that takes out the author of the other's first roster wins (a removal beats the removed member's
+     *    change, a departure stands against the leaver's own concurrent change).
+     * 2. More changes made by admins wins: a member who isn't one can't outweigh them, however many rosters they sign.
+     * 3. More distinct authors wins: one member can't outweigh several.
+     * 4. The larger hash of the first roster wins.
+     */
+    fun beats(fork: Roster, a: List<SignedRoster>, b: List<SignedRoster>): Boolean {
+        val a0 = a.first().roster
+        val b0 = b.first().roster
+        if (a0.by != b0.by) {
+            val aDrops = fork.role(b0.by) != null && a.last().roster.role(b0.by) == null
+            val bDrops = fork.role(a0.by) != null && b.last().roster.role(a0.by) == null
+            if (aDrops != bDrops) {
+                return aDrops
+            }
+        }
+        val aw = adminChanges(fork, a)
+        val bw = adminChanges(fork, b)
+        if (aw != bw) {
+            return aw > bw
+        }
+        val aa = a.map { it.roster.by }.toSet().size
+        val ba = b.map { it.roster.by }.toSet().size
+        if (aa != ba) {
+            return aa > ba
+        }
+        return compareUnsigned(a.first().hash, b.first().hash) > 0
     }
 
-    /** Rule 3 (order). [parent] looks up an earlier roster we have, by its b64u hash. */
-    fun decide(current: SignedRoster, incoming: SignedRoster, parent: (String) -> Roster?): Decision {
-        val c = current.roster
-        val r = incoming.roster
-        if (incoming.hashB64 == current.hashB64) {
-            return Decision.Ignore("same")
-        }
-        return when {
-            r.ver == c.ver + 1 && r.prev == current.hashB64 ->
-                if (authorized(c, r)) Decision.Accept(false) else Decision.Ignore("unauthorized")
-            r.ver == c.ver -> {
-                val base = parent(r.prev)
-                val ok = if (base != null) authorized(base, r) else c.isAdmin(r.by)
-                // A removal beats a concurrent change by the person removed (typically their acceptance of the invitation
-                // being withdrawn): otherwise they could stay in by winning the tie.
-                val inKicks = r.role(c.by) == null && c.role(c.by) != null && r.by != c.by
-                val curKicks = c.role(r.by) == null && r.role(r.by) != null && c.by != r.by
-                val wins = if (inKicks != curKicks) inKicks else compareUnsigned(incoming.hash, current.hash) > 0
-                when {
-                    !ok -> Decision.Ignore("unauthorized")
-                    wins -> Decision.Replace
-                    else -> Decision.Keep
-                }
+    private fun adminChanges(fork: Roster, branch: List<SignedRoster>): Int {
+        var parent = fork
+        var n = 0
+        for (s in branch) {
+            if (parent.isAdmin(s.roster.by)) {
+                n++
             }
-            // Skipped versions, or a successor of a concurrent sibling we never saw: only an admin of ours is trusted.
-            r.ver > c.ver -> if (c.isAdmin(r.by)) Decision.Accept(true) else Decision.Ignore("unauthorized")
-            else -> Decision.Ignore("old")
+            parent = s.roster
         }
+        return n
     }
 
     fun compareUnsigned(a: ByteArray, b: ByteArray): Int {
