@@ -328,7 +328,7 @@ class GroupEngine(
                 send(m, id, content)
             }
             if (m.state == GroupModel.INVITED) {
-                v.owner?.let { m.peers[it] = PeerSync(sent = DECLINED) }
+                v.owner?.let { m.peers[it] = PeerSync(sent = DECLINED, sentTs = io.nowMillis()) }
             }
         }
         m.state = GroupModel.LEFT
@@ -490,7 +490,7 @@ class GroupEngine(
                 else -> false
             }
             if (sent) {
-                m.peers[id] = PeerSync(sent = DECLINED)
+                m.peers[id] = PeerSync(sent = DECLINED, sentTs = io.nowMillis())
             }
         }
         store.save(m)
@@ -790,6 +790,9 @@ class GroupEngine(
      * (at most once per [RESEND_AFTER]). If it has left since, its answer names who owns the group now.
      */
     private fun behindAGap(m: GroupModel) {
+        if (m.state != GroupModel.JOINED) {
+            return
+        }
         val owner = m.view()?.owner?.takeIf { it != me } ?: return
         val ps = m.peers[owner] ?: return
         if (io.nowMillis() - ps.sentTs >= RESEND_AFTER) {
