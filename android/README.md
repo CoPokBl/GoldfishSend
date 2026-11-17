@@ -150,7 +150,13 @@ There's a single `:app` module, so the build stays simple and fast. It has no DI
 - **Endpoint rotation**: only verified mailboxes are rotated. A `404` on a batch falls back to rotating one by one. A contact's mailbox that the server no longer knows is replaced, and the contact gets an E2E `mailbox` message. Rate-limited rotations (`429`) are retried by maintenance.
 
 ### Contacts (invites)
-A pool of two ready, verified mailboxes is kept in the background (Argon2id PoW plus verification push), so **Add contact is instant**.
+A pool of three ready, verified mailboxes is kept in the background (Argon2id PoW plus verification push), so **Add contact is instant**.
+The PoW is deliberately slow (several seconds at base, much longer on a busy or shared network). It runs in the app's
+scope with no time limit, fetching a fresh challenge before one expires, and the pool fills one mailbox at a time.
+Screens that need a mailbox when the pool is empty (first setup, an invite, creating or joining a group) show a progress
+bar with a time estimate and can be left: the group or join completes, and the mailbox lands in the pool for next time.
+PoW for a contact's server (to get past a send limit) is a separate lane with tight caps and a 180 s timeout, and it
+pauses whenever our own mailbox creation needs the solver.
 Showing your code uploads a one-time encrypted `InviteBundle` (signed prekey and one-time Kyber-1024 prekey). The QR code holds only `server + inviteId + key`.
 Scanning fetches the invite (which deletes it), builds a PQXDH session and opens the chat right away. `hello` and anything typed are queued until delivery succeeds.
 Contacts added by scanning in person are marked **verified**. Contacts added by link are not, until you compare safety numbers.
@@ -240,7 +246,7 @@ All of these live in **Settings**. Only those with no real downside are on by de
 - **Re-authentication** (your app PIN or passphrase, or the phone's screen lock) is needed before changing the unlock method, duress PIN, hidden chats, erase settings, the panic response or the connection mode.
 - **Disappearing messages are shredded on time, even while locked.** Messages with an expiry are wrapped under hourly Keystore keys that are deleted when their hour is over. The chat's timer is the ceiling: a contact can make messages vanish sooner, never later.
 - **View-once** messages are deleted before they're shown.
-- **Hostile contacts and servers:** proof-of-work parameters are capped (difficulty, Argon2 memory and iterations, expected work), solver threads × memory stays within a heap budget, and solving times out, responses are capped at 64 KiB, each contact is sent to separately, contact-supplied servers must use https on 443 (or a valid onion), invites are bound to their own mailbox and prekey, names are sanitised and timestamps clamped.
+- **Hostile contacts and servers:** proof of work for a server other than our own is capped tightly (at most 2^11 Argon2 calls of 16 MiB, 180 s), solver threads × memory stays within a heap budget, and our own mailbox creation goes first, responses are capped at 64 KiB, each contact is sent to separately, contact-supplied servers must use https on 443 (or a valid onion), invites are bound to their own mailbox and prekey, names are sanitised and timestamps clamped.
 - **Restart wipe** also clears pushes waiting in the locked inbox and replaces its key.
 - **The Security tab** uses hardware key attestation for boot and bootloader state where available. It's checked on the device itself, without a server-side chain check, but it's far harder to spoof than system properties.
 

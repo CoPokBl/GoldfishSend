@@ -79,11 +79,9 @@ import app.goldfishsend.ui.components.rememberQuery
 import app.goldfishsend.ui.components.rememberTicker
 import app.goldfishsend.ui.components.ButtonKind
 import app.goldfishsend.ui.components.ProgressButton
+import app.goldfishsend.ui.components.MailboxWait
 import app.goldfishsend.ui.components.ProgressRow
 import app.goldfishsend.ui.components.TopProgressBar
-import app.goldfishsend.core.Mailboxes
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -221,6 +219,7 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
     var error by remember { mutableStateOf<String?>(null) }
     var generation by remember { mutableIntStateOf(0) }
     var sharing by remember { mutableStateOf(false) }
+    var shareJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val now by rememberTicker(true)
 
     LaunchedEffect(generation) {
@@ -263,20 +262,7 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
             if (inv != null) {
                 QrImage(inv.link.toUri(), Modifier.fillMaxSize())
             } else {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Color(0xFF9A4A00))
-                    // Only when no ready mailbox was left and a new one is being made (proof of work).
-                    val p by Mailboxes.progress.collectAsState()
-                    p?.let {
-                        Spacer(Modifier.height(20.dp))
-                        val solved = it.solved
-                        if (solved != null) {
-                            LinearProgressIndicator(progress = { solved }, Modifier.fillMaxWidth(0.7f), color = Color(0xFF9A4A00), trackColor = Color(0x339A4A00))
-                        } else {
-                            LinearProgressIndicator(Modifier.fillMaxWidth(0.7f), color = Color(0xFF9A4A00), trackColor = Color(0x339A4A00))
-                        }
-                    }
-                }
+                CircularProgressIndicator(color = Color(0xFF9A4A00))
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -289,15 +275,9 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
             textAlign = TextAlign.Center,
             style = MaterialTheme.typography.bodyLarge,
         )
-        val making by Mailboxes.progress.collectAsState()
-        if (inv == null && making != null) {
-            Text(
-                "Setting up a new private inbox. This can take up to a minute.",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-            )
-        }
+        // Only when no ready mailbox was left and a new one is being made. Leaving is fine: it lands in the pool, and the
+        // code is ready next time.
+        MailboxWait(inv == null || sharing, Modifier.fillMaxWidth(0.85f), cancelLabel = "Stop sharing", onCancel = shareJob?.let { j -> { j.cancel() } })
         if (inv != null) {
             val left = ((inv.expiresAt - now) / 1000).coerceAtLeast(0)
             Text(
@@ -312,7 +292,7 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
             kind = ButtonKind.OUTLINED,
             onClick = {
                 sharing = true
-                scope.launch {
+                shareJob = scope.launch {
                     try {
                         val link = withContext(Dispatchers.IO) { Invites.create(s, Mailbox.PURPOSE_LINK) }
                         val send = Intent(Intent.ACTION_SEND).apply {
@@ -320,10 +300,13 @@ private fun MyCode(s: Session, openChat: (Long) -> Unit, snackbar: SnackbarHostS
                             putExtra(Intent.EXTRA_TEXT, "Let's chat privately on GoldfishSend. This link works once, for 24 hours:\n${link.link.toUri()}")
                         }
                         ctx.startActivity(Intent.createChooser(send, "Share invite link"))
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        // Stopped. The mailbox it was waiting for still goes to the pool.
                     } catch (e: Exception) {
                         snackbar.showSnackbar(e.friendly())
                     } finally {
                         sharing = false
+                        shareJob = null
                     }
                 }
             },

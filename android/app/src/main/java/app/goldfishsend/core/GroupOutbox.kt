@@ -199,7 +199,7 @@ object GroupOutbox {
         if (!e.powCanHelp || batch.maxOf { it.item.attempts } >= 3) {
             throw e
         }
-        val ch = api.powChallenge()
+        val ch = api.powChallenge(forSend = true)
         val nonce = Outbox.solvePow(ch)
         call(Outbox.powHeader(ch, nonce))
     }

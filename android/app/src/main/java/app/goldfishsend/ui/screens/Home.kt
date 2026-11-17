@@ -97,7 +97,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material3.CircularProgressIndicator
-import app.goldfishsend.ui.components.MailboxProgressBar
+import app.goldfishsend.ui.components.MailboxWait
 import app.goldfishsend.ui.components.SecureTextField
 import app.goldfishsend.ui.components.rememberShowProgress
 import app.goldfishsend.ui.components.rememberWork
@@ -214,11 +214,9 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
     ) { pad ->
         Column(Modifier.padding(top = pad.calculateTopPadding()).fillMaxSize()) {
             StatusLine(!pushOk && Graph.prefs.onboarded, "Notifications aren't connected yet. Check your push app.", action = null)
+            // First setup: the mailbox pool is being filled. The app is usable meanwhile; invites wait for the first one.
             val preparing = pushOk && busy && chats.isNullOrEmpty()
-            StatusLine(preparing, "Getting ready… The first time can take up to a minute.")
-            if (preparing) {
-                MailboxProgressBar()
-            }
+            MailboxWait(preparing, Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
             StatusLine(revealed, "Showing hidden chats", action = "Hide") { s.hiddenRevealed.value = false }
             AnimatedVisibility(searching, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                 SecureTextField(

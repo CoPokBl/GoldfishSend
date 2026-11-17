@@ -1,8 +1,11 @@
 package app.goldfishsend
 
+import app.goldfishsend.core.Mailboxes
 import app.goldfishsend.proto.Pow
 import app.goldfishsend.proto.Rand
+import app.goldfishsend.ui.components.mailboxWaitText
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -10,13 +13,13 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -31,6 +34,12 @@ private fun unhex(s: String) = ByteArray(s.length / 2) { s.substring(2 * it, 2 *
 
 /** Small parameters, so solving takes milliseconds. */
 private fun small(difficulty: Int) = Pow.Params(difficulty, 64, 1)
+
+/** A challenge source for [Pow.solveOwn] that hands out fresh [p] challenges valid for [validForMs]. */
+private fun challenges(p: Pow.Params, validForMs: Long = 300_000, fetched: AtomicInteger = AtomicInteger()): suspend () -> Pow.Challenge = {
+    fetched.incrementAndGet()
+    Pow.Challenge(Rand.bytes(32), p, validForMs)
+}
 
 class PowTest {
     @Test
@@ -50,13 +59,13 @@ class PowTest {
     }
 
     @Test
-    fun parallelSolverProducesValidNonce() = runBlocking {
-        val ch = Rand.bytes(32)
+    fun bothLanesProduceValidNonces() = runBlocking {
         val hashes = AtomicLong()
-        val nonce = Pow.solve(ch, small(6), hashes = hashes)
-        assertEquals(8, nonce.size)
-        assertTrue(Pow.check(ch, nonce, small(6)))
+        val (ch, nonce) = Pow.solveOwn(challenges(small(6)), hashes)
+        assertTrue(Pow.check(ch.bytes, nonce, small(6)))
         assertTrue("counts Argon2 calls for the progress bar", hashes.get() >= 1)
+        val other = Rand.bytes(32)
+        assertTrue(Pow.check(other, Pow.solveContact(other, small(6)), small(6)))
     }
 
     @Test
@@ -99,7 +108,7 @@ class PowVectorsTest {
             assertEquals("$c", c.str("hash"), hex(hash))
             val zeros = c.int("leadingZeroBits")
             assertEquals(zeros, Pow.leadingZeroBits(hash))
-            assertTrue(Pow.check(challenge, nonce, Pow.Params(minOf(zeros, Pow.MAX_DIFFICULTY), m, t)))
+            assertTrue(Pow.check(challenge, nonce, Pow.Params(minOf(zeros, Pow.Lane.CONTACT_SEND.maxDifficulty), m, t)))
             assertFalse(Pow.check(challenge, nonce, Pow.Params(zeros + 1, m, t)))
         }
     }
@@ -113,21 +122,43 @@ class PowVectorsTest {
     }
 }
 
-/** A hostile or broken server (possibly a contact's) must not be able to pin the cores or the memory. */
-class PowLimitsTest {
+/**
+ * The two lanes: our own server may ask for a lot (up to its maximum under load), a contact's server only a little. A
+ * hostile or broken server must not be able to pin the cores or the memory.
+ */
+class PowLanesTest {
+    private val own = Pow.Lane.OWN_MAILBOX
+    private val contact = Pow.Lane.CONTACT_SEND
+
     @Test
-    fun theDefaultServersParametersAreAccepted_UpToItsWorstCase() {
-        assertNull(Pow.refusal(Pow.Params(6, 16 * 1024, 1)))
-        assertNull(Pow.refusal(Pow.Params(6 + 6 + 2, 16 * 1024, 1)))
-        assertNull(Pow.refusal(Pow.Params(Pow.MAX_DIFFICULTY, 8, 1)))
-        assertNull(Pow.refusal(Pow.Params(12, 64 * 1024, 1)))
+    fun ourServer_MayAskUpToTwiceItsDefaultMaximum() {
+        // Defaults: base 8, +6 for a busy network, +2 under global load, at 16 MiB.
+        assertNull(Pow.refusal(Pow.Params(8, 16 * 1024, 1), own))
+        assertNull(Pow.refusal(Pow.Params(8 + 6 + 2, 16 * 1024, 1), own))
+        assertNull(Pow.refusal(Pow.Params(17, 16 * 1024, 1), own))
+        assertEquals("work", Pow.refusal(Pow.Params(18, 16 * 1024, 1), own))
+        assertNull(Pow.refusal(Pow.Params(24, 8, 1), own))
+        assertEquals("difficulty", Pow.refusal(Pow.Params(25, 8, 1), own))
+        assertNull(own.timeoutMs)
     }
 
     @Test
-    fun unreasonableParametersAreRefused() {
+    fun aContactsServer_GetsOnlyAMinuteOrTwo() {
+        // The default send challenge (6 bits) is fine, and so is some headroom.
+        assertNull(Pow.refusal(Pow.Params(6, 16 * 1024, 1), contact))
+        assertNull(Pow.refusal(Pow.Params(11, 16 * 1024, 1), contact))
+        // What our own server may ask for creation is far too much here.
+        assertEquals("work", Pow.refusal(Pow.Params(8 + 6 + 2, 16 * 1024, 1), contact))
+        assertEquals("work", Pow.refusal(Pow.Params(12, 16 * 1024, 1), contact))
+        assertEquals("work", Pow.refusal(Pow.Params(10, 64 * 1024, 1), contact))
+        assertEquals("difficulty", Pow.refusal(Pow.Params(21, 8, 1), contact))
+        assertEquals(180_000L, contact.timeoutMs)
+    }
+
+    @Test
+    fun unreasonableParametersAreRefusedInBothLanes() {
         val refused = mapOf(
             Pow.Params(-1, 64, 1) to "difficulty",
-            Pow.Params(Pow.MAX_DIFFICULTY + 1, 8, 1) to "difficulty",
             Pow.Params(64, 64, 1) to "difficulty",
             Pow.Params(Int.MAX_VALUE, 64, 1) to "difficulty",
             Pow.Params(0, 7, 1) to "memory",
@@ -137,27 +168,33 @@ class PowLimitsTest {
             Pow.Params(0, 64, 0) to "iterations",
             Pow.Params(0, 64, 5) to "iterations",
             Pow.Params(0, 64, 1000) to "iterations",
-            Pow.Params(15, 16 * 1024, 1) to "work",
-            Pow.Params(14, 16 * 1024, 2) to "work",
-            Pow.Params(13, 64 * 1024, 1) to "work",
         )
-        for ((p, why) in refused) {
-            assertEquals("$p", why, Pow.refusal(p))
+        for (lane in Pow.Lane.entries) {
+            for ((p, why) in refused) {
+                assertEquals("$lane $p", why, Pow.refusal(p, lane))
+            }
         }
     }
 
     @Test
     fun refusedChallengesFailImmediately() = runBlocking {
-        for (p in listOf(Pow.Params(Pow.MAX_DIFFICULTY + 1, 64, 1), Pow.Params(1, 1 shl 20, 1), Pow.Params(18, 16 * 1024, 1))) {
-            val start = System.currentTimeMillis()
+        val start = System.currentTimeMillis()
+        for (p in listOf(Pow.Params(12, 16 * 1024, 1), Pow.Params(1, 1 shl 20, 1), Pow.Params(21, 64, 1))) {
             try {
-                Pow.solve(ByteArray(32), p)
-                fail("$p should be refused")
+                Pow.solveContact(ByteArray(32), p)
+                fail("$p should be refused for a contact")
             } catch (e: Pow.TooHardException) {
                 assertEquals(p, e.params)
-                assertTrue(System.currentTimeMillis() - start < 1_000)
             }
         }
+        try {
+            Pow.solveOwn(challenges(Pow.Params(18, 16 * 1024, 1)))
+            fail("should be refused for our own server too")
+        } catch (e: Pow.TooHardException) {
+            assertEquals("work", e.why)
+        }
+        assertTrue(System.currentTimeMillis() - start < 2_000)
+        assertFalse(Pow.ownBusy)
     }
 
     @Test
@@ -181,24 +218,51 @@ class PowLimitsTest {
             }
         }
     }
+}
 
+class PowSolverTest {
     @Test
-    fun solverTimesOut() = runBlocking {
+    fun aContactSolveTimesOut() = runBlocking {
         val start = System.currentTimeMillis()
         try {
-            Pow.solve(ByteArray(32) { 9 }, Pow.Params(Pow.MAX_DIFFICULTY, 64, 1), timeoutMs = 300)
+            Pow.solveContact(ByteArray(32) { 9 }, Pow.Params(20, 8, 1), timeoutMs = 300)
             fail("should time out")
         } catch (e: TimeoutCancellationException) {
             assertTrue("stopped promptly", System.currentTimeMillis() - start < 5_000)
         }
     }
 
+    /**
+     * Our own server's challenge lasts a few minutes, and a solve may take longer. Before one expires the solver fetches
+     * a fresh one and carries on, and the work count (and so the progress bar) keeps growing instead of starting over.
+     */
     @Test
-    fun cancellingStopsEveryWorkerWithinACall() = runBlocking {
+    fun anOwnSolveMovesToAFreshChallengeBeforeExpiry_AndKeepsCounting() = runBlocking {
+        val fetched = AtomicInteger()
         val hashes = AtomicLong()
-        val job = async(Dispatchers.Default) { Pow.solve(Rand.bytes(32), Pow.Params(16, 1024, 1), hashes = hashes) }
-        while (hashes.get() < 8) {
-            delay(10)
+        // A clock that ticks once per Argon2 call: each challenge (valid for "100 ms") is searched for 50 calls. The
+        // first three are practically unsolvable in that (24 bits), the fourth is easy.
+        val next: suspend () -> Pow.Challenge = {
+            val n = fetched.incrementAndGet()
+            Pow.Challenge(Rand.bytes(32), if (n <= 3) Pow.Params(24, 8, 1) else small(2), 100)
+        }
+        val (ch, nonce) = Pow.solveOwn(next, hashes, clock = { hashes.get() })
+        assertEquals(4, fetched.get())
+        assertEquals(small(2), ch.params)
+        assertTrue(Pow.check(ch.bytes, nonce, ch.params))
+        assertTrue("work across all four challenges is counted: ${hashes.get()}", hashes.get() >= 150)
+        assertEquals(2.5f, Pow.searchWindowMs(5_000) / 1000f, 0f)
+        assertEquals(270_000L, Pow.searchWindowMs(300_000))
+    }
+
+    @Test
+    fun anOwnSolveHasNoTimeLimit_ButIsCancellable() = runBlocking {
+        val hashes = AtomicLong()
+        val job = async(Dispatchers.Default) { Pow.solveOwn(challenges(Pow.Params(20, 1024, 1)), hashes) }
+        withTimeout(10_000) {
+            while (hashes.get() < 8) {
+                delay(10)
+            }
         }
         job.cancel()
         val start = System.currentTimeMillis()
@@ -212,17 +276,99 @@ class PowLimitsTest {
         val after = hashes.get()
         delay(300)
         assertEquals("no worker keeps hashing after cancellation", after, hashes.get())
+        assertFalse(Pow.ownBusy)
+    }
+
+    /** A contact's server can't hold up our own mailbox creation: its search steps aside, then carries on. */
+    @Test
+    fun ourOwnMailboxGoesAheadOfAContactsSolve() = runBlocking {
+        val contactHashes = AtomicLong()
+        val contact = async(Dispatchers.Default) {
+            Pow.solveContact(Rand.bytes(32), Pow.Params(20, 8, 1), timeoutMs = 60_000, hashes = contactHashes)
+        }
+        try {
+            withTimeout(10_000) {
+                while (contactHashes.get() < 50) {
+                    delay(10)
+                }
+            }
+            val ownHashes = AtomicLong()
+            val start = System.currentTimeMillis()
+            // Our search runs for a known stretch: its first challenge (practically unsolvable) is searched for 400 calls
+            // of a "clock" that ticks per call, then an easy one.
+            val fetched = AtomicInteger()
+            val next: suspend () -> Pow.Challenge = {
+                val n = fetched.incrementAndGet()
+                Pow.Challenge(Rand.bytes(32), if (n == 1) Pow.Params(20, 1024, 1) else small(1), 800)
+            }
+            val own = async(Dispatchers.Default) { Pow.solveOwn(next, ownHashes, clock = { ownHashes.get() }) }
+            withTimeout(10_000) {
+                while (ownHashes.get() < 20) {
+                    delay(2)
+                }
+            }
+            // Ours is mid-search (well before its 400th call): the contact's must be standing still.
+            val pausedAt = contactHashes.get()
+            withTimeout(10_000) {
+                while (ownHashes.get() < 200) {
+                    delay(2)
+                }
+            }
+            val duringOwn = contactHashes.get() - pausedAt
+            val (ch, nonce) = own.await()
+            assertTrue(Pow.check(ch.bytes, nonce, ch.params))
+            assertTrue("own solve wasn't queued behind the contact's: ${System.currentTimeMillis() - start} ms",
+                System.currentTimeMillis() - start < 30_000)
+            assertEquals("the contact search paused while ours ran", 0L, duringOwn)
+            // And it carries on afterwards.
+            withTimeout(10_000) {
+                while (contactHashes.get() < pausedAt + 20) {
+                    delay(10)
+                }
+            }
+        } finally {
+            contact.cancel()
+        }
+    }
+}
+
+class PowProgressTest {
+    @Test
+    fun remainingTimeCountsDownToTheAverage_ThenStops() {
+        // 2^8 calls at 25 a second: about 10 s in all.
+        assertEquals(11L, Pow.remainingSeconds(8, 25.0, 0.0))
+        assertEquals(6L, Pow.remainingSeconds(8, 25.0, 5.0))
+        assertNull(Pow.remainingSeconds(8, 25.0, 11.0))
+        assertNull(Pow.remainingSeconds(8, 0.0, 1.0))
     }
 
     @Test
-    fun easyChallengesStillSolve() = runBlocking {
-        val ch = ByteArray(32) { 3 }
-        assertTrue(Pow.check(ch, Pow.solve(ch, small(4)), small(4)))
+    fun progressUsesTheMeasuredSpeedOnceThereIsOne() {
+        // 400 calls in 10 s is 40 a second: 256 calls take 6.4 s on average, so it's past that already.
+        val late = Mailboxes.progressOf(400, 8, 10.0)
+        assertNull(late.remainingSeconds)
+        assertTrue(late.overdue)
+        assertTrue(late.solved!! > 0.8f)
+        // 100 calls in 10 s: 25.6 s expected in all.
+        val early = Mailboxes.progressOf(100, 8, 10.0)
+        assertEquals(16L, early.remainingSeconds)
+        assertFalse(early.overdue)
+    }
+
+    @Test
+    fun theWaitIsExplainedInPlainWords() {
+        assertEquals("Almost done. Waiting for your server to confirm.", mailboxWaitText(Mailboxes.Progress(null)))
+        assertEquals("A few seconds left", mailboxWaitText(Mailboxes.Progress(0.5f, 7)))
+        assertEquals("About 25 seconds left", mailboxWaitText(Mailboxes.Progress(0.2f, 23)))
+        assertEquals("About a minute left", mailboxWaitText(Mailboxes.Progress(0.2f, 70)))
+        assertEquals("About 12 minutes left", mailboxWaitText(Mailboxes.Progress(0.1f, 700)))
+        assertTrue(mailboxWaitText(Mailboxes.Progress(0.9f, null, overdue = true)).startsWith("Taking longer than usual"))
+        assertTrue(mailboxWaitText(Mailboxes.Progress(0.01f, 7200)).contains("hour"))
     }
 }
 
 /**
- * Argon2id speed on this JVM, as a rough proxy for a phone (run with -Pgf.powBench). The device test PowBenchmarkDeviceTest
+ * Argon2id speed on this JVM, as a rough proxy for a phone (run with -Pgf.powBench). The device test PowDeviceTest
  * measures the same on Android.
  */
 class PowBenchmarkTest {

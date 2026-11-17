@@ -6,6 +6,7 @@ import app.goldfishsend.db.setRotateNeeded
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.CreateMailboxRequest
 import app.goldfishsend.net.MailboxItem
+import app.goldfishsend.net.PowChallenge
 import app.goldfishsend.net.PowSolution
 import app.goldfishsend.net.RotateRequest
 import app.goldfishsend.proto.B64
@@ -14,8 +15,17 @@ import app.goldfishsend.proto.Pow
 import app.goldfishsend.proto.ProtoJson
 import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -27,45 +37,74 @@ data class PushEndpointData(val url: String, val p256dh: String, val auth: Strin
 
 /**
  * Inbound mailbox lifecycle: create (PoW + verification push), pool for instant invites, rotate on endpoint change,
- * refresh before expiry, and delete. None of this is ever surfaced in the UI.
+ * refresh before expiry, and delete.
+ *
+ * Creating a mailbox costs a proof of work on our own server (several seconds on a phone, much more on a busy network),
+ * so a pool of [POOL_TARGET] verified mailboxes is kept ready, filled one at a time in the app's scope. Whoever needs a
+ * mailbox takes one from the pool, or waits for the fill to deliver the next: leaving the screen doesn't waste the work.
  */
 object Mailboxes {
     private const val TAG = "Mailboxes"
-    const val POOL_TARGET = 2
+
+    /**
+     * Ready mailboxes kept in the pool. Three cover the usual bursts (add a contact, start a group, show a code) without a
+     * wait. Each is one more row on the server per user (a few hundred bytes, and a proof of work once).
+     */
+    const val POOL_TARGET = 3
     private const val VERIFY_TIMEOUT_MS = 120_000L
     private const val ROTATIONS_PER_PASS = 3
     private const val BUSY_RETRIES = 4
+
+    /** Before the first measurement: a guess at Argon2 calls per second (a mid-range phone at 16 MiB, 4 threads). */
+    private const val DEFAULT_CALLS_PER_SECOND = 25.0
 
     /** The server's max message TTL (14 days) plus a day of margin. */
     private const val DRAIN_MS = 15 * 86_400_000L
 
     private val waiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
-    private val poolMutex = Mutex()
     private val rotateMutex = Mutex()
 
-    private val _busy = kotlinx.coroutines.flow.MutableStateFlow(false)
+    private val fillLock = Any()
+    private var fill: Deferred<Boolean>? = null
+
+    /** Bumped each time a mailbox joins the pool. */
+    private val poolVersion = MutableStateFlow(0)
+
+    /** Measured speed of the last proof of work, for the next time estimate. */
+    @Volatile
+    private var callsPerSecond = DEFAULT_CALLS_PER_SECOND
+
+    private val _busy = MutableStateFlow(false)
 
     /** True while a mailbox is being prepared in the background (drives a subtle spinner). */
-    val busy: kotlinx.coroutines.flow.StateFlow<Boolean> = _busy
+    val busy: StateFlow<Boolean> = _busy
 
     /**
-     * A mailbox being created: [solved] is the estimated progress of its proof of work, or null once that's done and
-     * the server's confirmation push is awaited.
+     * A mailbox being created. [solved] is the estimated progress of its proof of work, or null once that's done and the
+     * server's confirmation push is awaited. [remainingSeconds] is a rough estimate of the time left, or null when there
+     * isn't one: at first, and once the average has passed ([overdue]).
      */
-    class Progress(val solved: Float?)
+    class Progress(val solved: Float?, val remainingSeconds: Long? = null, val overdue: Boolean = false)
 
-    private val _progress = kotlinx.coroutines.flow.MutableStateFlow<Progress?>(null)
+    private val _progress = MutableStateFlow<Progress?>(null)
 
-    /** Progress of the mailbox being created right now, or null. Proof of work can take tens of seconds on a phone. */
-    val progress: kotlinx.coroutines.flow.StateFlow<Progress?> = _progress
+    /** Progress of the mailbox being created right now, or null. */
+    val progress: StateFlow<Progress?> = _progress
 
     fun endpoint(s: Session): PushEndpointData? =
         s.repo.kvString("push_endpoint")?.let { ProtoJson.decodeFromString(PushEndpointData.serializer(), it) }
 
     fun item(m: Mailbox) = MailboxItem(B64.enc(m.sendSecret), B64.enc(m.ownerSecret))
 
-    /** Creates and verifies one mailbox on our server. Returns null if push isn't ready yet. */
-    suspend fun create(s: Session, purpose: Int): Mailbox? {
+    /**
+     * Creates and verifies one mailbox on our server, for the pool. Returns null if push isn't ready yet, or the
+     * verification push didn't arrive in time.
+     *
+     * The proof of work has no time limit ([Pow.Lane.OWN_MAILBOX]): it fetches fresh challenges as they near expiry, and
+     * only stops if cancelled. The local row is only written once it's solved, so cleanup of abandoned creations can't
+     * remove one that's still being worked on.
+     */
+    private suspend fun create(s: Session, purpose: Int): Mailbox? {
         if (s.decoy) {
             return null
         }
@@ -73,75 +112,126 @@ object Mailboxes {
         val send = MailboxCrypto.newSecret()
         val owner = MailboxCrypto.newSecret()
         val tag = MailboxCrypto.tag(send)
-        val id = s.repo.insertMailbox(purpose, send, owner, tag)
         val key = B64.enc(tag)
         val waiter = CompletableDeferred<Unit>()
         waiters[key] = waiter
         _busy.value = true
+        var id: Long? = null
+        // Set once the row should stay: active, or pending a late verification push.
+        var keep = false
         try {
             val api = Graph.api()
-            val ch = api.powChallenge()
-            val hashes = java.util.concurrent.atomic.AtomicLong()
-            _progress.value = Progress(0f)
-            val nonce = kotlinx.coroutines.coroutineScope {
-                val ticker = launch {
-                    while (true) {
-                        kotlinx.coroutines.delay(250)
-                        _progress.value = Progress(Pow.estimatedProgress(hashes.get(), ch.difficulty))
-                    }
-                }
-                try {
-                    Outbox.solvePow(ch, hashes)
-                } finally {
-                    ticker.cancel()
-                }
-            }
-            _progress.value = Progress(null)
-            val request = CreateMailboxRequest(
-                pow = PowSolution(ch.challenge, B64.enc(nonce)),
-                sendSecret = B64.enc(send),
-                ownerHash = B64.enc(MailboxCrypto.ownerHash(owner)),
-                endpoint = ep.url,
-                p256dh = ep.p256dh,
-                auth = ep.auth,
-            )
-            // A 503 here means every verification slot on the server was busy. The challenge is kept for us, so the same
-            // solution is retried after a moment instead of being thrown away.
             var attempt = 0
             while (true) {
+                val (ch, nonce) = solve(api)
+                _progress.value = Progress(null)
+                val request = CreateMailboxRequest(
+                    pow = PowSolution(ch.challenge, B64.enc(nonce)),
+                    sendSecret = B64.enc(send),
+                    ownerHash = B64.enc(MailboxCrypto.ownerHash(owner)),
+                    endpoint = ep.url,
+                    p256dh = ep.p256dh,
+                    auth = ep.auth,
+                )
+                if (id == null) {
+                    id = s.repo.insertMailbox(purpose, send, owner, tag)
+                }
                 try {
-                    api.createMailbox(request)
+                    submit(api, request)
                     break
                 } catch (e: ApiException) {
-                    // A longer Retry-After is another kind of 503 (the push service is paused), which used the challenge up.
-                    if (e.status != 503 || (e.retryAfterSeconds ?: 1L) > 2 || ++attempt >= BUSY_RETRIES) {
+                    // pow_invalid: the challenge expired or was used up on the way (a slow network). Solve another.
+                    if (e.code != "pow_invalid" || ++attempt >= 2) {
                         throw e
                     }
-                    kotlinx.coroutines.delay((e.retryAfterSeconds ?: 1L).coerceAtLeast(1L) * 1000L)
                 }
             }
+            val mid = id!!
             // The verification push may already have been handled while the request was in flight.
-            if (s.repo.mailbox(id)?.state != Mailbox.STATE_ACTIVE) {
-                s.repo.setMailboxState(id, Mailbox.STATE_PENDING_VERIFY)
+            if (s.repo.mailbox(mid)?.state != Mailbox.STATE_ACTIVE) {
+                s.repo.setMailboxState(mid, Mailbox.STATE_PENDING_VERIFY)
             }
             withTimeout(VERIFY_TIMEOUT_MS) {
-                if (s.repo.mailbox(id)?.state != Mailbox.STATE_ACTIVE) {
+                if (s.repo.mailbox(mid)?.state != Mailbox.STATE_ACTIVE) {
                     waiter.await()
                 }
             }
+            keep = true
             s.db.notifyChanged()
-            return s.repo.mailbox(id)
+            return s.repo.mailbox(mid)
         } catch (e: TimeoutCancellationException) {
             // Left pending: a late verification push (e.g. after unlock) still activates it, and cleanup removes it otherwise.
             Log.i(TAG, "verification push did not arrive in time")
+            keep = true
             return null
-        } catch (e: ApiException) {
-            s.repo.deleteMailboxRow(id)
-            throw e
         } finally {
+            // Failed or cancelled before the server took it: the local row goes (unless the push already activated it).
+            if (!keep) {
+                id?.let { if (s.repo.mailbox(it)?.state != Mailbox.STATE_ACTIVE) s.repo.deleteMailboxRow(it) }
+            }
             waiters.remove(key)
             _busy.value = false
             _progress.value = null
+        }
+    }
+
+    /** The proof of work for one creation, with progress and a time estimate on [progress]. */
+    private suspend fun solve(api: app.goldfishsend.net.ServerApi): Pair<PowChallenge, ByteArray> {
+        val hashes = AtomicLong()
+        var current: PowChallenge? = null
+        val start = System.nanoTime()
+        _progress.value = Progress(0f)
+        return coroutineScope {
+            val ticker = launch {
+                while (true) {
+                    delay(250)
+                    val d = current?.difficulty ?: continue
+                    _progress.value = progressOf(hashes.get(), d, (System.nanoTime() - start) / 1e9)
+                }
+            }
+            try {
+                val nonce = try {
+                    Pow.solveOwn({ api.powChallenge().also { current = it }.toPow() }, hashes).second
+                } catch (e: Pow.TooHardException) {
+                    throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
+                }
+                val seconds = (System.nanoTime() - start) / 1e9
+                if (seconds > 3 && hashes.get() >= 8) {
+                    callsPerSecond = hashes.get() / seconds
+                }
+                // The challenge that was solved is the latest one fetched.
+                val ch = current!!
+                ch to nonce
+            } finally {
+                ticker.cancel()
+            }
+        }
+    }
+
+    /** Progress after [calls] Argon2 calls in [seconds], at [difficulty]. */
+    internal fun progressOf(calls: Long, difficulty: Int, seconds: Double): Progress {
+        val rate = if (seconds > 3 && calls >= 8) calls / seconds else callsPerSecond
+        val left = Pow.remainingSeconds(difficulty, rate, seconds)
+        return Progress(Pow.estimatedProgress(calls, difficulty), left, overdue = left == null && seconds > 5)
+    }
+
+    /**
+     * Sends the creation request. A 503 with a short Retry-After means every verification slot on the server was busy: the
+     * challenge was kept for us, so the same solution is retried after a moment instead of being thrown away.
+     */
+    private suspend fun submit(api: app.goldfishsend.net.ServerApi, request: CreateMailboxRequest) {
+        var attempt = 0
+        while (true) {
+            try {
+                api.createMailbox(request)
+                return
+            } catch (e: ApiException) {
+                // A longer Retry-After is another kind of 503 (the push service is paused), which used the challenge up.
+                if (e.status != 503 || (e.retryAfterSeconds ?: 1L) > 2 || ++attempt >= BUSY_RETRIES) {
+                    throw e
+                }
+                delay((e.retryAfterSeconds ?: 1L).coerceAtLeast(1L) * 1000L)
+            }
         }
     }
 
@@ -175,43 +265,93 @@ object Mailboxes {
         waiters[B64.enc(tag)]?.complete(Unit)
     }
 
-    /** Keeps [POOL_TARGET] ready mailboxes so "Add contact" is instant. Safe to call often. */
+
+    /**
+     * Starts filling the pool to [POOL_TARGET] (unless it's already being filled) in the app's scope, so it carries on
+     * whoever stops waiting for it, and returns that job. Mailboxes are made one at a time.
+     */
+    private fun startFill(s: Session): Deferred<Boolean> = synchronized(fillLock) {
+        fill?.takeIf { it.isActive } ?: Graph.scope.async {
+            try {
+                fillPool(s)
+            } finally {
+                // Wakes anyone in take(), whether a mailbox came or not.
+                poolVersion.update { it + 1 }
+            }
+        }.also { fill = it }
+    }
+
+    /** True if the pool is full, false if a creation came back empty (push not ready, or no confirmation push). */
+    private suspend fun fillPool(s: Session): Boolean {
+        while (s.repo.pooledMailboxes().size < POOL_TARGET) {
+            create(s, Mailbox.PURPOSE_QR) ?: return false
+            poolVersion.update { it + 1 }
+        }
+        return true
+    }
+
+    /** Keeps [POOL_TARGET] ready mailboxes so "Add contact" is instant. Safe to call often; returns when the pool is full. */
     suspend fun ensurePool(s: Session) {
         if (s.decoy) {
             return
         }
-        if (poolMutex.isLocked) {
-            return
-        }
-        poolMutex.withLock {
-            val have = s.repo.pooledMailboxes().size + s.repo.pendingCount().toInt()
-            repeat((POOL_TARGET - have).coerceAtLeast(0)) {
-                create(s, Mailbox.PURPOSE_QR) ?: return
-            }
+        startFill(s).await()
+    }
+
+    /** Like [ensurePool], without waiting. */
+    fun kickPool(s: Session) {
+        if (!s.decoy) {
+            startFill(s)
         }
     }
 
-    /** Pooled mailbox if available, otherwise a freshly created one. */
-    /** Claims a pool mailbox (atomically), or creates and claims a new one. */
+    /**
+     * Claims a pool mailbox (atomically). If none is ready, waits for the pool fill to deliver the next one: the wait can
+     * be long (a proof of work), and if the caller gives up, the fill carries on and the mailbox stays in the pool for next
+     * time. Returns null if the fill stopped without one (push not ready, or the verification push didn't arrive), and
+     * throws the fill's error if it failed.
+     */
     suspend fun take(s: Session, purpose: Int): Mailbox? {
-        val provisional = System.currentTimeMillis() + 25 * 3600_000L
-        s.repo.claimPoolMailbox(purpose, provisional)?.let { return it }
-        repeat(3) {
-            val created = create(s, purpose) ?: return null
-            if (s.repo.claimMailbox(created.id, purpose, provisional)) {
-                return s.repo.mailbox(created.id)
-            }
-            // Someone else claimed the fresh one first. Try the pool again.
-            s.repo.claimPoolMailbox(purpose, provisional)?.let { return it }
+        if (s.decoy) {
+            return null
         }
-        return null
+        val provisional = System.currentTimeMillis() + 25 * 3600_000L
+        while (true) {
+            s.repo.claimPoolMailbox(purpose, provisional)?.let {
+                kickPool(s)
+                return it
+            }
+            // The fill bumps poolVersion for every new mailbox and once more when it ends, so this wakes for either.
+            val seen = poolVersion.value
+            val job = startFill(s)
+            poolVersion.first { it != seen }
+            if (job.isCompleted) {
+                // The fill ended. Something may still have reached the pool meanwhile.
+                s.repo.claimPoolMailbox(purpose, provisional)?.let {
+                    kickPool(s)
+                    return it
+                }
+                // Rethrows the fill's error, if it failed. False: it couldn't make one (push not ready, or no confirmation).
+                if (!job.await()) {
+                    return null
+                }
+            }
+        }
     }
 
-    suspend fun takeForContact(s: Session, contactId: Long): Mailbox? {
+    /**
+     * The contact's mailbox, or a ready one from the pool bound to them, without waiting for a proof of work. Null means
+     * none is ready: the pool fill has been started (the outbox retries shortly, instead of holding a send slot meanwhile).
+     */
+    fun readyForContact(s: Session, contactId: Long): Mailbox? {
         s.repo.mailboxForContact(contactId)?.let { return it }
-        val mb = take(s, Mailbox.PURPOSE_CONTACT) ?: return null
+        if (s.decoy) {
+            return null
+        }
+        val mb = s.repo.claimPoolMailbox(Mailbox.PURPOSE_CONTACT, System.currentTimeMillis() + 25 * 3600_000L)
+        kickPool(s)
+        mb ?: return null
         s.repo.bindMailbox(mb.id, contactId)
-        Graph.scope.launchSafe { ensurePool(s) }
         return s.repo.mailbox(mb.id)
     }
 

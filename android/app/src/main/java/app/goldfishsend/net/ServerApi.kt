@@ -34,13 +34,24 @@ data class ServerInfo(
 @Serializable
 data class PowChallenge(
     val scheme: String,
+    val purpose: String = "create",
     val challenge: String,
     val difficulty: Int,
     val memoryKiB: Int,
     val iterations: Int,
+    val ttlSeconds: Long = 300,
     val expiresAt: Long,
 ) {
     val params get() = app.goldfishsend.proto.Pow.Params(difficulty, memoryKiB, iterations)
+
+    /** For the solver. Throws [app.goldfishsend.proto.Pow.TooHardException] for another scheme or a malformed challenge. */
+    fun toPow(): app.goldfishsend.proto.Pow.Challenge {
+        val bytes = runCatching { app.goldfishsend.proto.B64.dec(challenge) }.getOrNull()
+        if (scheme != app.goldfishsend.proto.Pow.SCHEME || bytes == null || bytes.size != 32) {
+            throw app.goldfishsend.proto.Pow.TooHardException(params, "scheme")
+        }
+        return app.goldfishsend.proto.Pow.Challenge(bytes, params, ttlSeconds.coerceIn(1, 3600) * 1000)
+    }
 }
 
 @Serializable
@@ -287,7 +298,9 @@ class ServerApi(
      */
     suspend fun identity(): String = withContext(Dispatchers.IO) { serverKey(force = false).fingerprintB64 }
 
-    suspend fun powChallenge(): PowChallenge = postJson("v1/pow/challenge", null, PowChallenge.serializer())
+    /** A challenge for creating a mailbox (our own server), or with [forSend] one that only pays a send limit. */
+    suspend fun powChallenge(forSend: Boolean = false): PowChallenge =
+        postJson(if (forSend) "v1/pow/challenge?purpose=send" else "v1/pow/challenge?purpose=create", null, PowChallenge.serializer())
 
     suspend fun createMailbox(req: CreateMailboxRequest) {
         postJson<Unit>("v1/mailboxes", Json.encodeToString(CreateMailboxRequest.serializer(), req), null)
