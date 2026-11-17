@@ -6,6 +6,8 @@ hands it to the recipient's UnifiedPush server (ntfy, an FCM distributor, ...). 
 the message is gone. If delivery fails, the message is held, encrypted, until it can be delivered or its TTL
 runs out.
 
+Licence: **[MIT](LICENSE)**. The Android app is AGPL-3.0-or-later, because it's built on libsignal.
+
 It is written in ASP.NET Core (.NET 10) with MySQL 8.4 and Redis 7.4 (or Valkey). The wire protocol is in
 [`docs/protocol.md`](../docs/protocol.md), and the project overview in the [top-level README](../README.md).
 

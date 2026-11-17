@@ -41,4 +41,8 @@ to an opaque per-contact mailbox, pushes it to the recipient's phone through Uni
 
 ## Licence
 
-The Android app is AGPL-3.0-or-later, as libsignal requires.
+- **The Android app** (`android/`) is [AGPL-3.0-or-later](android/LICENSE). It has to be: it's built on libsignal,
+  which is AGPL-3.0.
+- **Everything else** (the server, the deployment files, the protocol docs and test vectors, and the CI workflows) is
+  [MIT](LICENSE), so anyone can run, change or reimplement the server and the protocol. The server has its own copy of
+  the licence in [`server/LICENSE`](server/LICENSE).

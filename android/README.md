@@ -2,7 +2,7 @@
 
 A native Kotlin and Jetpack Compose client for GoldfishSend. It has no accounts and no phone numbers. Messages are end-to-end encrypted with libsignal (PQXDH and Double Ratchet) and delivered through UnifiedPush.
 
-Licence: **AGPL-3.0-or-later** (required by libsignal).
+Licence: **[AGPL-3.0-or-later](LICENSE)** (required by libsignal). The server and the protocol docs are MIT.
 
 The wire protocol lives in [`../docs/protocol.md`](../docs/protocol.md), and this client implements its client side exactly.
 
