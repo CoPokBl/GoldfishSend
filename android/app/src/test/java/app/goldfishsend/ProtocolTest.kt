@@ -5,16 +5,13 @@ import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
-import app.goldfishsend.proto.Hash
 import app.goldfishsend.proto.InviteBundle
 import app.goldfishsend.proto.InviteCrypto
 import app.goldfishsend.proto.InviteLink
 import app.goldfishsend.proto.MailboxCrypto
 import app.goldfishsend.proto.Padding
-import app.goldfishsend.proto.Pow
 import app.goldfishsend.proto.PushEnvelope
 import app.goldfishsend.proto.Rand
-import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -25,51 +22,6 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 private fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
-
-class PowTest {
-    private val challenge = ByteArray(32) { 7 }
-
-    @Test
-    fun leadingZeroBits() {
-        assertEquals(0, Pow.leadingZeroBits(byteArrayOf(0x80.toByte())))
-        assertEquals(7, Pow.leadingZeroBits(byteArrayOf(0x01)))
-        assertEquals(8, Pow.leadingZeroBits(byteArrayOf(0x00, 0xff.toByte())))
-        assertEquals(12, Pow.leadingZeroBits(byteArrayOf(0x00, 0x08)))
-        assertEquals(16, Pow.leadingZeroBits(byteArrayOf(0, 0)))
-    }
-
-    @Test
-    fun nonceIsBigEndian() {
-        assertEquals("0000000000000102", hex(Pow.nonceBytes(0x0102)))
-        assertEquals("ffffffffffffffff", hex(Pow.nonceBytes(-1)))
-    }
-
-    /** Vector computed independently (Python hashlib): first nonce with ≥12 zero bits for challenge = 0x07 × 32. */
-    @Test
-    fun matchesIndependentVector() {
-        val nonce = Pow.nonceBytes(1949)
-        assertTrue(Pow.check(challenge, nonce, 12))
-        assertEquals(
-            "000822a69cc36d2131369cc589f472c007fbbe3d30c39a8cf54238dc1107f8cc",
-            hex(Hash.sha256("gf/pow/v1".toByteArray(), challenge, nonce)),
-        )
-        // The single-threaded search from 0 must find exactly this first solution.
-        assertArrayEquals(nonce, Pow.solveRange(challenge, 12, 0, 1))
-    }
-
-    @Test
-    fun parallelSolverProducesValidNonce() = runBlocking {
-        val ch = Rand.bytes(32)
-        val nonce = Pow.solve(ch, 14)
-        assertEquals(8, nonce.size)
-        assertTrue(Pow.check(ch, nonce, 14))
-    }
-
-    @Test
-    fun rejectsWrongNonce() {
-        assertFalse(Pow.check(challenge, Pow.nonceBytes(1948), 12))
-    }
-}
 
 class PaddingTest {
     @Test

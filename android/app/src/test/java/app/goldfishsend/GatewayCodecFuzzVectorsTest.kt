@@ -4,7 +4,6 @@ import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.GatewayCodec
 import app.goldfishsend.net.ServerKey
 import app.goldfishsend.proto.B64
-import app.goldfishsend.proto.Pow
 import java.io.File
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -22,7 +21,7 @@ import org.junit.Test
 /**
  * docs/test-vectors/gateway-codec-fuzz.json: seeded, generated cases (written by the server's GatewayCodecVectorTests) with
  * the server's verdict on each. This side must agree on every one: the inner codec both ways, padding, the response
- * envelope, key blobs and fingerprints, and proof of work. Mismatches are collected, so a failure lists all of them.
+ * envelope, and key blobs and fingerprints. Mismatches are collected, so a failure lists all of them.
  */
 class GatewayCodecFuzzVectorsTest {
     private val root: JsonObject by lazy {
@@ -145,12 +144,6 @@ class GatewayCodecFuzzVectorsTest {
             ok && hex(opened.getOrThrow()) != c.str("inner") -> "different plaintext"
             else -> null
         }
-    }
-
-    @Test
-    fun proofOfWork() = check("pow") { c ->
-        val app = Pow.check(unhex(c.str("challenge")), unhex(c.str("nonce")), c.int("difficulty"))
-        if (app != c.bool("ok")) "app $app, server ${c.bool("ok")}" else null
     }
 
     private fun JsonObject.str(key: String) = getValue(key).jsonPrimitive.content

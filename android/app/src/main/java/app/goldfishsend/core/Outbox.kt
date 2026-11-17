@@ -10,6 +10,7 @@ import app.goldfishsend.db.OutboxItem
 import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.db.isGroup
 import app.goldfishsend.net.ApiException
+import app.goldfishsend.net.PowChallenge
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Content
@@ -163,8 +164,8 @@ object Outbox {
                     throw e
                 }
                 val ch = api.powChallenge()
-                val nonce = solvePow(ch.challenge, ch.difficulty)
-                api.sendMessage(secret, blob, item.idem, null, "${ch.challenge}.${B64.enc(nonce)}")
+                val nonce = solvePow(ch)
+                api.sendMessage(secret, blob, item.idem, null, powHeader(ch, nonce))
             }
             s.repo.outboxDelete(item.seq)
             item.messageId?.let { id ->
@@ -232,16 +233,23 @@ object Outbox {
     )
 
     /**
-     * Solves a server's challenge, treating an absurd difficulty or a timeout as a server failure (retried later) rather
-     * than letting it pin the CPU or crash the send loop.
+     * Solves a server's challenge, treating an unknown scheme, unreasonable parameters or a timeout as a server failure
+     * (retried later) rather than letting it pin the CPU or memory, or crash the send loop.
      */
-    suspend fun solvePow(challengeB64: String, difficulty: Int, hashes: java.util.concurrent.atomic.AtomicLong? = null): ByteArray = try {
-        Pow.solve(B64.dec(challengeB64), difficulty, hashes = hashes)
+    suspend fun solvePow(ch: PowChallenge, hashes: java.util.concurrent.atomic.AtomicLong? = null): ByteArray = try {
+        val challenge = runCatching { B64.dec(ch.challenge) }.getOrNull()
+        if (ch.scheme != Pow.SCHEME || challenge == null || challenge.size != 32) {
+            throw Pow.TooHardException(ch.params, "scheme")
+        }
+        Pow.solve(challenge, ch.params, hashes = hashes)
     } catch (e: Pow.TooHardException) {
         throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
     } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
         throw ApiException("network", 0)
     }
+
+    /** "challenge.nonce" for the GF-PoW header. */
+    fun powHeader(ch: PowChallenge, nonce: ByteArray) = "${ch.challenge}.${B64.enc(nonce)}"
 
     private fun backoff(s: Session, item: OutboxItem, retryAfter: Long?) {
         val attempts = item.attempts + 1

@@ -34,6 +34,7 @@ object Mailboxes {
     const val POOL_TARGET = 2
     private const val VERIFY_TIMEOUT_MS = 120_000L
     private const val ROTATIONS_PER_PASS = 3
+    private const val BUSY_RETRIES = 4
 
     /** The server's max message TTL (14 days) plus a day of margin. */
     private const val DRAIN_MS = 15 * 86_400_000L
@@ -86,26 +87,39 @@ object Mailboxes {
                 val ticker = launch {
                     while (true) {
                         kotlinx.coroutines.delay(250)
-                        _progress.value = Progress(app.goldfishsend.proto.Pow.estimatedProgress(hashes.get(), ch.difficulty))
+                        _progress.value = Progress(Pow.estimatedProgress(hashes.get(), ch.difficulty))
                     }
                 }
                 try {
-                    Outbox.solvePow(ch.challenge, ch.difficulty, hashes)
+                    Outbox.solvePow(ch, hashes)
                 } finally {
                     ticker.cancel()
                 }
             }
             _progress.value = Progress(null)
-            api.createMailbox(
-                CreateMailboxRequest(
-                    pow = PowSolution(ch.challenge, B64.enc(nonce)),
-                    sendSecret = B64.enc(send),
-                    ownerHash = B64.enc(MailboxCrypto.ownerHash(owner)),
-                    endpoint = ep.url,
-                    p256dh = ep.p256dh,
-                    auth = ep.auth,
-                ),
+            val request = CreateMailboxRequest(
+                pow = PowSolution(ch.challenge, B64.enc(nonce)),
+                sendSecret = B64.enc(send),
+                ownerHash = B64.enc(MailboxCrypto.ownerHash(owner)),
+                endpoint = ep.url,
+                p256dh = ep.p256dh,
+                auth = ep.auth,
             )
+            // A 503 here means every verification slot on the server was busy. The challenge is kept for us, so the same
+            // solution is retried after a moment instead of being thrown away.
+            var attempt = 0
+            while (true) {
+                try {
+                    api.createMailbox(request)
+                    break
+                } catch (e: ApiException) {
+                    // A longer Retry-After is another kind of 503 (the push service is paused), which used the challenge up.
+                    if (e.status != 503 || (e.retryAfterSeconds ?: 1L) > 2 || ++attempt >= BUSY_RETRIES) {
+                        throw e
+                    }
+                    kotlinx.coroutines.delay((e.retryAfterSeconds ?: 1L).coerceAtLeast(1L) * 1000L)
+                }
+            }
             // The verification push may already have been handled while the request was in flight.
             if (s.repo.mailbox(id)?.state != Mailbox.STATE_ACTIVE) {
                 s.repo.setMailboxState(id, Mailbox.STATE_PENDING_VERIFY)
