@@ -120,7 +120,9 @@ public sealed class ProofOfWorkTests {
 
     [Theory]
     [InlineData(-1, 64, 1)]
-    [InlineData(25, 64, 1)]
+    [InlineData(21, 64, 1)]
+    [InlineData(15, 16 * 1024, 1)]
+    [InlineData(13, 64 * 1024, 1)]
     [InlineData(int.MaxValue, 64, 1)]
     [InlineData(0, 7, 1)]
     [InlineData(0, 64 * 1024 + 1, 1)]

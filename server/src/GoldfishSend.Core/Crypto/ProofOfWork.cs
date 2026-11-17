@@ -10,7 +10,11 @@ public readonly record struct PowParameters(int Difficulty, int MemoryKiB, int I
     /// <summary>Within the bounds clients accept (see <see cref="ProofOfWork"/>).</summary>
     public bool IsValid => Difficulty is >= 0 and <= ProofOfWork.MaxDifficulty
         && MemoryKiB is >= ProofOfWork.MinMemoryKiB and <= ProofOfWork.MaxMemoryKiB
-        && Iterations is >= 1 and <= ProofOfWork.MaxIterations;
+        && Iterations is >= 1 and <= ProofOfWork.MaxIterations
+        && ExpectedWorkKiB <= ProofOfWork.MaxWorkKiB;
+
+    /// <summary>KiB of Argon2 memory a solver fills on average: <c>2^difficulty × m × t</c>.</summary>
+    public long ExpectedWorkKiB => Difficulty is >= 0 and < 62 ? (1L << Difficulty) * MemoryKiB * Iterations : long.MaxValue;
 }
 
 /// <summary>
@@ -25,10 +29,12 @@ public static class ProofOfWork {
     public const int HashSize = 32;
 
     // The app refuses challenges outside these bounds (Pow.kt), so the server must never issue one.
-    public const int MaxDifficulty = 24;
+    public const int MaxDifficulty = 20;
     public const int MinMemoryKiB = 8;
     public const int MaxMemoryKiB = 64 * 1024;
     public const int MaxIterations = 4;
+    /// <summary>The default parameters at their worst (6 + 6 + 2 bits at 16 MiB, t = 1).</summary>
+    public const long MaxWorkKiB = (1L << 14) * 16 * 1024;
 
     private static readonly byte[] Label = "gf/pow/v2"u8.ToArray();
 

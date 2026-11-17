@@ -84,7 +84,7 @@ public sealed class CodecFuzzTests {
     private static readonly Gen<(byte[] Challenge, byte[] Nonce, PowParameters Parameters)> PowInputs = Gen.Select(
         Gen.Frequency((8, Fuzz.Bytes(32, 32)), (1, Fuzz.Bytes(0, 40))),
         Gen.Frequency((8, Fuzz.Bytes(8, 8)), (1, Fuzz.Bytes(0, 12))),
-        Gen.Frequency((6, Gen.Int[0, 6]), (1, Gen.Int[-5, 50]), (1, Gen.OneOf(int.MinValue, int.MaxValue, 24, 25))),
+        Gen.Frequency((6, Gen.Int[0, 6]), (1, Gen.Int[-5, 50]), (1, Gen.OneOf(int.MinValue, int.MaxValue, 20, 21))),
         Gen.Frequency((6, Gen.Int[8, 40]), (1, Gen.OneOf(int.MinValue, -1, 0, 7, 64 * 1024 + 1, int.MaxValue))),
         Gen.Frequency((6, Gen.Int[1, 2]), (1, Gen.OneOf(int.MinValue, -1, 0, 5, int.MaxValue))),
         (c, n, d, m, t) => (c, n, new PowParameters(d, m, t)));
@@ -95,7 +95,8 @@ public sealed class CodecFuzzTests {
             var (challenge, nonce, p) = input;
             var expected = false;
             if (challenge.Length == 32 && nonce.Length == 8 && p.Difficulty is >= 0 and <= ProofOfWork.MaxDifficulty
-                && p.MemoryKiB is >= 8 and <= 64 * 1024 && p.Iterations is >= 1 and <= 4) {
+                && p.MemoryKiB is >= 8 and <= 64 * 1024 && p.Iterations is >= 1 and <= 4
+                && (1L << p.Difficulty) * p.MemoryKiB * p.Iterations <= (1L << 28)) {
                 var hash = new BigInteger(ProofOfWork.Hash(challenge, nonce, p.MemoryKiB, p.Iterations), isUnsigned: true, isBigEndian: true);
                 expected = p.Difficulty == 0 || hash >> (256 - p.Difficulty) == 0;
             }
