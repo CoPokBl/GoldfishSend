@@ -2,7 +2,7 @@
 
 Groups are a client-side protocol built on the existing mailboxes and libsignal sessions. The server learns nothing new,
 apart from a batch send endpoint so that fan-out doesn't hit per-IP limits. This file is the contract;
-`docs/protocol.md` links here. `docs/groups-redesign.md` explains why groups have one owner rather than admins.
+`docs/protocol.md` links here. "Why one owner, and delivery by state" below gives the reasoning behind the design.
 
 ## Design choices
 
@@ -25,6 +25,28 @@ apart from a batch send endpoint so that fan-out doesn't hit per-IP limits. This
   arriving. Invitees stay outside this until the owner takes them in. There is no background traffic: a group catches
   up as its members write.
 - **Maximum 100 members.**
+
+### Why one owner, and delivery by state
+- **One owner, not several admins.** If several members may sign rosters, two can change it at the same moment, and
+  every member has to pick one branch. What the other branch meant ("Bob left", "Carol accepted") is then lost unless
+  some third member notices and applies it again, and that member must be present, hold the right history, be
+  reachable and be allowed to. The scenario fuzzers find schedules where nobody is: say, the only member allowed to
+  apply a departure is the one who left, and their inbox is gone. With one owner the roster is a single chain, and a
+  member's own accept or leave is a fact that's final once anyone holds it. The view is a function of the chain and the
+  set of facts, so the same facts give the same membership in any order.
+- **Delivery by state.** Rules of the form "on X, forward Y to Z" (relays by leavers and inviters, sync requests after a
+  gap) each fix one lost-message schedule and open new ones. Instead, every message carries its sender's head, what's
+  owed follows from comparing heads, and whoever is ahead sends one idempotent `gstate`. Nothing depends on a particular
+  message arriving.
+- **Alternatives considered.**
+  - **A sequencer on the server** (an append-only group log): keeps co-admins, but needs a readable log on the server,
+    a group key per epoch, and lets the server link the members who read the log.
+  - **A CRDT of signed operations:** keeps co-admins with no server change, but the conflict rules are subtle (Matrix's
+    state resolution went through several versions and still had state-reset bugs), and the operations need compaction.
+  - **A time-based takeover** when the owner disappears: it forks whenever the owner comes back. A lost owner freezes the
+    roster instead (see "Leave").
+- **The cost.** Only the owner adds, removes, renames or changes the timer, and those wait while the owner is offline.
+  Members' own accepts, declines and leaves don't.
 
 ## Identifiers
 

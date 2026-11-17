@@ -62,7 +62,7 @@ class GroupStatefulTest {
 
     // ---------- found by randomScenarios, shrunk (see GroupFindingsTest for some of them written out) ----------
     //
-    // Most of these were found under the earlier design, with admins and a fork rule (docs/groups-redesign.md), and say
+    // Most of these were found under an earlier design, with admins and a fork rule, and say
     // what went wrong then. The steps mean the same under the owner design (role changes are ownership transfers now),
     // so each still runs, as a scenario its fix has to keep working.
 
