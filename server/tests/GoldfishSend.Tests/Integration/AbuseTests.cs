@@ -240,6 +240,119 @@ public sealed class AbuseTests {
     }
 
     [IntegrationFact]
+    public async Task Slash32Buckets_StopOneActorWithManySlash48s_ButNotOtherAllocations() {
+        async Task<(int, string?, string?)> Challenge(HttpClient c) => await ErrorOf(await c.PostAsync("/v1/pow/challenge", null));
+        var ok = (200, (string?)null, (string?)null);
+
+        await using (var node = NodeBehindProxy(ApiNode(Policy("pow-alloc", 1, 3600, 1)))) {
+            using var a = ClientFrom(node, "3fff:3:30:1::1");
+            using var b = ClientFrom(node, "3fff:3:31::1");
+            using var c = ClientFrom(node, "3fff:3:ffff::1");
+            using var otherSlash32 = ClientFrom(node, "3fff:4:30::1");
+            using var ipv4 = ClientFrom(node, "198.18.30.1");
+            Assert.Equal(ok, await Challenge(a));
+            Assert.Equal((429, "rate_limited", "network"), await Challenge(b));
+            Assert.Equal((429, "rate_limited", "network"), await Challenge(c));
+            Assert.Equal(ok, await Challenge(otherSlash32));
+            Assert.Equal(ok, await Challenge(ipv4));
+        }
+
+        await using (var node = NodeBehindProxy(ApiNode(Policy("create-alloc", 1, 3600, 1)))) {
+            using var a = ClientFrom(node, "3fff:1:40::1");
+            using var b = ClientFrom(node, "3fff:1:41::1");
+            using var otherSlash32 = ClientFrom(node, "3fff:2:40::1");
+            Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(a)).StatusCode);
+            Assert.Equal((429, "rate_limited", "network"), await ErrorOf(await CreateAsync(b)));
+            Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(otherSlash32)).StatusCode);
+        }
+    }
+
+    [IntegrationFact]
+    public async Task PowDifficulty_RisesForASlash32SpreadOverManySlash48s() {
+        await using var node = NodeBehindProxy(ApiNode(new Dictionary<string, string> {
+            ["Goldfish__Pow__AllocationLoadThreshold"] = "2",
+            ["Goldfish__Pow__GlobalLoadThresholdPerMinute"] = "0",
+        }));
+        var baseDifficulty = _f.Services.GetRequiredService<GoldfishOptions>().Pow.BaseDifficulty;
+        // One creation from each of four /48s: no /48 is over anything, the /32 is over 2 (4 = one doubling: +2).
+        for (var i = 0; i < 4; i++) {
+            using var client = ClientFrom(node, $"3fff:5:5{i}::1");
+            Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(client)).StatusCode);
+        }
+        using var fresh = ClientFrom(node, "3fff:5:59::1");
+        using var elsewhere = ClientFrom(node, "3fff:6:50::1");
+        Assert.Equal(baseDifficulty + 2, await DifficultyOf(fresh));
+        Assert.Equal(baseDifficulty, await DifficultyOf(elsewhere));
+    }
+
+    [IntegrationFact]
+    public async Task PowVerification_OneNetworkGetsOnlyItsShareOfTheSlots() {
+        // Four slots: a network (/24 or /48) may hold one, an IPv6 /32 two.
+        await using var node = NodeBehindProxy(ApiNode(new Dictionary<string, string> {
+            ["Goldfish__Pow__MaxConcurrentVerifications"] = "4",
+        }));
+        var pow = node.Services.GetRequiredService<PowService>();
+        using var flooder = ClientFrom(node, "198.18.44.1");
+        using var neighbour = ClientFrom(node, "198.18.44.200");
+        using var other = ClientFrom(node, "198.18.45.1");
+        // The flooder's network already has one verification running (as if it sent junk).
+        var flooderShare = new[] { ("n" + Convert.ToHexString(ClientSubjectOf("198.18.44.1").Network), 1) };
+        Assert.True(pow.Shares.TryEnter(flooderShare));
+        try {
+            Assert.Equal((503, "unavailable", null), await ErrorOf(await CreateAsync(flooder)));
+            Assert.Equal((503, "unavailable", null), await ErrorOf(await CreateAsync(neighbour)));
+            Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(other)).StatusCode);
+            Assert.Equal(4, pow.VerificationSlots.CurrentCount);
+        } finally {
+            pow.Shares.Exit(flooderShare);
+        }
+        Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(flooder)).StatusCode);
+        Assert.Equal(0, pow.Shares.Count);
+
+        // A /32 holds at most two, however many /48s it spreads over.
+        var slash32 = new[] { ("a" + Convert.ToHexString(ClientSubjectOf("3fff:7:60::1").Allocation!), 2) };
+        Assert.True(pow.Shares.TryEnter(slash32));
+        Assert.True(pow.Shares.TryEnter(slash32));
+        try {
+            using var inSlash32 = ClientFrom(node, "3fff:7:61::1");
+            Assert.Equal((503, "unavailable", null), await ErrorOf(await CreateAsync(inSlash32)));
+        } finally {
+            pow.Shares.Exit(slash32);
+            pow.Shares.Exit(slash32);
+        }
+    }
+
+    private static GoldfishSend.Infrastructure.Services.ClientSubject ClientSubjectOf(string address) =>
+        GoldfishSend.Infrastructure.Services.ClientSubject.From(IPAddress.Parse(address));
+
+    [IntegrationFact]
+    public async Task SendChallenges_PayOnlyForSends_AtTheirFixedDifficulty() {
+        await using var node = NodeBehindProxy(ApiNode(new Dictionary<string, string> {
+            ["Goldfish__Pow__SendDifficulty"] = "2",
+        }));
+        using var client = ClientFrom(node, "198.18.46.1");
+        var issued = await (await client.PostAsync("/v1/pow/challenge?purpose=send", null)).Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("send", issued.GetProperty("purpose").GetString());
+        Assert.Equal(2, PowOf(issued).Difficulty);
+        Assert.True(issued.GetProperty("ttlSeconds").GetInt32() > 0);
+        var challenge = Base64Url.DecodeFromChars(issued.GetProperty("challenge").GetString());
+        var nonce = ProofOfWork.Solve(challenge, PowOf(issued));
+        var device = _f.Push.NewDevice();
+        var response = await client.PostAsJsonAsync("/v1/mailboxes", new {
+            pow = new { challenge = B64(challenge), nonce = B64(nonce) },
+            sendSecret = B64(RandomNumberGenerator.GetBytes(32)),
+            ownerHash = B64(RandomNumberGenerator.GetBytes(32)),
+            endpoint = device.Url,
+            p256dh = B64(device.P256dh),
+            auth = B64(device.Auth),
+        });
+        Assert.Equal((403, "pow_invalid", null), await ErrorOf(response));
+        Assert.Equal((400, "invalid_request", null), await ErrorOf(await client.PostAsync("/v1/pow/challenge?purpose=other", null)));
+        var create = await (await client.PostAsync("/v1/pow/challenge?purpose=create", null)).Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("create", create.GetProperty("purpose").GetString());
+    }
+
+    [IntegrationFact]
     public async Task OwnerOperations_ChargeTheAddressOnlyForFailedOwnership() {
         var mailbox = await _f.CreateActiveMailboxAsync();
         var impostor = mailbox with { OwnerSecret = RandomNumberGenerator.GetBytes(32) };

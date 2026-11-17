@@ -110,7 +110,7 @@ public sealed class MessageService {
                     return ServiceError.RateLimited(decision);
                 }
                 // Paying a send limit never counts toward the creation load, so heavy senders can't make onboarding harder.
-                switch (await _pow.RedeemAsync(pow.Challenge, pow.Nonce)) {
+                switch (await _pow.RedeemAsync(pow.Challenge, pow.Nonce, client, PowPurpose.Send)) {
                     case PowRedemption.Busy:
                         return ServiceError.PowBusy;
                     case PowRedemption.Invalid:

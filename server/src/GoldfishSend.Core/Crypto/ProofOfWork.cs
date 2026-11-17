@@ -13,8 +13,19 @@ public readonly record struct PowParameters(int Difficulty, int MemoryKiB, int I
         && Iterations is >= 1 and <= ProofOfWork.MaxIterations
         && ExpectedWorkKiB <= ProofOfWork.MaxWorkKiB;
 
+    /// <summary>Within the tighter bounds clients accept from a server that isn't their own (send-limit PoW).</summary>
+    public bool IsValidForSend => IsValid && Difficulty <= ProofOfWork.MaxSendDifficulty && ExpectedWorkKiB <= ProofOfWork.MaxSendWorkKiB;
+
     /// <summary>KiB of Argon2 memory a solver fills on average: <c>2^difficulty × m × t</c>.</summary>
     public long ExpectedWorkKiB => Difficulty is >= 0 and < 62 ? (1L << Difficulty) * MemoryKiB * Iterations : long.MaxValue;
+}
+
+/// <summary>What a challenge pays for. It's stored with the challenge, so a cheap send challenge can't create a mailbox.</summary>
+public enum PowPurpose {
+    /// <summary>Mailbox creation, on the client's own server. Adaptive difficulty, and no client timeout.</summary>
+    Create,
+    /// <summary>Paying a send limit, usually on a contact's server. Fixed difficulty, within the tight send caps.</summary>
+    Send,
 }
 
 /// <summary>
@@ -29,12 +40,17 @@ public static class ProofOfWork {
     public const int HashSize = 32;
 
     // The app refuses challenges outside these bounds (Pow.kt), so the server must never issue one.
-    public const int MaxDifficulty = 20;
+    // Mailbox creation on the app's own server:
+    public const int MaxDifficulty = 24;
     public const int MinMemoryKiB = 8;
     public const int MaxMemoryKiB = 64 * 1024;
     public const int MaxIterations = 4;
-    /// <summary>The default parameters at their worst (6 + 6 + 2 bits at 16 MiB, t = 1).</summary>
-    public const long MaxWorkKiB = (1L << 14) * 16 * 1024;
+    /// <summary>Twice the default parameters at their worst (8 + 6 + 2 bits at 16 MiB, t = 1): 2^17 calls of 16 MiB.</summary>
+    public const long MaxWorkKiB = (1L << 17) * 16 * 1024;
+    // Send-limit PoW, which a contact's (possibly hostile) server can demand: about a minute or two on a phone at most.
+    public const int MaxSendDifficulty = 20;
+    /// <summary>2^11 calls of 16 MiB.</summary>
+    public const long MaxSendWorkKiB = (1L << 11) * 16 * 1024;
 
     private static readonly byte[] Label = "gf/pow/v2"u8.ToArray();
 

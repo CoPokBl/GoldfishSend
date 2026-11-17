@@ -30,7 +30,10 @@ public sealed record BatchSendResponse(BatchItemResult[] Results);
 public sealed record ErrorResponse(string Error, string? Scope = null);
 
 /// <param name="Scheme">Always <c>gf/pow/v2</c>: Argon2id with these parameters (docs/protocol.md).</param>
-public sealed record PowChallengeResponse(string Scheme, string Challenge, int Difficulty, int MemoryKiB, int Iterations, long ExpiresAt);
+/// <param name="Purpose"><c>create</c> or <c>send</c>: what the challenge can pay for.</param>
+/// <param name="TtlSeconds">How long it stays valid from now, so clients can refresh it without trusting their clock.</param>
+public sealed record PowChallengeResponse(
+    string Scheme, string Purpose, string Challenge, int Difficulty, int MemoryKiB, int Iterations, int TtlSeconds, long ExpiresAt);
 
 public sealed record InfoResponse(
     int Protocol, string VapidPublicKey, int MaxMessageBytes, int MaxInviteBytes, int DefaultTtlSeconds, int MaxTtlSeconds,

@@ -94,6 +94,7 @@ public sealed class GoldfishFixture : IAsyncLifetime {
             ["Goldfish__Pow__MemoryKiB"] = "64",
             // Every test client shares 127.0.0.1, so the per-network difficulty would climb across tests.
             ["Goldfish__Pow__NetworkLoadThreshold"] = "0",
+            ["Goldfish__Pow__AllocationLoadThreshold"] = "0",
             ["Goldfish__Messages__MaxHeldPerMailbox"] = "3",
             // Small enough that the tarpit test can prove one slow host can't take every slot.
             ["Goldfish__Messages__DeliveryParallelism"] = "8",

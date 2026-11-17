@@ -84,14 +84,18 @@ public sealed class MailboxService {
 
         // The proof of work is checked first: requests without one never touch the address budgets, so junk from a shared
         // address (Tor exit, CGNAT) can't lock everyone behind it out of creating mailboxes.
-        if (ServiceError.FromPow(await _pow.RedeemAsync(powChallenge, powNonce, ct)) is { } powError) {
+        if (ServiceError.FromPow(await _pow.RedeemAsync(powChallenge, powNonce, client, PowPurpose.Create, ct)) is { } powError) {
             return powError;
         }
         foreach (var (policy, subject) in new[] {
                      (RatePolicies.CreateGlobal, "global"u8.ToArray()),
+                     (RatePolicies.CreatePerAllocation, client.Allocation),
                      (RatePolicies.CreatePerNetwork, client.Network),
                      (RatePolicies.CreatePerIp, client.Host),
                  }) {
+            if (subject is null) {
+                continue; // IPv4 has no /32 tier.
+            }
             var limit = await _limiter.CheckAsync(policy, subject, failOpen: false);
             if (!limit.Allowed) {
                 return ServiceError.RateLimited(limit);

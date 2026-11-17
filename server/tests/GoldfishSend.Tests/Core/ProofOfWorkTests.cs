@@ -120,9 +120,9 @@ public sealed class ProofOfWorkTests {
 
     [Theory]
     [InlineData(-1, 64, 1)]
-    [InlineData(21, 64, 1)]
-    [InlineData(15, 16 * 1024, 1)]
-    [InlineData(13, 64 * 1024, 1)]
+    [InlineData(25, 64, 1)]
+    [InlineData(18, 16 * 1024, 1)]
+    [InlineData(16, 64 * 1024, 1)]
     [InlineData(int.MaxValue, 64, 1)]
     [InlineData(0, 7, 1)]
     [InlineData(0, 64 * 1024 + 1, 1)]
@@ -141,6 +141,9 @@ public sealed class ProofOfWorkTests {
         Assert.True(new PowParameters(
             options.BaseDifficulty + options.MaxNetworkExtraDifficulty + options.MaxGlobalExtraDifficulty,
             options.MemoryKiB, options.Iterations).IsValid);
-        Assert.Equal((6, 16 * 1024, 1), (options.BaseDifficulty, options.MemoryKiB, options.Iterations));
+        Assert.Equal((8, 16 * 1024, 1), (options.BaseDifficulty, options.MemoryKiB, options.Iterations));
+        Assert.True(new PowParameters(options.SendDifficulty, options.MemoryKiB, options.Iterations).IsValidForSend);
+        Assert.False(new PowParameters(12, options.MemoryKiB, options.Iterations).IsValidForSend);
+        Assert.True(new PowParameters(16, options.MemoryKiB, options.Iterations).IsValid);
     }
 }
