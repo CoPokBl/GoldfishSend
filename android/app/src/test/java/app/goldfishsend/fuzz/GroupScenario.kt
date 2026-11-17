@@ -490,7 +490,11 @@ class GroupScenario(private val seed: Long) {
         }
         // The honest active members: admitted (their roster says so), and not gone in their own view. Someone whose
         // acceptance the owner hasn't taken in yet is still outside delivery.
-        val h = honest.filter { p -> joinedModel(p)?.let { it.roster!!.roster.role(p.id) != Role.INVITED && it.view()?.isActive(p.id) == true } == true }
+        // Someone the owner took out, who never heard and whom that owner, having left since, won't tell again
+        // (docs/groups.md, "Taken out"), isn't one of them: they only think they are.
+        val h = honest.filter { p ->
+            joinedModel(p)?.let { it.roster!!.roster.role(p.id) != Role.INVITED && it.view()?.isActive(p.id) == true } == true && !removedUnheard(p)
+        }
         if (h.isEmpty()) {
             return null
         }
@@ -560,6 +564,22 @@ class GroupScenario(private val seed: Long) {
     private fun ownerCantReach(p: Peer, r: View): Boolean {
         val o = honest.firstOrNull { it.id == r.owner } ?: return true
         return !route(o, p)
+    }
+
+    /**
+     * A roster an honest member holds, newer than [p]'s, ended [p]'s stint (not by their own departure), and whoever
+     * signed it is out of the group now: only they would have sent it again when [p] wrote.
+     */
+    private fun removedUnheard(p: Peer): Boolean {
+        val m = model(p) ?: return false
+        val ver = m.roster?.roster?.ver ?: return false
+        val later = honest.flatMap { it.store.historySince(gid, ver) }.distinctBy { it.hashB64 }.sortedBy { it.roster.ver }
+        val ended = later.firstOrNull { it.roster.member(p.id)?.since != m.since } ?: return false
+        if (ended.roster.proof.any { w -> GroupCrypto.openFact(w)?.fact?.let { it.id == p.id && it.since == m.since } == true }) {
+            return false
+        }
+        val by = peers.firstOrNull { it.id == ended.roster.by } ?: return false
+        return model(by)?.state.let { it == GroupModel.LEFT || it == GroupModel.REMOVED }
     }
 
     /** Waiting to be let in, [p] can send to whoever owns the group as far as they know ([GroupEngine.sendAgain]). */
