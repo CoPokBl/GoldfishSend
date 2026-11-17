@@ -13,6 +13,8 @@ deploy/secrets/
 *.suo
 .vs/
 **/appsettings.*.local.json
+goldfish-dev-keys.json
+*-keys.json
 
 # --- Android ----------------------------------------------------------------------------------------
 android/.gradle/
