@@ -33,22 +33,33 @@ This is the contract between the server (`server/`) and the Android client (`and
 | sealed endpoint | `nonce(12) ‖ AES-256-GCM(sealKey, nonce, plaintext = endpointRecord, aad = mailboxId)` | server only |
 
 ## Proof of work
-- `POST /v1/pow/challenge` returns
-  `{ "scheme": "gf/pow/v2", "challenge": b64u(32 B), "difficulty": int, "memoryKiB": int, "iterations": int, "expiresAt": unixSeconds }`.
+- `POST /v1/pow/challenge?purpose=create|send` (default `create`) returns
+  `{ "scheme": "gf/pow/v2", "purpose": "create" | "send", "challenge": b64u(32 B), "difficulty": int, "memoryKiB": int,
+  "iterations": int, "ttlSeconds": int, "expiresAt": unixSeconds }`.
 - Solution: an 8-byte big-endian unsigned `nonce` such that
   `Argon2id(password = "gf/pow/v2" ‖ challenge ‖ nonce, salt = challenge, m = memoryKiB, t = iterations, p = 1, 32 bytes)`
   (RFC 9106, version 0x13, no secret or associated data) has at least `difficulty` leading zero **bits**. That takes
-  about `2^difficulty` Argon2 calls. Verifying takes one. Vectors: `docs/test-vectors/pow-v2.json`.
-- The server picks the parameters (defaults: 16 MiB, `t = 1`, 6 bits). Clients refuse a challenge with another `scheme`,
-  `difficulty` over 20, `memoryKiB` outside 8–65536, `iterations` outside 1–4, or expected work
-  `2^difficulty × memoryKiB × iterations` over 2^28 KiB (the default server's worst case), and give up after 180 s.
-- Difficulty adapts to load. Creations from the requester's IPv4 /24 or IPv6 /48 in the last 5 minutes raise its own
-  difficulty (one bit when over 5, one more per doubling, up to +6). Verified creations server-wide add up to +2 bits for
-  everyone. A challenge keeps the parameters it was issued with.
-- A challenge is single-use and expires after 5 minutes.
+  about `2^difficulty` Argon2 calls, and every call is an independent try, so a search can stop and resume (on a fresh
+  challenge) without losing anything. Verifying takes one call. Vectors: `docs/test-vectors/pow-v2.json`.
+- **Purpose.** A `create` challenge pays for `POST /v1/mailboxes` on the client's own server. A `send` challenge only pays
+  a send limit (`GF-PoW`), usually on a contact's server, and can't create a mailbox. A `create` challenge also pays a
+  send limit.
+- **Parameters.** The server picks them. Defaults: 16 MiB, `t = 1`, 8 bits for `create` (rising under load, see below),
+  6 bits for `send`. Expected work is `2^difficulty × memoryKiB × iterations` KiB. Clients refuse another `scheme`,
+  `memoryKiB` outside 8–65536 and `iterations` outside 1–4, and then:
+  - for their **own server's** `create` challenges: `difficulty` over 24 or expected work over 2^31 KiB (twice the
+    default server's worst case). There's no time limit: when a challenge has under 30 s of `ttlSeconds` left, the client
+    fetches a new one and carries on.
+  - for a **contact's server** (`send`): `difficulty` over 20 or expected work over 2^25 KiB (2^11 calls of 16 MiB), and
+    they give up after 180 s. A contact's server can't make a phone work for longer than that per attempt.
+- **Load.** `create` difficulty adapts. Creations from the requester's IPv4 /24 or IPv6 /48 in the last 5 minutes raise
+  its own difficulty (one bit when over 5, one more per doubling), and so do creations from its IPv6 /32 (threshold 50);
+  the larger of the two counts, up to +6. Verified creations server-wide add up to +2 bits for everyone. A challenge
+  keeps the parameters it was issued with.
+- A challenge is single-use and expires after `ttlSeconds` (5 minutes by default).
 - Submitted as `"pow": { "challenge": b64u, "nonce": b64u(8 B) }`, or in `GF-PoW` on sends.
-- `503 unavailable` (with `Retry-After`) on a request carrying a solution means the server's verification slots were all
-  busy. The challenge was not used up: retry the same solution.
+- `503 unavailable` with a short `Retry-After` on a request carrying a solution means no verification slot was free (one
+  network may only use a share of them). The challenge was not used up: retry the same solution.
 
 ## Push payload (plaintext inside the RFC 8291 Web Push layer)
 ```
@@ -212,7 +223,8 @@ Response: `{ "protocol": 2, "vapidPublicKey": b64u(65 B uncompressed P-256), "ma
 issued to this client would need right now.
 
 ### `POST /v1/pow/challenge`
-No body. Response as above. Rate limited per IP and per network.
+No body. Optional query `purpose=create|send`. Response as above. Rate limited per IP, per network and per IPv6 /32.
+`400 invalid_request` for an unknown purpose.
 
 ### `POST /v1/mailboxes`: create a mailbox
 ```json
@@ -261,7 +273,7 @@ resumes on its own if one starts accepting again. Clients that call refresh peri
     Delivery is at-least-once: in rare crash windows the same message may be pushed twice, and clients must drop
     duplicates (a repeated Signal ciphertext is rejected anyway). Retry with the same key and body.
   - `GF-TTL: seconds`, optional. The default is `defaultTtlSeconds`, clamped to `[60, maxTtlSeconds]`.
-  - `GF-PoW: <challenge b64u>.<nonce b64u>`, optional. A solved `/v1/pow/challenge` that pays for this request after a
+  - `GF-PoW: <challenge b64u>.<nonce b64u>`, optional. A solved `/v1/pow/challenge?purpose=send` that pays for this request after a
     `429` with `"scope": "ip"` or `"network"` (shared IPs, Tor). It doesn't bypass `mailbox` or `global`.
 - Responses: `202 { "id": b64u(16 B) }`, `404 not_found` (unknown, expired or deleted mailbox), `413 too_large`,
   `415 unsupported_media_type`, `429 rate_limited` (with `Retry-After`), and `507 mailbox_full` (with `Retry-After` and a `scope`).

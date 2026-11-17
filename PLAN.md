@@ -88,12 +88,13 @@ Mailboxes expire after 90 days (configurable) unless the owner refreshes them. `
 > The QR code carries the server URL, so **federation comes free**: Alice and Bob can use different servers.
 
 ### 4.2 Mailbox creation (anti-abuse)
-1. `POST /v1/pow/challenge` returns `{scheme, challenge, difficulty, memoryKiB, iterations, expires}`. The challenge is
-   stored in Redis with its parameters and is single-use. Difficulty depends mostly on recent creations from the
-   requester's network, plus a little (at most 2 bits) on verified creations server-wide.
+1. `POST /v1/pow/challenge?purpose=create` returns `{scheme, purpose, challenge, difficulty, memoryKiB, iterations,
+   ttlSeconds, expires}`. The challenge is stored in Redis with its parameters and purpose, and is single-use. Difficulty
+   depends mostly on recent creations from the requester's network and IPv6 /32, plus a little (at most 2 bits) on
+   verified creations server-wide. The app solves it with no time limit, moving to a fresh challenge before one expires.
 2. `POST /v1/mailboxes` with `{pow_solution, send_secret, owner_hash, endpoint, p256dh, auth}`. The PoW is checked first
-   (GETDEL, then one Argon2 call in a bounded pool), then the global, network and IP creation limits. Only a creation that
-   passes them counts toward its network's load.
+   (GETDEL, then one Argon2 call in a bounded pool where one network gets at most a quarter of the slots), then the global,
+   /32, network and IP creation limits. Only a creation that passes them counts toward its network's load.
 3. The server validates the endpoint (§7), creates the mailbox in state `PendingVerification`, and **sends a verification push**
    with a random 128-bit code.
 4. The client gets the push and sends `POST /v1/mailboxes/verify` with `{send_secret, owner_secret, code}`. The mailbox
@@ -184,7 +185,7 @@ CREATE TABLE pending_messages (
 | Server at rest | AES-256-GCM, HMAC-SHA256, HKDF-SHA256. Keys come from files mounted as secrets, never from the DB. |
 | Client at rest | SQLCipher database, with the key wrapped by an Android Keystore key (StrongBox when available). `allowBackup=false`, plus data-extraction rules that exclude everything. |
 | Transport | TLS 1.3 only, HSTS, optional SPKI pinning per server |
-| PoW | Argon2id (`gf/pow/v2`: 16 MiB, `t = 1`, `p = 1`, 2^6 calls by default), so GPUs and ASICs gain only a small factor over a CPU. About 1–3 s on a mid-range phone, rising mostly for the network causing load. Verified in one Argon2 call, in a bounded pool. |
+| PoW | Argon2id (`gf/pow/v2`: 16 MiB, `t = 1`, `p = 1`), so GPUs and ASICs gain only a small factor over a CPU. Mailbox creation: 2^8 calls at base (about 5–15 s on a mid-range phone, about 3 core-seconds for an attacker), rising mostly for the network or IPv6 /32 causing load; a pool of ready mailboxes hides it, and the app solves without a time limit. Send-limit challenges: fixed 2^6 calls, and the app caps what it does for a contact's server. Verified in one Argon2 call, in a bounded pool with a per-network share. |
 
 **Payload budget**: UnifiedPush allows 4096 bytes. RFC 8291 overhead is 103 B and the push envelope is 9 B, which leaves **about 3984 B for the
 E2E blob**. A PQXDH PreKey message carries a 1568 B Kyber ciphertext, so first messages must be short. Long texts get
