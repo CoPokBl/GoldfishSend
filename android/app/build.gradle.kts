@@ -68,7 +68,8 @@ android {
                 storePassword = signingValue("storePassword", "GF_KEYSTORE_PASSWORD")
                 keyAlias = signingValue("keyAlias", "GF_KEY_ALIAS")
                 keyPassword = signingValue("keyPassword", "GF_KEY_PASSWORD")
-                // minSdk 29: v2+v3 cover every supported device. v3 enables future key rotation.
+                // minSdk 29: v3 alone covers every supported device, and allows key rotation later. AGP then leaves out
+                // v2 whatever this says (apksigner verify -v shows v3 only); it's kept on in case minSdk ever drops.
                 enableV1Signing = false
                 enableV2Signing = true
                 enableV3Signing = true
