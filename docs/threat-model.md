@@ -95,8 +95,9 @@ adversary.
 - **Can't:** read content, forge messages (libsignal authenticates them), learn names or contact lists, or link one
   person's mailboxes except by IP and timing.
 - **Can:** drop, delay or replay messages. Drops look like an offline recipient. libsignal rejects replays.
-- **Deferred:** two-relay routing, where your server forwards to your contact's server, would hide your IP from the
-  recipient's server (PLAN.md §11, item 11).
+- **Not built yet:** two-relay routing, where your own server forwards to your contact's server (as in SimpleX's
+  private message routing), would hide your IP from the recipient's server. It needs a server-to-server forwarding
+  endpoint with its own abuse controls.
 
 ### A malicious or compromised contact
 - **Can:** read what you send them, keep it (disappearing timers and "delete for everyone" are honoured by honest apps

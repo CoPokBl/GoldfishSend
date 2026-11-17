@@ -6,7 +6,7 @@ import app.goldfishsend.proto.utf8
 import app.goldfishsend.proto.wipe
 
 /**
- * Per-message crypto-shredding (PLAN.md §10a). Each message body is encrypted with its own random key, stored wrapped in
+ * Per-message crypto-shredding (android/README.md, "Security notes"). Each message body is encrypted with its own random key, stored wrapped in
  * `message_keys`. Messages with an expiry are wrapped under that expiry's time-bucket key (see [BucketKeys]), which is
  * destroyed when the bucket ends, even while locked. Others are wrapped by the message root key (MRK).
  * Deleting the key row makes the body unrecoverable. Destroying the MRK's Keystore wrapper makes every message unrecoverable.

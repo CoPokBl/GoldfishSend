@@ -17,7 +17,7 @@ using static GoldfishSend.Tests.Integration.GoldfishFixture;
 namespace GoldfishSend.Tests.Integration;
 
 /// <summary>
-/// M4's abuse suite (PLAN.md §4.2, §7, §8): the promised defences that the other integration tests don't already cover.
+/// The abuse suite (server/README.md, "Tests"): the documented defences that the other integration tests don't already cover.
 /// Rate-limit buckets are shared by every node, so limits are tightened on separate nodes and exercised from made-up
 /// client addresses (198.18.0.0/15, 2001:db8::/32), never from the address the other tests share. Burst-1 policies keep
 /// the outcomes exact despite the limiter rounding stored times to whole seconds.

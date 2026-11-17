@@ -231,7 +231,7 @@ class Prefs(context: Context) {
         get() = str("push_host")
         set(v) = setStrIfChanged("push_host", v)
 
-    // --- Security features (each one optional, see PLAN.md §11.10) ---
+    // --- Security features (each one optional, see android/README.md, "Optional security features") ---
 
     /** Shuffle the in-app PIN keypad's digits each time it's shown. Off by default because it slows entry. */
     var scramblePinPad: Boolean
