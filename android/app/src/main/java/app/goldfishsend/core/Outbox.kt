@@ -40,6 +40,9 @@ object Outbox {
      */
     private val contactLocks = ConcurrentHashMap<Long, Mutex>()
 
+    /** How soon a hello waiting for a ready mailbox (the pool is being filled) is tried again. */
+    private const val MAILBOX_WAIT_RETRY_MS = 30_000L
+
     /** At most this many contacts are sent to at once. */
     private val parallel = Semaphore(4)
 
@@ -130,8 +133,11 @@ object Outbox {
             if (blob == null) {
                 val plaintext = when (item.kind) {
                     OutboxKind.HELLO -> {
-                        val mb = Mailboxes.takeForContact(s, item.contactId) ?: run {
-                            backoff(s, item, null)
+                        // Doesn't wait for a proof of work here (that would hold a send slot for as long as it takes):
+                        // without a ready mailbox, the pool fill starts and this hello is retried shortly, without
+                        // counting as a failed attempt.
+                        val mb = Mailboxes.readyForContact(s, item.contactId) ?: run {
+                            s.repo.outboxBackoff(item.seq, item.attempts, System.currentTimeMillis() + MAILBOX_WAIT_RETRY_MS)
                             return false
                         }
                         Content.Hello(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), s.repo.displayName, Graph.ownServerKey()).encode()
@@ -163,7 +169,7 @@ object Outbox {
                 if (!e.powCanHelp || item.attempts >= 3) {
                     throw e
                 }
-                val ch = api.powChallenge()
+                val ch = api.powChallenge(forSend = true)
                 val nonce = solvePow(ch)
                 api.sendMessage(secret, blob, item.idem, null, powHeader(ch, nonce))
             }
@@ -233,15 +239,13 @@ object Outbox {
     )
 
     /**
-     * Solves a server's challenge, treating an unknown scheme, unreasonable parameters or a timeout as a server failure
-     * (retried later) rather than letting it pin the CPU or memory, or crash the send loop.
+     * Solves a send-limit challenge ([Pow.Lane.CONTACT_SEND]: usually a contact's server, which may be hostile). An unknown
+     * scheme, parameters past the lane's tight caps, or a timeout count as a server failure (retried later) rather than
+     * letting it pin the CPU or memory, or crash the send loop. It pauses while our own mailbox creation needs the solver.
      */
-    suspend fun solvePow(ch: PowChallenge, hashes: java.util.concurrent.atomic.AtomicLong? = null): ByteArray = try {
-        val challenge = runCatching { B64.dec(ch.challenge) }.getOrNull()
-        if (ch.scheme != Pow.SCHEME || challenge == null || challenge.size != 32) {
-            throw Pow.TooHardException(ch.params, "scheme")
-        }
-        Pow.solve(challenge, ch.params, hashes = hashes)
+    suspend fun solvePow(ch: PowChallenge): ByteArray = try {
+        val pow = ch.toPow()
+        Pow.solveContact(pow.bytes, pow.params)
     } catch (e: Pow.TooHardException) {
         throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
     } catch (e: kotlinx.coroutines.TimeoutCancellationException) {

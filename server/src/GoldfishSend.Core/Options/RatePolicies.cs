@@ -10,11 +10,14 @@ public static class RatePolicies {
     public const string SendGlobal = "send-global";
     public const string CreatePerIp = "create-ip";
     public const string CreatePerNetwork = "create-net";
+    /// <summary>Per IPv6 /32. Much looser than <see cref="CreatePerNetwork"/>: it only stops one actor with thousands of /48s.</summary>
+    public const string CreatePerAllocation = "create-alloc";
     public const string CreateGlobal = "create-global";
     /// <summary>Verification pushes to push hosts no mailbox has used before, server-wide.</summary>
     public const string NewHostGlobal = "newhost-global";
     public const string PowPerIp = "pow-ip";
     public const string PowPerNetwork = "pow-net";
+    public const string PowPerAllocation = "pow-alloc";
     public const string OwnerPerIp = "owner-ip";
     public const string OwnerPerNetwork = "owner-net";
     public const string RotatePerMailbox = "rotate-mailbox";
@@ -29,7 +32,8 @@ public static class RatePolicies {
     public const string PushPerMailbox = "push-mailbox";
 
     // "-ip" policies key on an IPv4 /32 or IPv6 /64. "-net" policies key on an IPv4 /24 or IPv6 /48, so one
-    // allocation can't multiply its quota by rotating through the addresses it controls.
+    // allocation can't multiply its quota by rotating through the addresses it controls. "-alloc" policies key on an
+    // IPv6 /32 (IPv4 clients skip them).
     public static readonly IReadOnlyDictionary<string, RatePolicy> Defaults = new Dictionary<string, RatePolicy> {
         [SendPerIp] = new(60, 60, 20),
         [SendPerNetwork] = new(600, 60, 200),
@@ -40,12 +44,16 @@ public static class RatePolicies {
         // Each contact, group joined and group removal costs a mailbox, plus a PoW each.
         [CreatePerIp] = new(30, 3600, 20),
         [CreatePerNetwork] = new(100, 3600, 50),
+        // 20x one /48: an ISP /32 can hold tens of thousands of customers, but one actor with thousands of /48s is held
+        // to what 20 of them would get.
+        [CreatePerAllocation] = new(2000, 3600, 500),
         // Only a resource cap (pending rows, verification pushes), well above real demand, so a flood can't easily lock
         // everyone out. Floods are slowed by the per-address limits and the per-network PoW difficulty instead.
         [CreateGlobal] = new(30000, 3600, 3000),
         [NewHostGlobal] = new(120, 3600, 30),
         [PowPerIp] = new(30, 60, 30),
         [PowPerNetwork] = new(300, 60, 100),
+        [PowPerAllocation] = new(3000, 60, 1000),
         [OwnerPerIp] = new(30, 60, 30),
         [OwnerPerNetwork] = new(300, 60, 100),
         [RotatePerMailbox] = new(10, 86400, 5),
@@ -69,7 +77,7 @@ public static class RatePolicies {
     /// </summary>
     public static string ScopeOf(string policy) => policy switch {
         SendPerIp or CreatePerIp or PowPerIp or OwnerPerIp or InviteCreatePerIp or InviteFetchPerIp => ScopeIp,
-        SendPerNetwork or CreatePerNetwork or PowPerNetwork or OwnerPerNetwork or InviteCreatePerNetwork or InviteFetchPerNetwork => ScopeNetwork,
+        SendPerNetwork or CreatePerNetwork or CreatePerAllocation or PowPerNetwork or PowPerAllocation or OwnerPerNetwork or InviteCreatePerNetwork or InviteFetchPerNetwork => ScopeNetwork,
         SendPerMailbox or SendPerMailboxDaily or RotatePerMailbox or PushPerMailbox => ScopeMailbox,
         _ => ScopeGlobal,
     };

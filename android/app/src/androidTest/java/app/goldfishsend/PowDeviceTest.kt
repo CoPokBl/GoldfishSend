@@ -45,7 +45,7 @@ class PowDeviceTest {
         val hashes = AtomicLong()
         val p = Pow.Params(4, 16 * 1024, 1)
         val start = System.currentTimeMillis()
-        val nonce = Pow.solve(ch, p, hashes = hashes)
+        val nonce = Pow.solveOwn({ Pow.Challenge(ch, p, 300_000) }, hashes).second
         Log.i("PowDeviceTest", "difficulty 4 at 16 MiB: ${hashes.get()} calls in ${System.currentTimeMillis() - start} ms")
         assertTrue(Pow.check(ch, nonce, p))
         assertTrue(Pow.threadsFor(16 * 1024) in 1..Pow.MAX_THREADS)

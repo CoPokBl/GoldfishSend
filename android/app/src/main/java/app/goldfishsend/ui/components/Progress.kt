@@ -258,3 +258,62 @@ fun MailboxProgressBar(modifier: Modifier = Modifier) {
     val p by Mailboxes.progress.collectAsState()
     TopProgressBar(p != null, modifier, progress = p?.solved)
 }
+
+/** What a mailbox wait is doing, in a few plain words, with a rough time estimate when there is one. */
+fun mailboxWaitText(p: Mailboxes.Progress): String {
+    val left = p.remainingSeconds
+    return when {
+        p.solved == null -> "Almost done. Waiting for your server to confirm."
+        p.overdue -> "Taking longer than usual. It will finish, even if you leave this screen."
+        left == null -> "Working…"
+        left < 10 -> "A few seconds left"
+        left < 50 -> "About ${(left + 4) / 5 * 5} seconds left"
+        left < 90 -> "About a minute left"
+        left < 3600 -> "About ${(left + 30) / 60} minutes left"
+        else -> "This could take an hour or more. It will finish, even if you leave this screen."
+    }
+}
+
+/**
+ * Shown wherever someone waits for a new mailbox (first setup, an invite or group when no ready mailbox is left): an
+ * animated bar, a time estimate, why it takes a while, and a way out when [onCancel] is given. It follows
+ * [rememberShowProgress], and only appears while a mailbox is actually being made and [active].
+ */
+@Composable
+fun MailboxWait(active: Boolean, modifier: Modifier = Modifier, cancelLabel: String = "Cancel", onCancel: (() -> Unit)? = null) {
+    val p by Mailboxes.progress.collectAsState()
+    val show = rememberShowProgress(active && p != null)
+    // Keeps the last state through the exit animation.
+    var last by remember { mutableStateOf(Mailboxes.Progress(0f)) }
+    p?.let { last = it }
+    AnimatedVisibility(show, modifier, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            val solved = last.solved
+            if (solved != null) {
+                val shown by androidx.compose.animation.core.animateFloatAsState(solved, label = "mailbox progress")
+                LinearProgressIndicator(
+                    progress = { shown },
+                    Modifier.fillMaxWidth().height(6.dp).semantics { contentDescription = "Preparing a secure mailbox" },
+                )
+            } else {
+                LinearProgressIndicator(Modifier.fillMaxWidth().height(6.dp).semantics { contentDescription = "Preparing a secure mailbox" })
+            }
+            Text(
+                mailboxWaitText(last),
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 10.dp),
+            )
+            Text(
+                "Preparing a secure mailbox. This stops spam and can take a minute.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            if (onCancel != null) {
+                TextButton(onClick = onCancel, modifier = Modifier.padding(top = 4.dp)) { Text(cancelLabel) }
+            }
+        }
+    }
+}

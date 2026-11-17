@@ -95,9 +95,11 @@ import app.goldfishsend.ui.components.BusyDialog
 import app.goldfishsend.ui.components.ButtonKind
 import app.goldfishsend.ui.components.ProgressButton
 import app.goldfishsend.ui.components.ProgressRow
+import app.goldfishsend.ui.components.MailboxWait
 import app.goldfishsend.ui.components.TopProgressBar
 import app.goldfishsend.ui.components.rememberWork
 import app.goldfishsend.core.Mailboxes
+import app.goldfishsend.core.Actions
 import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.Dispatchers
@@ -165,23 +167,29 @@ fun NewGroupScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                     )
                 }
             }
+            // Creation runs in the app's scope (Actions): if it has to wait for a new mailbox and the user leaves, the group
+            // still appears in the chat list when it's done.
+            val running by Actions.running.collectAsState()
+            val creating = busy || Actions.groupCreate() in running
             val making by Mailboxes.progress.collectAsState()
-            ProgressRow(
-                busy, "Creating the group…", Modifier.padding(horizontal = 20.dp),
-                hint = if (making != null) "Setting up the group's private inbox. This can take up to a minute." else null,
-            )
+            ProgressRow(creating && making == null, "Creating the group…", Modifier.padding(horizontal = 20.dp))
+            MailboxWait(creating, Modifier.padding(horizontal = 20.dp), onCancel = { Actions.cancel(Actions.groupCreate()) })
             ProgressButton(
                 onClick = {
                     busy = true
+                    val members = picked.toList()
+                    val job = Actions.start(Actions.groupCreate()) { Groups.create(s, name, members) }
                     scope.launch {
-                        val r = withContext(Dispatchers.IO) { runCatching { Groups.create(s, name, picked.toList()) } }
+                        val r = runCatching { job.await() }
                         busy = false
                         r.onSuccess(openChat).onFailure {
-                            snackbar.showSnackbar(groupError(it, "Couldn't create the group. Try again."))
+                            if (it !is kotlinx.coroutines.CancellationException) {
+                                snackbar.showSnackbar(groupError(it, "Couldn't create the group. Try again."))
+                            }
                         }
                     }
                 },
-                busy = busy,
+                busy = creating,
                 enabled = name.isNotBlank() && picked.isNotEmpty(),
                 modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp).height(52.dp),
             ) {
@@ -572,7 +580,10 @@ private fun AddMembersDialog(s: Session, already: Set<String>, onDismiss: () -> 
 fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String) -> Unit, onDeclined: () -> Unit) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
-    var joining by remember { mutableStateOf(false) }
+    // The join runs in the app's scope (Actions), so it completes even if the user leaves while it waits for a mailbox.
+    val running by Actions.running.collectAsState()
+    val joinKey = Actions.groupJoin(cid)
+    val joining = joinKey in running
     Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.navigationBarsPadding().padding(16.dp)) {
             Text("$inviter invited you to this group", style = MaterialTheme.typography.titleSmall)
@@ -585,27 +596,28 @@ fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String)
             )
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                ProgressButton(busy = busy && !joining, enabled = !busy, kind = ButtonKind.OUTLINED, onClick = {
+                ProgressButton(busy = busy, enabled = !busy && !joining, kind = ButtonKind.OUTLINED, onClick = {
                     busy = true
-                    joining = false
                     scope.launch {
                         withContext(Dispatchers.IO) { runCatching { Groups.leave(s, cid) } }
                         busy = false
                         onDeclined()
                     }
                 }, modifier = Modifier.weight(1f)) { Text("Decline") }
-                ProgressButton(busy = busy && joining, enabled = !busy, onClick = {
-                    busy = true
-                    joining = true
+                ProgressButton(busy = joining, enabled = !busy && !joining, onClick = {
+                    val job = Actions.start(joinKey) { Groups.join(s, cid) }
                     scope.launch {
-                        val r = withContext(Dispatchers.IO) { runCatching { Groups.join(s, cid) } }
-                        busy = false
-                        r.onFailure { onError(groupError(it, "Couldn't join. Try again.")) }
+                        runCatching { job.await() }.onFailure {
+                            if (it !is kotlinx.coroutines.CancellationException) {
+                                onError(groupError(it, "Couldn't join. Try again."))
+                            }
+                        }
                     }
                 }, modifier = Modifier.weight(1f).blockWhenObscured()) {
                     Text("Join")
                 }
             }
+            MailboxWait(joining, Modifier.padding(top = 8.dp), cancelLabel = "Cancel joining", onCancel = { Actions.cancel(joinKey) })
         }
     }
 }

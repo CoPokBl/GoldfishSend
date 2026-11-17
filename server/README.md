@@ -285,29 +285,59 @@ All keys are base64url: 32 bytes each, except `ServerKey` (96). Generate a full 
 ### `Goldfish:Pow`
 
 Argon2id proof of work (`gf/pow/v2`, see docs/protocol.md). Solving costs about `2^difficulty` Argon2 calls of
-`MemoryKiB` each, and verifying costs one. Measured with BouncyCastle on an i9-9900K, one 16 MiB call (`t = 1`) takes
-about 30–45 ms in .NET (verification), 17 ms on the JVM, and 47 ms in an x86_64 Android emulator (ART, release-like
-build), or 18 ms per call on its 3 solver threads. A mid-range ARM phone should be about 2× slower per core, so roughly
-25–60 ms per call on 4 threads, and 64 calls at the base difficulty take about 1–3 s (median). That estimate comes from
-CPU benchmark ratios, not a phone, so treat it as good to about 2×.
+`MemoryKiB` each, and verifying costs one. It's tuned to make mass creation cost something, not to be quick: the app
+keeps a pool of ready mailboxes, so people rarely wait, and when they do it shows progress and carries on in the
+background.
+
+Measured on an i9-9900K, one 16 MiB call (`t = 1`) takes:
+
+| Implementation | One core | Notes |
+|---|---|---|
+| libsodium (native, AVX2) | 12 ms | What an attacker would use. Many threads at once are held back by memory bandwidth. |
+| BouncyCastle .NET (this server) | 30–45 ms | Verification, including allocating the 16 MiB. |
+| BouncyCastle JVM (HotSpot) | 17 ms | 5 ms per call on 4 threads. |
+| BouncyCastle on Android (x86_64 emulator, ART, non-debuggable) | 47 ms | 18 ms per call on its 3 solver threads. |
+
+A mid-range ARM phone should be about 2× slower per core than the emulator on this host, so roughly 25–60 ms per call
+on 4 threads. At the base difficulty (256 calls) that's a median of about 4–11 s (mean 6–15 s). This comes from CPU
+benchmark ratios, not a phone, so treat it as good to about 2×.
+
+**What it costs an attacker** (native Argon2 at 12 ms per call per core, cloud CPU at $0.01–0.04 per core-hour, a GPU at
+$0.3–0.8 an hour):
+
+| Difficulty | When | Core-seconds per mailbox | Per million mailboxes (CPU) | Per million (GPU, rough) |
+|---|---|---|---|---|
+| 8 | base | 3 | 850 core-hours, $9–35 | 6–14 GPU-hours, $2–11 |
+| 12 | one network at the default `create-net` burst (+4) | 49 | 14 000 core-hours, $140–550 | $30–180 |
+| 16 | a busy network during a global flood (+6 +2) | 790 | 220 000 core-hours, $2 200–8 700 | $500–2 900 |
+
+The GPU column assumes the GPU is limited by memory bandwidth: each call moves about 48 MiB, so an RTX 4090 (1 TB/s)
+manages at most about 20 000 calls a second, and likely 5 000–12 000. That's 60–150 CPU cores' worth, or roughly 1–20×
+cheaper per call than cloud CPUs. There's no published Argon2 GPU benchmark at these parameters, so this is the least
+certain number here (an order of magnitude either way). Proof of work prices out cheap mass abuse; it doesn't stop a
+funded attacker. The real caps are the per-IP, per-network and per-/32 limits below, and each network an attacker uses
+pays its own rising difficulty.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `BaseDifficulty` | `6` | Leading zero bits at no load, for mailbox creation and the send-limit bypass: 64 Argon2 calls. |
+| `BaseDifficulty` | `8` | Leading zero bits for mailbox creation at no load: 256 Argon2 calls. |
+| `SendDifficulty` | `6` | Fixed bits for `?purpose=send` challenges, which only pay a send limit (64 calls). The app solves at most 2^11 calls of 16 MiB, for 180 s, for a server that isn't its own, so keep this well below that. |
 | `MemoryKiB` | `16384` | Argon2 memory per call. The app runs up to 4 solver threads, so up to 4× this. 16 MiB is large enough that GPUs are held back by memory bandwidth, and small enough for low-memory phones. |
 | `Iterations` | `1` | Argon2 passes over the memory. Raising `MemoryKiB` buys more memory-hardness for the same time. |
-| `ChallengeTtlSeconds` | `300` | Lifetime of a single-use challenge. It must exceed the app's 180 s solve timeout. |
+| `ChallengeTtlSeconds` | `300` | Lifetime of a single-use challenge. The app fetches a fresh one 30 s before expiry when its search takes longer, so this only needs to cover a send-limit solve (180 s) and the round trip. |
 | `LoadWindowMinutes` | `5` | How far back creations count toward load. |
-| `NetworkLoadThreshold` | `5` | Creations from one network (IPv4 /24, IPv6 /48) in the window before that network's difficulty rises: +1 bit when over it, +1 more per doubling. A household setting up a few phones stays at base. Counted for every creation that passes the rate limits, verified or not, since it only slows that network. `0` disables it. |
-| `MaxNetworkExtraDifficulty` | `6` | Bits a busy network can gain (64×, a minute or two on a phone). With the default `create-net` limit (burst 50) one network reaches about +4. |
+| `NetworkLoadThreshold` | `5` | Creations from one network (IPv4 /24, IPv6 /48) in the window before that network's difficulty rises: +1 bit when over it, +1 more per doubling. A household setting up a few phones stays at base. Counted for every creation that passes the rate limits, verified or not, since it only slows that network. Shared networks (CGNAT, Tor exits) get slower too, and the app copes with that. `0` disables it. |
+| `AllocationLoadThreshold` | `50` | The same for a whole IPv6 /32, 10× looser, since a /32 can hold an ISP's customers. It catches one actor spread over many /48s. A network gets the larger of its own and its /32's extra bits. `0` disables it. |
+| `MaxNetworkExtraDifficulty` | `6` | Bits a busy network (or /32) can gain: 64×, ten minutes or more on a phone. With the default `create-net` limit (burst 50) one network reaches about +4. |
 | `GlobalLoadThresholdPerMinute` | `120` | **Verified** mailboxes per minute, server-wide, before everyone's difficulty rises. Raising it this way needs real push endpoints and a round trip per mailbox. `0` disables it. |
 | `MaxGlobalExtraDifficulty` | `2` | Bits everyone can gain from server-wide load (4×). Kept small, so a flood spread over many networks can't make onboarding slow for everyone. |
-| `MaxConcurrentVerifications` | `0` | Argon2 verifications at once per process (`0`: one per CPU). Each takes about 30 ms of a core and `MemoryKiB` of memory. When all are busy, requests wait at most 250 ms, then get `503` with `Retry-After: 1`, and the challenge is kept for a retry. |
+| `MaxConcurrentVerifications` | `0` | Argon2 verifications at once per process (`0`: one per CPU). Each takes about 30–45 ms of a core and `MemoryKiB` of memory. One network (/24 or /48) may hold at most a quarter of them and one IPv6 /32 half (at least one each), so junk solutions from one place can't take them all. When none comes free within 250 ms, the request gets `503` with `Retry-After: 1`, and the challenge is kept for a retry. |
 
 The load counters are per-minute counts in the ephemeral Redis that expire after `LoadWindowMinutes` + 1. The
-per-network ones are keyed by the same daily HMAC as short-period rate-limit buckets. Neither refers to a mailbox. The
-startup check refuses parameters the app would refuse (difficulty over 20 at full load, `MemoryKiB` outside 8–65536,
-`Iterations` outside 1–4, or expected work over 2^14 calls of 16 MiB).
+per-network and per-/32 ones are keyed by the same daily HMAC as short-period rate-limit buckets. None refers to a
+mailbox. The fair-share counts live only in process memory, while a verification runs. The startup check refuses
+parameters the app would refuse: `create` difficulty over 24 at full load or expected work over 2^17 calls of 16 MiB,
+`send` difficulty over 20 or work over 2^11 calls of 16 MiB, `MemoryKiB` outside 8–65536, `Iterations` outside 1–4.
 
 ### `Goldfish:Push` (outbound requests to push servers)
 
@@ -362,7 +392,9 @@ A dictionary of GCRA policies: `Limit` events per `PeriodSeconds`, with bursts o
 HMACed with a daily random key, which lives only in the ephemeral Redis, before they reach Redis. Every limit is shared
 cluster-wide. A partial override is fine: any field you leave out (or set to `0`) keeps its default.
 "IP" subjects are an IPv4 /32 or IPv6 /64. "Network" subjects are an IPv4 /24 or IPv6 /48, which stops one
-allocation from multiplying its quota by rotating addresses.
+allocation from multiplying its quota by rotating addresses. "-alloc" subjects are an IPv6 /32, with much looser limits:
+a /48 costs little in bulk, so they stop one actor that holds thousands of them. All are keyed by HMAC like the rest, and
+a `429` from them has scope `network`.
 
 | Policy | Subject | Default (`Limit` / `PeriodSeconds`, `Burst`) | Applies to |
 |---|---|---|---|
@@ -372,8 +404,10 @@ allocation from multiplying its quota by rotating addresses.
 | `send-global` | whole server | 2000 / 1 s, burst 4000 | Every message, single or batched: the overall accept ceiling. Charged last, only for messages about to be accepted, so junk can't drain it. |
 | `create-ip` | client IP | 30 / 3600 s, burst 20 | `POST /v1/mailboxes` (fails closed if Redis is down) |
 | `create-net` | client network | 100 / 3600 s, burst 50 | `POST /v1/mailboxes` (fails closed) |
+| `create-alloc` | client IPv6 /32 | 2000 / 3600 s, burst 500 | `POST /v1/mailboxes` (fails closed), checked before `create-net`. 20× one /48: a normal ISP's /32 shares it among many customers, but one actor holding thousands of /48s gets what 20 of them would. IPv4 clients skip it. |
 | `pow-ip` | client IP | 30 / 60 s, burst 30 | `POST /v1/pow/challenge` |
 | `pow-net` | client network | 300 / 60 s, burst 100 | `POST /v1/pow/challenge` |
+| `pow-alloc` | client IPv6 /32 | 3000 / 60 s, burst 1000 | `POST /v1/pow/challenge`, checked first. 10× one /48. IPv4 clients skip it. |
 | `owner-ip` | client IP | 30 / 60 s, burst 30 | Owner operations (verify, rotate, refresh, delete) |
 | `rotate-mailbox` | mailbox | 10 / 86400 s, burst 5 | `PUT /v1/mailboxes/endpoint`. Each rotation pushes to a new URL, so it's budgeted per mailbox. |
 | `invite-create-ip` | client IP | 20 / 3600 s, burst 10 | `POST /v1/invites` (fails closed) |

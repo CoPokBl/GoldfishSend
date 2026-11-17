@@ -13,6 +13,8 @@ public sealed class RatePoliciesTests {
     [InlineData(RatePolicies.SendPerNetwork, "network")]
     [InlineData(RatePolicies.CreatePerNetwork, "network")]
     [InlineData(RatePolicies.PowPerNetwork, "network")]
+    [InlineData(RatePolicies.CreatePerAllocation, "network")]
+    [InlineData(RatePolicies.PowPerAllocation, "network")]
     [InlineData(RatePolicies.OwnerPerNetwork, "network")]
     [InlineData(RatePolicies.InviteCreatePerNetwork, "network")]
     [InlineData(RatePolicies.InviteFetchPerNetwork, "network")]
@@ -33,7 +35,7 @@ public sealed class RatePoliciesTests {
     [Fact]
     public void ScopeTable_CoversEveryDefaultPolicy() {
         // A newly added policy must be added to the theory above (and ScopeOf) deliberately.
-        Assert.Equal(22, RatePolicies.Defaults.Count);
+        Assert.Equal(24, RatePolicies.Defaults.Count);
     }
 
     [Fact]

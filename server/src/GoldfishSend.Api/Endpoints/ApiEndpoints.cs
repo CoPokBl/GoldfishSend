@@ -57,17 +57,35 @@ public static class ApiEndpoints {
 
     private static async Task<IResult> IssueChallenge(HttpContext context, PowService pow, RateLimiter limiter) {
         var client = Subject(context);
-        foreach (var (policy, subject) in new[] { (RatePolicies.PowPerIp, client.Host), (RatePolicies.PowPerNetwork, client.Network) }) {
+        PowPurpose purpose;
+        switch (context.Request.Query["purpose"].ToString()) {
+            case "" or "create":
+                purpose = PowPurpose.Create;
+                break;
+            case "send":
+                purpose = PowPurpose.Send;
+                break;
+            default:
+                return Error(ServiceError.InvalidRequest);
+        }
+        foreach (var (policy, subject) in new[] {
+                     (RatePolicies.PowPerAllocation, client.Allocation),
+                     (RatePolicies.PowPerNetwork, client.Network),
+                     (RatePolicies.PowPerIp, client.Host),
+                 }) {
+            if (subject is null) {
+                continue;
+            }
             var limit = await limiter.CheckAsync(policy, subject);
             if (!limit.Allowed) {
                 return Error(ServiceError.RateLimited(limit));
             }
         }
-        var challenge = await pow.IssueAsync(client);
+        var challenge = await pow.IssueAsync(client, purpose);
         var p = challenge.Parameters;
         return Results.Json(
-            new PowChallengeResponse(ProofOfWork.Scheme, B64(challenge.Challenge), p.Difficulty, p.MemoryKiB, p.Iterations,
-                challenge.ExpiresAt.ToUnixTimeSeconds()),
+            new PowChallengeResponse(ProofOfWork.Scheme, purpose == PowPurpose.Send ? "send" : "create", B64(challenge.Challenge),
+                p.Difficulty, p.MemoryKiB, p.Iterations, (int)challenge.Ttl.TotalSeconds, challenge.ExpiresAt.ToUnixTimeSeconds()),
             ApiJsonContext.Default.PowChallengeResponse);
     }
 

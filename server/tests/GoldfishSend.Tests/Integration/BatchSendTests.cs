@@ -185,7 +185,7 @@ public sealed class BatchSendTests {
             Assert.True(limited.Headers.Contains("Retry-After"));
 
             // A solved proof of work pays for the whole batch, once.
-            var challengeResponse = await client.PostAsync("/v1/pow/challenge", null);
+            var challengeResponse = await client.PostAsync("/v1/pow/challenge?purpose=send", null);
             var challengeJson = await challengeResponse.Content.ReadFromJsonAsync<JsonElement>();
             var challenge = Base64Url.DecodeFromChars(challengeJson.GetProperty("challenge").GetString());
             var nonce = ProofOfWork.Solve(challenge, GoldfishFixture.PowOf(challengeJson));

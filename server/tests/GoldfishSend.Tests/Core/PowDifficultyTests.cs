@@ -4,7 +4,8 @@ using GoldfishSend.Core.Options;
 namespace GoldfishSend.Tests.Core;
 
 public sealed class PowDifficultyTests {
-    // Defaults: base 6, network threshold 5 per 5-minute window (up to +6), global 120 verified a minute (up to +2).
+    // Defaults: base 8, network threshold 5 per 5-minute window and /32 threshold 50 (up to +6 together), global 120
+    // verified a minute (up to +2).
     private static readonly PowOptions Defaults = new();
 
     [Theory]
@@ -26,37 +27,50 @@ public sealed class PowDifficultyTests {
 
     [Fact]
     public void NoLoad_IsTheBaseDifficulty() {
-        Assert.Equal(6, PowDifficulty.For(Defaults, 0, 0));
+        Assert.Equal(8, PowDifficulty.For(Defaults, 0, 0, 0));
         // A household onboarding a few phones at once stays at base.
-        Assert.Equal(6, PowDifficulty.For(Defaults, 5, 0));
+        Assert.Equal(8, PowDifficulty.For(Defaults, 5, 5, 0));
     }
 
     [Fact]
     public void NetworkLoad_RaisesThatNetworkUpToSixBits() {
-        Assert.Equal(7, PowDifficulty.For(Defaults, 6, 0));
-        Assert.Equal(12, PowDifficulty.For(Defaults, 10_000, 0));
+        Assert.Equal(9, PowDifficulty.For(Defaults, 6, 6, 0));
+        Assert.Equal(14, PowDifficulty.For(Defaults, 10_000, 10_000, 0));
+    }
+
+    [Fact]
+    public void AllocationLoad_CatchesFloodsSpreadOverManyNetworks_ButIsTenTimesLooser() {
+        // A /48 with one creation in a /32 that saw 50: an ISP's ordinary traffic, not raised.
+        Assert.Equal(8, PowDifficulty.For(Defaults, 1, 50, 0));
+        // One actor with 500 /48s in a /32, three creations each: each /48 is under its threshold, the /32 is not.
+        Assert.Equal(8 + 5, PowDifficulty.For(Defaults, 3, 1500, 0));
+        // The larger of the two counts, not the sum, and still capped at +6.
+        Assert.Equal(8 + 6, PowDifficulty.For(Defaults, 10_000, 1_000_000, 0));
+        Assert.Equal(PowDifficulty.For(Defaults, 40, 0, 0), PowDifficulty.For(Defaults, 40, 60, 0));
     }
 
     [Fact]
     public void GlobalLoad_AddsAtMostTwoBits() {
         // 5-minute window: 600 verified is 120 a minute (not over), 601 is just over, 1201 is past one doubling.
-        Assert.Equal(6, PowDifficulty.For(Defaults, 0, 600));
-        Assert.Equal(7, PowDifficulty.For(Defaults, 0, 601));
-        Assert.Equal(8, PowDifficulty.For(Defaults, 0, 1201));
-        Assert.Equal(8, PowDifficulty.For(Defaults, 0, 10_000_000));
+        Assert.Equal(8, PowDifficulty.For(Defaults, 0, 0, 600));
+        Assert.Equal(9, PowDifficulty.For(Defaults, 0, 0, 601));
+        Assert.Equal(10, PowDifficulty.For(Defaults, 0, 0, 1201));
+        Assert.Equal(10, PowDifficulty.For(Defaults, 0, 0, 10_000_000));
     }
 
     [Fact]
     public void LoadFromOneNetwork_RaisesAnotherOnlyByTheGlobalCap() {
-        // Network X floods (and everything it creates is verified, so it also counts globally). Network Y is idle.
+        // Network X floods (and everything it creates is verified, so it also counts globally). Network Y, in another
+        // /32, is idle.
         foreach (var flood in new long[] { 10, 100, 1000, 100_000 }) {
-            var x = PowDifficulty.For(Defaults, flood, flood);
-            var y = PowDifficulty.For(Defaults, 0, flood);
+            var x = PowDifficulty.For(Defaults, flood, flood, flood);
+            var y = PowDifficulty.For(Defaults, 0, 0, flood);
             Assert.True(y <= Defaults.BaseDifficulty + Defaults.MaxGlobalExtraDifficulty, $"flood {flood}: y = {y}");
             Assert.True(x >= y);
         }
-        Assert.Equal(6 + 6 + 2, PowDifficulty.For(Defaults, 100_000, 100_000));
-        Assert.Equal(6 + 2, PowDifficulty.For(Defaults, 0, 100_000));
+        Assert.Equal(8 + 6 + 2, PowDifficulty.For(Defaults, 100_000, 100_000, 100_000));
+        Assert.Equal(8 + 2, PowDifficulty.For(Defaults, 0, 0, 100_000));
+        Assert.Equal(16, PowDifficulty.Highest(Defaults));
     }
 
     [Fact]
@@ -68,6 +82,6 @@ public sealed class PowDifficultyTests {
             NetworkLoadThreshold = 1,
             GlobalLoadThresholdPerMinute = 1,
         };
-        Assert.Equal(ProofOfWork.MaxDifficulty, PowDifficulty.For(extreme, long.MaxValue / 2, long.MaxValue / 2));
+        Assert.Equal(ProofOfWork.MaxDifficulty, PowDifficulty.For(extreme, long.MaxValue / 2, 0, long.MaxValue / 2));
     }
 }

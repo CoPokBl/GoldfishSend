@@ -158,20 +158,25 @@ server.
 Anyone without a capability.
 - **Can't:** message you at all. Sending needs that mailbox's `sendSecret`, which only your contact has.
 - **Can:** try to exhaust a server: create mailboxes, flood sends, use invites. Defences:
-  - memory-hard proof of work (Argon2id, 16 MiB per call) whose difficulty rises mostly for the network causing the
-    load, and only a little (at most 4x) for everyone else;
-  - GCRA limits per IP, network, mailbox and global, in Redis. The global creation limit is a high resource cap, so
-    filling it takes hundreds of networks;
+  - memory-hard proof of work (Argon2id, 16 MiB per call, 256 calls at base) whose difficulty rises mostly for the
+    network (or IPv6 /32) causing the load, and only a little (at most 4x) for everyone else;
+  - GCRA limits per IP, network, IPv6 /32, mailbox and global, in Redis. The global creation limit is a high resource
+    cap, so filling it takes hundreds of networks;
   - verification pushes before a mailbox goes live, and only verified mailboxes raise everyone's difficulty;
-  - a bounded pool for PoW verification, so checking solutions can't take the server's CPU;
+  - a bounded pool for PoW verification, of which one network may hold only a quarter, so checking junk solutions can't
+    take the server's CPU or make everyone else wait;
+  - send-limit challenges that can't create mailboxes, and tight caps on how much work the app does for a contact's
+    server (at most 2^11 calls of 16 MiB, 180 s), so a hostile server can't burn the phone;
   - per-push-host circuit breakers;
   - an SSRF-safe push client.
-- **Residual:** Argon2 takes away most of the GPU and ASIC advantage: each call needs 16 MiB filled in order, so a GPU
-  is limited by memory bandwidth and is worth a small factor (roughly 5–10x, our estimate) over a desktop CPU core,
-  instead of the 100x or more that SHA-256 gives. A phone running Java Argon2 is still much slower than any desktop or
-  cloud machine, so an attacker pays little per mailbox (about a CPU-second at base difficulty). What holds back an
-  attacker with many networks (a botnet, a large IPv6 allocation, many cloud addresses) is mainly the per-IP and
-  per-network limits, and each of their networks pays its own rising difficulty. Privacy Pass tokens are future work.
+- **Residual:** proof of work prices out cheap mass abuse; it doesn't stop a funded attacker. With native Argon2 a base
+  mailbox costs about 3 core-seconds, so a million cost roughly $10–35 of cloud CPU, or a few dollars on GPUs (server
+  README, `Goldfish:Pow`). Argon2 keeps the GPU advantage to a small factor (memory bandwidth, not hashing speed, limits
+  it; our estimate is 1–20x cheaper per call than cloud CPUs, uncertain by an order of magnitude), instead of the 100x or
+  more that SHA-256 gives. A phone is still far slower than any server, so honest users pay more time than attackers pay
+  money. What actually caps an attacker with many networks (a botnet, many cloud addresses, a large IPv6 allocation) is
+  the per-IP, per-network and per-/32 limits, with each of their networks paying its own rising difficulty. Privacy Pass
+  tokens are future work.
 
 ### Seized phone
 - **App locked, or phone before first unlock:** the database is SQLCipher, keyed from the Android Keystore
@@ -227,8 +232,8 @@ Malware with root, accessibility or notification access, or a keyboard that uplo
   locked app.
 - **MySQL logs:** InnoDB redo and undo log encryption is documented but not enabled in the compose stack.
 - **Sender IPs:** the live server sees them on sends, until two-relay routing exists.
-- **Proof of work:** it's cheap for anyone with a real computer, and many networks get many budgets (see Strangers and
-  abusers). Privacy Pass would tie creation to something scarcer.
+- **Proof of work:** it costs an attacker with real computers little (about $10–35 per million mailboxes at base), and
+  many networks get many budgets. The rate limits are the real cap. Privacy Pass would tie creation to something scarcer.
 - **Server key:** `ServerKey` never expires. If it leaks, someone who can also intercept TLS can impersonate the server
   until you replace it, and replacing it warns every user.
 - **Group members who aren't contacts** are vouched for by the owner. Until you compare safety numbers with them, a

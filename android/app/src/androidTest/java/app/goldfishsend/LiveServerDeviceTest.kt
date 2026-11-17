@@ -47,7 +47,10 @@ class LiveServerDeviceTest {
         assertEquals(2, info.protocol)
         val ch = api.powChallenge()
         assertEquals(app.goldfishsend.proto.Pow.SCHEME, ch.scheme)
-        assertNull(app.goldfishsend.proto.Pow.refusal(ch.params))
+        assertNull(app.goldfishsend.proto.Pow.refusal(ch.params, app.goldfishsend.proto.Pow.Lane.OWN_MAILBOX))
+        val send = api.powChallenge(forSend = true)
+        assertEquals("send", send.purpose)
+        assertNull(app.goldfishsend.proto.Pow.refusal(send.params, app.goldfishsend.proto.Pow.Lane.CONTACT_SEND))
 
         val blob = Rand.bytes(600)
         val id = api.uploadInvite(blob, 600)

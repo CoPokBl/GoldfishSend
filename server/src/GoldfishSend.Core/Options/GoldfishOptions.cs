@@ -83,8 +83,16 @@ public sealed class MailboxOptions {
 /// <see cref="MemoryKiB"/> each to solve, and one to verify.
 /// </summary>
 public sealed class PowOptions {
-    /// <summary>Leading zero bits at no load: 2^6 = 64 Argon2 calls, about 1-3 s on a mid-range phone at 16 MiB.</summary>
-    public int BaseDifficulty { get; set; } = 6;
+    /// <summary>
+    /// Leading zero bits for mailbox creation at no load: 2^8 = 256 Argon2 calls, roughly 5-15 s on a mid-range phone at
+    /// 16 MiB, and about 3 core-seconds for an attacker with native Argon2. The app's mailbox pool hides it most of the time.
+    /// </summary>
+    public int BaseDifficulty { get; set; } = 8;
+    /// <summary>
+    /// Fixed difficulty for send-limit challenges (<c>?purpose=send</c>): 64 calls. They only pay past the per-IP and
+    /// per-network send limits, and the app caps what it will solve for another server tightly.
+    /// </summary>
+    public int SendDifficulty { get; set; } = 6;
     /// <summary>Argon2 memory per call. The app solves on up to 4 threads, so it holds up to 4x this.</summary>
     public int MemoryKiB { get; set; } = 16 * 1024;
     public int Iterations { get; set; } = 1;
@@ -96,11 +104,19 @@ public sealed class PowOptions {
     /// gains a bit each time this doubles, up to <see cref="MaxNetworkExtraDifficulty"/>.
     /// </summary>
     public int NetworkLoadThreshold { get; set; } = 5;
+    /// <summary>
+    /// The same for a whole IPv6 /32, which can hold an ISP's customers: 10x looser. It catches one actor spreading over
+    /// many /48s. A network gets the larger of its own and its /32's extra bits.
+    /// </summary>
+    public int AllocationLoadThreshold { get; set; } = 50;
     public int MaxNetworkExtraDifficulty { get; set; } = 6;
     /// <summary>Verified creations per minute, server-wide, before everyone's difficulty rises (by up to <see cref="MaxGlobalExtraDifficulty"/>).</summary>
     public int GlobalLoadThresholdPerMinute { get; set; } = 120;
     public int MaxGlobalExtraDifficulty { get; set; } = 2;
-    /// <summary>Argon2 verifications running at once per process. 0 means one per CPU.</summary>
+    /// <summary>
+    /// Argon2 verifications running at once per process. 0 means one per CPU. One network (/24 or /48) may hold at most a
+    /// quarter of them and one IPv6 /32 at most half (at least one each), so junk from one place can't take them all.
+    /// </summary>
     public int MaxConcurrentVerifications { get; set; }
 }
 
