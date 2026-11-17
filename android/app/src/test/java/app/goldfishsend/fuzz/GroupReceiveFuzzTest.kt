@@ -437,6 +437,9 @@ class GroupReceiveFuzzTest {
                 KEMPublicKey(B64.dec(card.card.bundle.kyberPreKey))
             }
             check(store.held(W.gid).size <= 200 && store.chunkRows(W.gid) <= 256) { "unbounded storage" }
+            // Someone no roster of ours lists (a stranger with our hint key) leaves no session or identity behind.
+            val listed = store.historySince(W.gid, 0).flatMap { it.roster.ids() }.map { GroupCrypto.address(it).name }.toSet()
+            check(signal.written.all { it in listed }) { "stored a session or identity for someone no roster lists" }
             check(sent.size < 2000) { "message storm" }
         }
     }

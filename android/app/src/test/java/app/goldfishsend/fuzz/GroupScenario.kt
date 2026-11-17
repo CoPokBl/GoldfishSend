@@ -138,6 +138,11 @@ class GroupScenario(private val seed: Long) {
             try {
                 now += GroupEngine.RESEND_AFTER
                 quiesce()
+                log("--- whoever is still waiting to be let in sends their acceptance again")
+                for (p in honest) {
+                    sendAgain(p)
+                }
+                quiesce()
                 now += GroupEngine.RESEND_AFTER
                 log("--- one message from each honest active member")
                 for (p in honest) {
@@ -202,6 +207,8 @@ class GroupScenario(private val seed: Long) {
                     log("${p.name} joins")
                     p.join(gid)
                     joined += p.id
+                } else {
+                    sendAgain(p)
                 }
             }
             1 -> {
@@ -271,6 +278,20 @@ class GroupScenario(private val seed: Long) {
         }
         for (p in peers) {
             p.runDeferred()
+        }
+    }
+
+    /** Still waiting to be let in, [p]'s user waits until "Send again" is allowed, and taps it. */
+    private fun sendAgain(p: Peer) {
+        val m = model(p) ?: return
+        val at = GroupEngine.sendAgainAt(m, p.id) ?: return
+        now = maxOf(now, at)
+        val queued = net.queue.size
+        if (p.engine.sendAgain(m)) {
+            log("${p.name} sends their acceptance again")
+            // The user's, not an answer of the engine's: a copy that changes nothing isn't ping-pong (what it's answered with
+            // still counts).
+            net.queue.drop(queued).forEach { net.uncounted += it }
         }
     }
 
@@ -469,7 +490,11 @@ class GroupScenario(private val seed: Long) {
         }
         // The honest active members: admitted (their roster says so), and not gone in their own view. Someone whose
         // acceptance the owner hasn't taken in yet is still outside delivery.
-        val h = honest.filter { p -> joinedModel(p)?.let { it.roster!!.roster.role(p.id) != Role.INVITED && it.view()?.isActive(p.id) == true } == true }
+        // Someone the owner took out, who never heard and whom that owner, having left since, won't tell again
+        // (docs/groups.md, "Taken out"), isn't one of them: they only think they are.
+        val h = honest.filter { p ->
+            joinedModel(p)?.let { it.roster!!.roster.role(p.id) != Role.INVITED && it.view()?.isActive(p.id) == true } == true && !removedUnheard(p)
+        }
         if (h.isEmpty()) {
             return null
         }
@@ -541,7 +566,29 @@ class GroupScenario(private val seed: Long) {
         return !route(o, p)
     }
 
-        /** [p] joined, but their roster still lists them invited: their acceptance hasn't been taken in. */
+    /**
+     * A roster an honest member holds, newer than [p]'s, ended [p]'s stint (not by their own departure), and whoever
+     * signed it is out of the group now: only they would have sent it again when [p] wrote.
+     */
+    private fun removedUnheard(p: Peer): Boolean {
+        val m = model(p) ?: return false
+        val ver = m.roster?.roster?.ver ?: return false
+        val later = honest.flatMap { it.store.historySince(gid, ver) }.distinctBy { it.hashB64 }.sortedBy { it.roster.ver }
+        val ended = later.firstOrNull { it.roster.member(p.id)?.since != m.since } ?: return false
+        if (ended.roster.proof.any { w -> GroupCrypto.openFact(w)?.fact?.let { it.id == p.id && it.since == m.since } == true }) {
+            return false
+        }
+        val by = peers.firstOrNull { it.id == ended.roster.by } ?: return false
+        return model(by)?.state.let { it == GroupModel.LEFT || it == GroupModel.REMOVED }
+    }
+
+    /** Waiting to be let in, [p] can send to whoever owns the group as far as they know ([GroupEngine.sendAgain]). */
+    private fun reachesOwner(p: Peer, m: GroupModel): Boolean {
+        val o = honest.firstOrNull { it.id == m.view()?.owner } ?: return false
+        return route(p, o)
+    }
+
+    /** [p] joined, but their roster still lists them invited: their acceptance hasn't been taken in. */
     private fun pending(p: Peer, m: GroupModel): Boolean = m.state == GroupModel.JOINED && m.roster?.roster?.role(p.id) == Role.INVITED
 
     /** [p] is out of [r] or invited, and nobody honest still in it can reach them. */
@@ -570,15 +617,23 @@ class GroupScenario(private val seed: Long) {
             // that was gone: an owner who has left since), or the owner has no route to
             // them, they may not agree: they find out when they act (the owner answers an acceptance), or stay waiting.
             val inviteeCut = p.id in lostTo || p.id in lostFrom || net.deadLetters.any { it.first == p.id } || ownerCantReach(p, r)
+            // Joined and still waiting to be let in, after sending their acceptance again once the network was fair: what
+            // was lost before doesn't excuse it any more, only having no way to the owner, or the owner none back.
+            val waiting = m != null && pending(p, m)
+            val waitingCut = m != null && (ownerCantReach(p, r) || unreachable(p, h) || !reachesOwner(p, m))
             val ok = when {
                 // They know they're out, from a newer roster than the agreed one: what's agreed is behind.
                 m != null && m.state == GroupModel.REMOVED && (m.roster?.roster?.ver ?: 0) > r.roster.ver -> true
                 m == null -> role == null || (role == Role.INVITED && inviteeCut) || unreachable(p, h)
                 // Someone who left knows they're out, whether or not their departure reached anyone (it can be lost).
-                role == Role.OWNER || role == Role.MEMBER -> m.state == GroupModel.JOINED || m.state == GroupModel.LEFT
+                role == Role.OWNER || role == Role.MEMBER -> (m.state == GroupModel.JOINED && (!waiting || waitingCut)) || m.state == GroupModel.LEFT
+                role == Role.INVITED && waiting -> waitingCut
                 role == Role.INVITED -> m.state == GroupModel.INVITED || inviteeCut || unreachable(p, h)
+                // Waiting, though the invitation is over: sending again was answered with how it ended, unless the owner they
+                // sent it to can't answer (that answer goes over 1:1 only).
+                waiting -> !reachesOwner(p, m) || honest.none { o -> o.id == m.view()?.owner && p.id in o.contacts } || unreachable(p, h)
                 // Out: they know it, or nobody still in can reach them.
-                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || ((m.state == GroupModel.INVITED || pending(p, m)) && inviteeCut) ||
+                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || (m.state == GroupModel.INVITED && inviteeCut) ||
                     unreachable(p, h)
             }
             if (!ok) {

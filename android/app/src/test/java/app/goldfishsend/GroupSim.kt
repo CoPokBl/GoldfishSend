@@ -24,12 +24,16 @@ import app.goldfishsend.proto.Signed
 import app.goldfishsend.proto.SignedCard
 import app.goldfishsend.proto.SignedFact
 import app.goldfishsend.proto.SignedRoster
+import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
+import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.signal.libsignal.protocol.ecc.ECPublicKey
 import org.signal.libsignal.protocol.kem.KEMKeyPair
 import org.signal.libsignal.protocol.kem.KEMKeyType
+import org.signal.libsignal.protocol.state.IdentityKeyStore
 import org.signal.libsignal.protocol.state.KyberPreKeyRecord
+import org.signal.libsignal.protocol.state.SessionRecord
 import org.signal.libsignal.protocol.state.SignedPreKeyRecord
 import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore
 
@@ -43,9 +47,24 @@ fun factState(f: SignedFact, h: Head = NO_HEAD) = Content.GState(f.fact.g, h, fa
 
 fun cardState(c: SignedCard, h: Head = NO_HEAD) = Content.GState(c.card.g, h, cards = listOf(Signed(B64.enc(c.bytes), B64.enc(c.sig))))
 
-/** Like the app's SignalStore: group prekeys are last-resort, so using them deletes nothing. */
+/**
+ * Like the app's SignalStore: group prekeys are last-resort, so using them deletes nothing. [written]: the address names
+ * a session or identity was ever stored for.
+ */
 class LastResortStore(kp: IdentityKeyPair, reg: Int) : InMemorySignalProtocolStore(kp, reg) {
+    val written = mutableSetOf<String>()
+
     override fun markKyberPreKeyUsed(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) = Unit
+
+    override fun storeSession(address: SignalProtocolAddress, record: SessionRecord) {
+        written += address.name
+        super.storeSession(address, record)
+    }
+
+    override fun saveIdentity(address: SignalProtocolAddress, identityKey: IdentityKey): IdentityKeyStore.IdentityChange {
+        written += address.name
+        return super.saveIdentity(address, identityKey)
+    }
 }
 
 /** [GroupStore] in memory, mirroring RepoGroupStore (including departed members' cards kept for routing). */
@@ -127,6 +146,8 @@ class MemoryGroupStore : GroupStore {
     override fun dropHeld(id: Long) {
         heldRows.values.forEach { l -> l.removeAll { it.id == id } }
     }
+
+    override fun membersElsewhere(gid: String): Collection<String> = rows.filterKeys { it != gid }.values.flatMap { it.cards.keys }.toSet()
 }
 
 /**

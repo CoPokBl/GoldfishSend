@@ -177,6 +177,12 @@ class SignalStore(private val db: Db) : SignalProtocolStore {
         db.exec("DELETE FROM sig_session WHERE address = ?", key(address))
     }
 
+    /** Drops the session and the identity key stored for [address] (a group member we share no group with any more). */
+    fun forget(address: SignalProtocolAddress) {
+        db.exec("DELETE FROM sig_session WHERE address = ?", key(address))
+        db.exec("DELETE FROM sig_identity WHERE address = ?", key(address))
+    }
+
     override fun deleteAllSessions(name: String) {
         db.exec("DELETE FROM sig_session WHERE address LIKE ?", "$name.%")
         db.exec("DELETE FROM sig_identity WHERE address LIKE ?", "$name.%")
