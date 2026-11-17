@@ -7,7 +7,7 @@ the message is gone. If delivery fails, the message is held, encrypted, until it
 runs out.
 
 It is written in ASP.NET Core (.NET 10) with MySQL 8.4 and Redis 7.4 (or Valkey). The wire protocol is in
-[`docs/protocol.md`](../docs/protocol.md) and the design rationale in [`PLAN.md`](../PLAN.md).
+[`docs/protocol.md`](../docs/protocol.md), and the project overview in the [top-level README](../README.md).
 
 ## Privacy model, in plain words
 
@@ -79,8 +79,9 @@ Source layout:
 | `src/GoldfishSend.Api` | `Program.cs` (Kestrel limits, forwarded headers, security headers, `keygen`, `fingerprint`), the gateway middleware and endpoints. |
 | `tests/GoldfishSend.Tests` | Unit tests and Testcontainers-based integration tests. |
 | `tools/HealthProbe` | A tiny HTTP probe used by container healthchecks (the runtime image has no shell or curl). |
+| `tools/LoadTest` | A load generator that speaks the encrypted gateway and runs its own push server (see [Load testing](#load-testing)). |
 | `Dockerfile` | Multi-stage build to a distroless (`noble-chiseled`) non-root runtime image. |
-| `../deploy` | Compose stack: Caddy, api, worker, MySQL, Redis. |
+| `../deploy` | Compose stack: Caddy (or a Traefik overlay), api, worker, MySQL, two Redis instances, optional Tor. |
 
 Code style: K&R braces (opening brace on the same line, also for `else`/`catch`/`finally`), file-scoped
 namespaces, braces always. It is enforced through the repository's `.editorconfig`; run `dotnet format` before
@@ -144,13 +145,13 @@ dotnet test --filter "Category=Chaos"         # only the chaos tests, about 2 mi
 The integration tests bind extra loopback addresses (127.0.0.2 to 127.0.0.8) for push servers of their own, which
 Linux provides out of the box.
 
-- **Chaos tests** (`ChaosTests`, milestone M3): messages keep flowing while a push server refuses connections,
+- **Chaos tests** (`ChaosTests`): messages keep flowing while a push server refuses connections,
   answers 5xx or times out, and while a worker node is killed with deliveries in flight and a fresh node takes over.
   Nothing accepted is lost within its TTL, nothing is delivered after it, and idempotent retries get the original id.
   The worker test waits out the real recovery timeouts (stream entries are reclaimed after a minute or more, retry
   leases after 85 s), which is why it is slow.
 - **Abuse suite** (`AbuseTests`, plus parts of `EndToEndTests`, `GatewayTests`, `HardeningTests` and
-  `BatchSendTests`, milestone M4): proof of work, adaptive difficulty, per-address, per-network, per-mailbox and global
+  `BatchSendTests`): proof of work, adaptive difficulty, per-address, per-network, per-mailbox and global
   limits, verification pushes and the new-host budget, the per-host circuit breaker, the gateway flood guard, replay
   cache and size limits, and SSRF checks at registration and at connect time.
 
@@ -289,16 +290,16 @@ Argon2id proof of work (`gf/pow/v2`, see docs/protocol.md). Solving costs about 
 keeps a pool of ready mailboxes, so people rarely wait, and when they do it shows progress and carries on in the
 background.
 
-Measured on an i9-9900K, one 16 MiB call (`t = 1`) takes:
+Measured on a desktop x86 CPU (AVX2), one 16 MiB call (`t = 1`) takes:
 
 | Implementation | One core | Notes |
 |---|---|---|
 | libsodium (native, AVX2) | 12 ms | What an attacker would use. Many threads at once are held back by memory bandwidth. |
 | BouncyCastle .NET (this server) | 30–45 ms | Verification, including allocating the 16 MiB. |
 | BouncyCastle JVM (HotSpot) | 17 ms | 5 ms per call on 4 threads. |
-| BouncyCastle on Android (x86_64 emulator, ART, non-debuggable) | 47 ms | 18 ms per call on its 3 solver threads. |
+| BouncyCastle on Android (x86_64 emulator on the same CPU, ART, non-debuggable) | 47 ms | 18 ms per call on its 3 solver threads. |
 
-A mid-range ARM phone should be about 2× slower per core than the emulator on this host, so roughly 25–60 ms per call
+A mid-range ARM phone should be about 2× slower per core than that emulator, so roughly 25–60 ms per call
 on 4 threads. At the base difficulty (256 calls) that's a median of about 4–11 s (mean 6–15 s). This comes from CPU
 benchmark ratios, not a phone, so treat it as good to about 2×.
 
@@ -426,8 +427,9 @@ a `429` from them has scope `network`.
 Order: for every request, the widest scope (global, then network) is checked before the narrowest, so a request a
 wide limit refuses never creates narrow buckets. For mailbox creation, the proof of work is redeemed **before** any
 address budget is charged: first a GETDEL of the challenge (so only challenges issued under `pow-ip` and `pow-net` ever
-cost an Argon2 call), then one Argon2 call in the `MaxConcurrentVerifications` pool. Budgets with a period of an hour or more are keyed with a stable cluster secret (in
-the ephemeral Redis) instead of the daily key, so the key rotation at UTC midnight doesn't reset them.
+cost an Argon2 call), then one Argon2 call in the `MaxConcurrentVerifications` pool. Budgets with a period of an hour
+or more are keyed with a stable cluster secret (in the ephemeral Redis) instead of the daily key, so the key rotation
+at UTC midnight doesn't reset them.
 
 Example: `Goldfish__RateLimits__send-ip__Limit=120`, `…__PeriodSeconds=60`, `…__Burst=40`.
 
@@ -436,22 +438,24 @@ Example: `Goldfish__RateLimits__send-ip__Limit=120`, `…__PeriodSeconds=60`, `�
 Kestrel caps request bodies at 20 KiB (the gateway's outer body), headers at 16 KiB / 50 headers and the request line
 at 4 KiB, with a 30 s request timeout. Inside the gateway, request bodies are capped at 16 KiB and the padded inner
 request at 17 KiB. Each request carries about 1.2 KB of overhead (1153 B of KEM ciphertexts, a 9 B header and a 16 B
-tag) and each response 48 B, and both are padded to 512 B, 1, 2, 4, 8 or 17 KiB. Messages are capped at 3983 bytes and invites at 4096 bytes (see the protocol's size
-budget).
+tag) and each response 48 B, and both are padded to 512 B, 1, 2, 4, 8 or 17 KiB. Messages are capped at 3983 bytes
+and invites at 4096 bytes (see the protocol's size budget).
 
 ## Deployment with Docker Compose
 
-The stack in [`../deploy`](../deploy) runs five containers on three networks:
+The stack in [`../deploy`](../deploy) runs six containers on four networks (plus `tor`, with the `onion` profile):
 
 | Service | Networks | Notes |
 |---|---|---|
-| `caddy` | `public` | The only published service (80/tcp, 443/tcp, 443/udp). Automatic Let's Encrypt, TLS 1.3, HSTS, 20 KiB body limit, no access logs. Only `/v1/gw` and `/v1/key` are proxied; `/healthz`, `/readyz` and everything else get 404. |
+| `caddy` | `public`, `onion` | The only published service (80/tcp, 443/tcp, 443/udp). Automatic Let's Encrypt, TLS 1.3, HSTS, 20 KiB body limit, no access logs. Only `/v1/gw` and `/v1/key` are proxied; `/healthz`, `/readyz` and everything else get 404. |
 | `api` | `public`, `internal` | `Goldfish__Roles=api`. Trusts `X-Forwarded-For` only from the `public` subnet. Uses `public` for outbound verification pushes. |
 | `worker` | `internal`, `egress` | `Goldfish__Roles=worker`. `egress` gives it outbound internet for push servers. |
 | `mysql` | `internal` | MySQL 8.4, no binlog, fsync on every commit, no query logs, performance_schema off. |
-| `redis` | `internal` | Redis 7.4, AOF only, `noeviction`, `default` user disabled, an ACL-restricted `goldfish` app user, dangerous commands removed. |
+| `redis` | `internal` | Redis 7.4 for the queue and invites: AOF only, `noeviction`, `default` user disabled, an ACL-restricted `goldfish` app user, dangerous commands removed. |
+| `redis-ephemeral` | `internal` | Redis 7.4 for rate limits, PoW, idempotency and breakers: no persistence and no volume, `volatile-ttl`, the same ACL setup. |
 
-`internal` is a Docker `internal: true` network with no route out. All app containers run with a read-only
+`internal` is a Docker `internal: true` network with no route out. `onion` only links Caddy and the optional `tor`
+container (see "Onion service"). All app containers run with a read-only
 root filesystem, `no-new-privileges`, all capabilities dropped (Caddy keeps only `NET_BIND_SERVICE`), and core
 dumps disabled.
 
@@ -483,7 +487,7 @@ dumps disabled.
 4. **Start.**
    ```bash
    docker compose up -d
-   docker compose ps                  # api, worker, mysql and redis should become "healthy"
+   docker compose ps                  # api, worker, mysql and both redis should become "healthy"
    curl -s https://push.example.com/v1/key | wc -c    # 1250
    docker compose logs api | grep "Server key fingerprint"
    ```
@@ -698,7 +702,7 @@ server until each user accepts the new key, so do this rarely and deliberately.
 
 ### Keys and what losing them means
 
-Back up `Pepper`, `SealSalt`, `EpochKek`, `VapidPrivateKey` offline and encrypted (for example an
+Back up `Pepper`, `SealSalt`, `EpochKek`, `VapidPrivateKey` and `ServerKey` offline and encrypted (for example an
 `age`-encrypted file in two places, or a password manager). They are not stored anywhere else, and a database
 backup is useless without them (by design).
 
