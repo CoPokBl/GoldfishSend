@@ -88,11 +88,16 @@ Mailboxes expire after 90 days (configurable) unless the owner refreshes them. `
 > The QR code carries the server URL, so **federation comes free**: Alice and Bob can use different servers.
 
 ### 4.2 Mailbox creation (anti-abuse)
-1. `POST /v1/pow/challenge` returns `{challenge, difficulty, expires}`. The challenge is stored in Redis and is single-use.
-2. `POST /v1/mailboxes` with `{pow_solution, send_secret, owner_hash, endpoint, p256dh, auth}`.
+1. `POST /v1/pow/challenge` returns `{scheme, challenge, difficulty, memoryKiB, iterations, expires}`. The challenge is
+   stored in Redis with its parameters and is single-use. Difficulty depends mostly on recent creations from the
+   requester's network, plus a little (at most 2 bits) on verified creations server-wide.
+2. `POST /v1/mailboxes` with `{pow_solution, send_secret, owner_hash, endpoint, p256dh, auth}`. The PoW is checked first
+   (GETDEL, then one Argon2 call in a bounded pool), then the global, network and IP creation limits. Only a creation that
+   passes them counts toward its network's load.
 3. The server validates the endpoint (§7), creates the mailbox in state `PendingVerification`, and **sends a verification push**
    with a random 128-bit code.
-4. The client gets the push and sends `POST /v1/mailboxes/verify` with `{send_secret, owner_secret, code}`. The mailbox becomes `Active`.
+4. The client gets the push and sends `POST /v1/mailboxes/verify` with `{send_secret, owner_secret, code}`. The mailbox
+   becomes `Active`, and counts toward the server-wide PoW load.
    - This proves the registrant controls the endpoint, so **the server can't be used as a cannon against arbitrary URLs.**
    - Unverified mailboxes are purged after 10 minutes. Each mailbox gets at most 5 verify attempts.
 
@@ -162,7 +167,8 @@ CREATE TABLE pending_messages (
 |---|---|
 | `gf:q` (stream, group `delivery`) | Hot message queue. Entries live for seconds. |
 | `gf:rl:{scope}:{key}` | GCRA rate-limit state, through an atomic Lua script |
-| `gf:pow:{challenge}` | Single-use PoW challenges, TTL 5 min |
+| `gf:pow:{challenge}` | Single-use PoW challenges and their parameters, TTL 5 min |
+| `gf:pow:load:{minute}`, `gf:pow:netload:{hmac}:{minute}` | PoW load counts (server-wide, and per network keyed by the daily rate-limit HMAC), TTL 6 min. Counts only, nothing about a mailbox. |
 | `gf:idem:{mailbox}:{key}` | Idempotency, TTL 24 h |
 | `gf:wake` (pub/sub) | Wakes workers on other nodes |
 
@@ -178,7 +184,7 @@ CREATE TABLE pending_messages (
 | Server at rest | AES-256-GCM, HMAC-SHA256, HKDF-SHA256. Keys come from files mounted as secrets, never from the DB. |
 | Client at rest | SQLCipher database, with the key wrapped by an Android Keystore key (StrongBox when available). `allowBackup=false`, plus data-extraction rules that exclude everything. |
 | Transport | TLS 1.3 only, HSTS, optional SPKI pinning per server |
-| PoW | SHA-256 hashcash with adaptive difficulty (about 1 s on a mid-range phone, rising under load) |
+| PoW | Argon2id (`gf/pow/v2`: 16 MiB, `t = 1`, `p = 1`, 2^6 calls by default), so GPUs and ASICs gain only a small factor over a CPU. About 1–3 s on a mid-range phone, rising mostly for the network causing load. Verified in one Argon2 call, in a bounded pool. |
 
 **Payload budget**: UnifiedPush allows 4096 bytes. RFC 8291 overhead is 103 B and the push envelope is 9 B, which leaves **about 3984 B for the
 E2E blob**. A PQXDH PreKey message carries a 1568 B Kyber ciphertext, so first messages must be short. Long texts get
@@ -226,7 +232,7 @@ GCRA token buckets live in Redis through a single atomic Lua script. Every limit
 | Verify attempts | `mailbox_id` | 5 total |
 | Owner ops | IP | 30/min |
 | Outbound, per push host | host | 50/s, plus circuit breaker |
-| Global | n/a | Overall accept-rate ceiling, plus PoW difficulty that rises automatically under load |
+| Global | n/a | Overall accept-rate ceiling, plus PoW difficulty that rises automatically under load (mostly for the loaded network) |
 
 - **IP privacy**: rate-limit keys are `HMAC(daily_rotating_key, ip_prefix)` with a short TTL. Raw IPs are never stored or logged.
   `X-Forwarded-For` is trusted only from configured proxies.
@@ -404,7 +410,8 @@ signal_* (identity, prekeys, signed_prekeys, kyber_prekeys, sessions)
     server never sees the sender's IP (as in SimpleX private message routing). It fits the federated design, since the
     sender's server is already known to the client. It needs a server-to-server forwarding endpoint with its own abuse
     controls. It's not built yet.
-12. **Future: memory-hard PoW or Privacy Pass tokens** for mailbox creation (SHA-256 hashcash is cheap on GPUs).
+12. **Future: Privacy Pass tokens** for mailbox creation. The PoW is memory-hard now (Argon2id), but a botnet or a large
+    address allocation still gets many networks' worth of budget.
 
 The exact wire format lives in `docs/protocol.md`.
 
@@ -422,6 +429,6 @@ The exact wire format lives in `docs/protocol.md`.
 | M5 | Android: UP registration, mailbox lifecycle, QR exchange, libsignal sessions, send/receive, SQLCipher key hierarchy, per-message keys, outbox and receipts | Two phones chat through a self-hosted ntfy |
 | M6 | Security controls: disappearing messages and view-once, app lock, wrong-PIN, duress and panic wipe, notification and screen hardening | Done: forensic test (`ForensicDeviceTest`): no deleted plaintext or keys recoverable from a DB or file dump, even with the DB key |
 | M7 | Hardening: padding, chunking, pinning, Baseline Profiles, external security review | Review findings closed |
-| Future | Abuse resistance: a memory-hard PoW (e.g. Equi-X/Argon2-based) or Privacy Pass (RFC 9576/9578) tokens. SHA-256 hashcash costs a GPU milliseconds but a phone tens of seconds. Changing it is a protocol change for clients. | n/a |
+| Future | Abuse resistance: Privacy Pass (RFC 9576/9578) tokens. The Argon2id PoW (`gf/pow/v2`) replaced SHA-256 hashcash. | n/a |
 | M8 | Groups: pairwise fan-out, signed rosters and cards, sender hints, inbox rotation on removal, batch send (`docs/groups.md`) | Done: multi-party simulation, device tests, live batch send |
 | M9+ | Attachments, multi-device, Privacy Pass, group invite links, MLS (maybe) | n/a |

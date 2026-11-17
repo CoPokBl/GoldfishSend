@@ -158,12 +158,20 @@ server.
 Anyone without a capability.
 - **Can't:** message you at all. Sending needs that mailbox's `sendSecret`, which only your contact has.
 - **Can:** try to exhaust a server: create mailboxes, flood sends, use invites. Defences:
-  - proof of work that adapts to load;
-  - GCRA limits per IP, network, mailbox and global, in Redis;
-  - verification pushes before a mailbox goes live;
+  - memory-hard proof of work (Argon2id, 16 MiB per call) whose difficulty rises mostly for the network causing the
+    load, and only a little (at most 4x) for everyone else;
+  - GCRA limits per IP, network, mailbox and global, in Redis. The global creation limit is a high resource cap, so
+    filling it takes hundreds of networks;
+  - verification pushes before a mailbox goes live, and only verified mailboxes raise everyone's difficulty;
+  - a bounded pool for PoW verification, so checking solutions can't take the server's CPU;
   - per-push-host circuit breakers;
   - an SSRF-safe push client.
-- **Residual:** SHA-256 proof of work is cheap on GPUs. Memory-hard PoW or Privacy Pass are future work.
+- **Residual:** Argon2 takes away most of the GPU and ASIC advantage: each call needs 16 MiB filled in order, so a GPU
+  is limited by memory bandwidth and is worth a small factor (roughly 5–10x, our estimate) over a desktop CPU core,
+  instead of the 100x or more that SHA-256 gives. A phone running Java Argon2 is still much slower than any desktop or
+  cloud machine, so an attacker pays little per mailbox (about a CPU-second at base difficulty). What holds back an
+  attacker with many networks (a botnet, a large IPv6 allocation, many cloud addresses) is mainly the per-IP and
+  per-network limits, and each of their networks pays its own rising difficulty. Privacy Pass tokens are future work.
 
 ### Seized phone
 - **App locked, or phone before first unlock:** the database is SQLCipher, keyed from the Android Keystore
@@ -219,7 +227,8 @@ Malware with root, accessibility or notification access, or a keyboard that uplo
   locked app.
 - **MySQL logs:** InnoDB redo and undo log encryption is documented but not enabled in the compose stack.
 - **Sender IPs:** the live server sees them on sends, until two-relay routing exists.
-- **Proof of work:** it isn't memory-hard.
+- **Proof of work:** it's cheap for anyone with a real computer, and many networks get many budgets (see Strangers and
+  abusers). Privacy Pass would tie creation to something scarcer.
 - **Server key:** `ServerKey` never expires. If it leaks, someone who can also intercept TLS can impersonate the server
   until you replace it, and replacing it warns every user.
 - **Group members who aren't contacts** are vouched for by the owner. Until you compare safety numbers with them, a
