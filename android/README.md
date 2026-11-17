@@ -206,7 +206,7 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
   Plain http is allowed only to onion hosts (network security config plus the route check), and only through Tor or
   Orbot. If a contact's server is an onion and Tor is off, the user is asked to turn Tor on. Nothing is sent directly.
 - **Server identity** (always on): every request is encrypted to the server's identity key
-  ([`../docs/protocol.md`](../docs/protocol.md#encrypted-transport-and-server-identity)), whose fingerprint is pinned:
+  ([`../docs/protocol.md`](../docs/protocol.md#encrypted-transport-and-server-identity-gateway-v1)), whose fingerprint is pinned:
   built in for the default server, from the invite for a contact's server, and on first use for a server typed in by
   hand. If our own server's key changes, nothing is sent to it until the user re-authenticates and trusts the new
   identity ("Your server's identity changed", also a critical Security tab finding). A contact's server that presents

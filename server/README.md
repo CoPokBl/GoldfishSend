@@ -199,7 +199,7 @@ simulated phone one push host. That file also makes the PoW tiny (test only: 8 c
 adaptive difficulty. **Use a separate (existing) database and
 separate Redis databases**, since the run leaves queue, rate-limit and idempotency state behind.
 
-Smoke run, as CI would do it (about a minute; 8 clients, 45 s, 50 ms think time, fails on more than 1% errors, more
+Smoke run, as CI does it (about a minute; 8 clients, 45 s, 50 ms think time, fails on more than 1% errors, more
 than 5% throttled calls, a p95 above 1 s or under 99% of messages pushed back):
 
 ```bash
