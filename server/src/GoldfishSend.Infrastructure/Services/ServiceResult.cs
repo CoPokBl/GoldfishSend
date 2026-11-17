@@ -18,6 +18,14 @@ public sealed record ServiceError(int Status, string Code, TimeSpan? RetryAfter 
     /// <summary>The server-wide held-message quota is reached, and this mailbox would add to the backlog.</summary>
     public static readonly ServiceError StorageFull = new(507, "mailbox_full", TimeSpan.FromHours(1), "global");
     public static readonly ServiceError Unavailable = new(503, "unavailable");
+    /// <summary>Every PoW verification slot is busy. The challenge is still valid: retry the same solution.</summary>
+    public static readonly ServiceError PowBusy = new(503, "unavailable", TimeSpan.FromSeconds(1));
+
+    public static ServiceError? FromPow(PowRedemption redemption) => redemption switch {
+        PowRedemption.Ok => null,
+        PowRedemption.Busy => PowBusy,
+        _ => PowInvalid,
+    };
 
     public static ServiceError RateLimited(RateLimitDecision decision) => new(429, "rate_limited", decision.RetryAfter, decision.Scope);
 }

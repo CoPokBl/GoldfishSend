@@ -10,6 +10,7 @@ internal static class RedisKeys {
     public static string RateLimitKey(string day) => $"gf:rlkey:{day}";
     public static string Pow(string challengeHex) => $"gf:pow:{challengeHex}";
     public static string PowLoad(long minute) => $"gf:pow:load:{minute}";
+    public static string PowNetworkLoad(string hmacHex, long minute) => $"gf:pow:netload:{hmacHex}:{minute}";
     public static string Idempotency(string hmacHex) => $"gf:idem:{hmacHex}";
     public const string InviteIndex = "gf:inv:index";
     public static string MailboxInFlight(string hmacHex) => $"gf:mbxlease:{hmacHex}";

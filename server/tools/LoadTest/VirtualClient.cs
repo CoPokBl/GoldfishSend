@@ -107,7 +107,10 @@ public sealed class VirtualClient {
         }
         var challengeJson = JsonDocument.Parse(issued.Body).RootElement;
         var challenge = Base64Url.DecodeFromChars(challengeJson.GetProperty("challenge").GetString());
-        var nonce = ProofOfWork.Solve(challenge, challengeJson.GetProperty("difficulty").GetInt32());
+        // Solved off the request path's threads: Argon2 is CPU-bound, and the virtual clients share the thread pool.
+        var parameters = new PowParameters(challengeJson.GetProperty("difficulty").GetInt32(),
+            challengeJson.GetProperty("memoryKiB").GetInt32(), challengeJson.GetProperty("iterations").GetInt32());
+        var nonce = await Task.Run(() => ProofOfWork.Solve(challenge, parameters));
 
         var device = _receiver.NewDevice();
         var mailbox = new Mailbox(RandomNumberGenerator.GetBytes(32), RandomNumberGenerator.GetBytes(32), device);

@@ -79,7 +79,7 @@ public sealed class AbuseTests {
         // A wrong solution and an unknown challenge are refused, and neither touches the address budget.
         var issued = await (await client.PostAsync("/v1/pow/challenge", null)).Content.ReadFromJsonAsync<JsonElement>();
         var challenge = Base64Url.DecodeFromChars(issued.GetProperty("challenge").GetString());
-        var difficulty = issued.GetProperty("difficulty").GetInt32();
+        var difficulty = PowOf(issued);
         byte[] wrong;
         do {
             wrong = RandomNumberGenerator.GetBytes(ProofOfWork.NonceSize);
@@ -102,22 +102,112 @@ public sealed class AbuseTests {
         Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(other)).StatusCode);
     }
 
+    private static async Task<int> DifficultyOf(HttpClient client) {
+        var issued = await (await client.PostAsync("/v1/pow/challenge", null)).Content.ReadFromJsonAsync<JsonElement>();
+        return PowOf(issued).Difficulty;
+    }
+
     [IntegrationFact]
-    public async Task PowDifficulty_RisesWithServerWideCreationLoad() {
+    public async Task PowDifficulty_RisesMostlyForTheLoadedNetwork_OthersOnlyUpToTheGlobalCap() {
         await using var node = NodeBehindProxy(ApiNode(new Dictionary<string, string> {
-            ["Goldfish__Pow__LoadThresholdPerMinute"] = "1",
-            ["Goldfish__Pow__MaxExtraDifficulty"] = "1",
+            ["Goldfish__Pow__NetworkLoadThreshold"] = "1",
+            ["Goldfish__Pow__MaxNetworkExtraDifficulty"] = "3",
+            ["Goldfish__Pow__GlobalLoadThresholdPerMinute"] = "1",
+            ["Goldfish__Pow__MaxGlobalExtraDifficulty"] = "1",
         }));
-        using var client = ClientFrom(node, "198.18.12.1");
-        // Four creations in the last two minutes, from anyone, are two a minute: over this node's threshold of one.
-        for (var i = 0; i < 4; i++) {
-            await _f.CreateActiveMailboxAsync();
-        }
+        using var loaded = ClientFrom(node, "198.18.12.1");
+        using var sameNetwork = ClientFrom(node, "198.18.12.200");
+        using var other = ClientFrom(node, "198.18.40.1");
         var baseDifficulty = _f.Services.GetRequiredService<GoldfishOptions>().Pow.BaseDifficulty;
-        var info = await client.GetFromJsonAsync<JsonElement>("/v1/info");
+
+        // Ten verified creations from one /24: 10 over a threshold of 1 is past three doublings (capped at 3 bits), and
+        // 10 in the five-minute window is two a minute server-wide (over 1: the global cap of 1 bit).
+        for (var i = 0; i < 10; i++) {
+            await _f.CreateActiveMailboxAsync(client: loaded);
+        }
+        Assert.Equal(baseDifficulty + 3 + 1, await DifficultyOf(loaded));
+        Assert.Equal(baseDifficulty + 3 + 1, await DifficultyOf(sameNetwork));
+        Assert.Equal(baseDifficulty + 1, await DifficultyOf(other));
+        var info = await other.GetFromJsonAsync<JsonElement>("/v1/info");
         Assert.Equal(baseDifficulty + 1, info.GetProperty("powDifficulty").GetInt32());
-        var challenge = await (await client.PostAsync("/v1/pow/challenge", null)).Content.ReadFromJsonAsync<JsonElement>();
-        Assert.Equal(baseDifficulty + 1, challenge.GetProperty("difficulty").GetInt32());
+
+        // Harder challenges still verify, at the difficulty they were issued with.
+        Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(loaded)).StatusCode);
+    }
+
+    [IntegrationFact]
+    public async Task PowRedemptions_ThatFailVerificationOrTheRateLimits_DontCountTowardLoad() {
+        await using var node = NodeBehindProxy(ApiNode(Policy("create-ip", 1, 3600, 1), new Dictionary<string, string> {
+            ["Goldfish__Pow__NetworkLoadThreshold"] = "1",
+            ["Goldfish__Pow__MaxNetworkExtraDifficulty"] = "6",
+        }));
+        using var client = ClientFrom(node, "198.18.41.1");
+        using var reference = ClientFrom(node, "198.18.42.1");
+        var device = _f.Push.NewDevice();
+
+        // Wrong solutions: verified (and refused) by Argon2, never counted.
+        for (var i = 0; i < 4; i++) {
+            var issued = await (await client.PostAsync("/v1/pow/challenge", null)).Content.ReadFromJsonAsync<JsonElement>();
+            var challenge = Base64Url.DecodeFromChars(issued.GetProperty("challenge").GetString());
+            byte[] wrong;
+            do {
+                wrong = RandomNumberGenerator.GetBytes(ProofOfWork.NonceSize);
+            } while (ProofOfWork.Verify(challenge, wrong, PowOf(issued)));
+            var response = await client.PostAsJsonAsync("/v1/mailboxes", new {
+                pow = new { challenge = B64(challenge), nonce = B64(wrong) },
+                sendSecret = B64(RandomNumberGenerator.GetBytes(32)),
+                ownerHash = B64(RandomNumberGenerator.GetBytes(32)),
+                endpoint = device.Url,
+                p256dh = B64(device.P256dh),
+                auth = B64(device.Auth),
+            });
+            Assert.Equal((403, "pow_invalid", null), await ErrorOf(response));
+        }
+        Assert.Equal(await DifficultyOf(reference), await DifficultyOf(client));
+
+        // One creation passes (one is not over the threshold of one), then valid proofs of work refused by create-ip.
+        Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(client)).StatusCode);
+        for (var i = 0; i < 4; i++) {
+            Assert.Equal((429, "rate_limited", "ip"), await ErrorOf(await CreateAsync(client)));
+        }
+        Assert.Equal(await DifficultyOf(reference), await DifficultyOf(client));
+    }
+
+    [IntegrationFact]
+    public async Task PowVerification_WhenEverySlotIsBusy_AnswersRetryableAtOnce_AndKeepsTheChallenge() {
+        await using var node = NodeBehindProxy(ApiNode(Policy("create-ip", 1, 3600, 1), new Dictionary<string, string> {
+            ["Goldfish__Pow__MaxConcurrentVerifications"] = "1",
+        }));
+        using var client = ClientFrom(node, "198.18.43.1");
+        var slots = node.Services.GetRequiredService<PowService>().VerificationSlots;
+        var device = _f.Push.NewDevice();
+        var (challenge, nonce) = await _f.SolvePowAsync(client);
+        var body = new {
+            pow = new { challenge = B64(challenge), nonce = B64(nonce) },
+            sendSecret = B64(RandomNumberGenerator.GetBytes(32)),
+            ownerHash = B64(RandomNumberGenerator.GetBytes(32)),
+            endpoint = device.Url,
+            p256dh = B64(device.P256dh),
+            auth = B64(device.Auth),
+        };
+
+        Assert.True(slots.Wait(0));
+        HttpResponseMessage busy;
+        var started = DateTime.UtcNow;
+        try {
+            busy = await client.PostAsJsonAsync("/v1/mailboxes", body);
+        } finally {
+            slots.Release();
+        }
+        Assert.Equal((503, "unavailable", null), await ErrorOf(busy));
+        Assert.True(busy.Headers.Contains("Retry-After"));
+        Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds(5), "a busy server answers quickly instead of queueing");
+        Assert.False(device.TryNext(out _));
+
+        // The same solution works once a slot is free, and the busy answer didn't spend the burst-1 create-ip budget.
+        Assert.Equal(HttpStatusCode.Accepted, (await client.PostAsJsonAsync("/v1/mailboxes", body)).StatusCode);
+        // Single use still holds.
+        Assert.Equal((403, "pow_invalid", null), await ErrorOf(await client.PostAsJsonAsync("/v1/mailboxes", body)));
     }
 
     [IntegrationFact]

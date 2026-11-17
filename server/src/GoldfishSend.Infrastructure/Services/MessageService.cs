@@ -106,8 +106,15 @@ public sealed class MessageService {
         foreach (var (policy, subject) in new[] { (RatePolicies.SendPerNetwork, client.Network), (RatePolicies.SendPerIp, client.Host) }) {
             var decision = await _limiter.CheckAsync(policy, subject, cost: cost);
             if (!decision.Allowed) {
-                if (pow is null || !await _pow.RedeemAsync(pow.Challenge, pow.Nonce, countsTowardLoad: false)) {
+                if (pow is null) {
                     return ServiceError.RateLimited(decision);
+                }
+                // Paying a send limit never counts toward the creation load, so heavy senders can't make onboarding harder.
+                switch (await _pow.RedeemAsync(pow.Challenge, pow.Nonce)) {
+                    case PowRedemption.Busy:
+                        return ServiceError.PowBusy;
+                    case PowRedemption.Invalid:
+                        return ServiceError.RateLimited(decision);
                 }
                 break; // A valid PoW pays for this request at every client scope.
             }
