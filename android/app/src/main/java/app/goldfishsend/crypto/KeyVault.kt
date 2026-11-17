@@ -21,7 +21,7 @@ import org.bouncycastle.crypto.generators.Argon2BytesGenerator
 import org.bouncycastle.crypto.params.Argon2Parameters
 
 /**
- * Key hierarchy (PLAN.md §10a):
+ * Key hierarchy (android/README.md, "Security notes"):
  *
  *   [optional passphrase] --Argon2id--> KEK --AES-GCM--> inner(MK)
  *   Android Keystore "gf_device" (StrongBox if present, unlocked-device-required) --AES-GCM--> outer(inner or MK)

@@ -57,7 +57,7 @@ import org.signal.libsignal.protocol.state.SignedPreKeyRecord
 import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore
 
 /**
- * PLAN.md M6: no deleted plaintext or keys can be recovered from a dump of the app's storage, even by someone who also
+ * No deleted plaintext or keys can be recovered from a dump of the app's storage, even by someone who also
  * holds the database key (a coerced unlock).
  *
  * Messages with random markers go through the real receive and send paths (libsignal sessions with peers, the outbox,

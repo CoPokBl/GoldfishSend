@@ -20,7 +20,7 @@ When the code and this document disagree, that's a bug in one of them.
 
 ## What we protect
 
-1. **Message content** and attachments-to-be, including names and the contact list.
+1. **Message content**, display names and the contact list.
 2. **The social graph:** who is in contact with whom.
 3. **Identity and location:** which phone, which IP and which push account a mailbox belongs to.
 4. **History:** what was said in the past, after keys or devices are compromised (forward secrecy) and after deletion.
@@ -95,8 +95,9 @@ adversary.
 - **Can't:** read content, forge messages (libsignal authenticates them), learn names or contact lists, or link one
   person's mailboxes except by IP and timing.
 - **Can:** drop, delay or replay messages. Drops look like an offline recipient. libsignal rejects replays.
-- **Deferred:** two-relay routing, where your server forwards to your contact's server, would hide your IP from the
-  recipient's server (PLAN.md §11, item 11).
+- **Not built yet:** two-relay routing, where your own server forwards to your contact's server (as in SimpleX's
+  private message routing), would hide your IP from the recipient's server. It needs a server-to-server forwarding
+  endpoint with its own abuse controls.
 
 ### A malicious or compromised contact
 - **Can:** read what you send them, keep it (disappearing timers and "delete for everyone" are honoured by honest apps

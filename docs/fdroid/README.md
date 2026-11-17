@@ -45,7 +45,11 @@ there are any.
 
 ## Before submitting
 
-- Replace the placeholders in `app.goldfishsend.yml` (repository URL, default relay, signing-key SHA-256).
-- Tag the release commit (`v<versionName>`) and attach the signed APK at the `Binaries:` URL.
+- Replace the placeholders in `app.goldfishsend.yml`: the repository URL, the default server and its fingerprint, and
+  the signing-key SHA-256.
+- Give each build entry the version and `-P` values of the release it reproduces (they're in the release notes).
+  Otherwise the rebuilt APK differs from the signed one.
+- Releases from `release.yml` are already tagged `v<versionName>` with `goldfishsend-<versionName>.apk` attached, which
+  matches the `Binaries:` URL once it points at the repository's GitHub releases (`docs/RELEASING.md`).
 - Run `fdroid lint app.goldfishsend` and `fdroid build -v -l app.goldfishsend` in an fdroiddata checkout.
 - Check F-Droid's category list. The "Internet" and "Security" choices may need updating to the current taxonomy.

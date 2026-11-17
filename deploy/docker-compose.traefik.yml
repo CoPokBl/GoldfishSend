@@ -73,7 +73,7 @@ services:
 
   # The optional onion service (profile "onion") can't go through Caddy here, so it forwards straight to the api, which
   # gets a fixed address on the onion network. The api treats Tor's address as the client (it isn't a trusted proxy), so
-  # onion clients share one rate-limit address, as before. Kestrel's own limits apply on this path, and /healthz and
+  # onion clients share one rate-limit address, as with Caddy. Kestrel's own limits apply on this path, and /healthz and
   # /readyz are reachable from the onion (they reveal only "ok"/"ready").
   tor:
     depends_on: !reset []

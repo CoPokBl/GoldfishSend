@@ -245,7 +245,7 @@ internal object Schema {
         "ALTER TABLE groups DROP COLUMN pending_hash",
         // Our stint: the `since` of our entry in the roster.
         "ALTER TABLE groups ADD COLUMN since INTEGER NOT NULL DEFAULT 0",
-        // The facts held (docs/groups.md, "Facts"), one `fact sig` (b64u) per line.
+        // The facts held (docs/groups.md, "Fact"), one `fact sig` (b64u) per line.
         "ALTER TABLE groups ADD COLUMN facts TEXT",
     )
 

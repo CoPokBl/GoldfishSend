@@ -92,7 +92,7 @@ data class AuditReport(private val findings: List<Finding>, private val dismisse
 }
 
 /**
- * On-device security and privacy audit (PLAN.md §11.7). Everything runs locally, and nothing is reported anywhere.
+ * On-device security and privacy audit (android/README.md, "Security tab"). Everything runs locally, and nothing is reported anywhere.
  */
 object SecurityAudit {
     private const val NTFY = "io.heckel.ntfy"

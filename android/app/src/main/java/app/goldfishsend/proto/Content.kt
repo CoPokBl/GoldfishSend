@@ -6,7 +6,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
-/** E2E Content JSON (protocol.md, "Content"). Discriminator field is `t`. */
+/** E2E Content JSON (docs/protocol.md, "E2E blob"). Discriminator field is `t`. */
 @Serializable
 sealed class Content {
     @Serializable

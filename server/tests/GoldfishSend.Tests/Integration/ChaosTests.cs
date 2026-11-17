@@ -15,7 +15,7 @@ using static GoldfishSend.Tests.Integration.GoldfishFixture;
 namespace GoldfishSend.Tests.Integration;
 
 /// <summary>
-/// M3's "done when" (PLAN.md §12): with the push server failing and the delivery worker killed, nothing is lost within
+/// With the push server failing and the delivery worker killed, nothing is lost within
 /// its TTL, and nothing is delivered after it. Each test uses push servers on loopback addresses of their own, so their
 /// failures (circuit breaker, slow lane) stay out of the other tests.
 /// Slow by design (the second waits out the real reclaim and lease timeouts), so they carry a trait:

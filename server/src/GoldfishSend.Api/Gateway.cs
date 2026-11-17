@@ -151,7 +151,7 @@ public sealed class GatewayMiddleware {
         if (status is (400 or 413 or 415) && buffer.Length == 0) {
             // Parameter binding answers unreadable JSON or a wrong content type with an empty body. Clients get the
             // documented {"error": …} body for those too. An unknown route stays a bare 404: clients detect missing
-            // endpoints by it (docs/groups.md, "Fallback").
+            // endpoints by it (docs/groups.md, "Server: batch send").
             await using var writer = new Utf8JsonWriter(buffer);
             writer.WriteStartObject();
             writer.WriteString("error", status switch {

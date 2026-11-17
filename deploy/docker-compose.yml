@@ -12,10 +12,6 @@
 #   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
 # (server/README.md, "Running behind Traefik").
 #
-# Already running Traefik? Use the overlay instead of the bundled Caddy:
-#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
-# (server/README.md, "Running behind Traefik").
-#
 # Scaling out: every process is stateless and coordinates through MySQL and Redis, so
 #   docker compose up -d --scale api=3 --scale worker=4
 # works as-is. Caddy discovers api replicas through DNS. Workers share one Redis consumer group, so each
@@ -26,8 +22,8 @@
 #   public    caddy + api. Not internal: caddy publishes 80/443 and reaches Let's Encrypt; the api uses
 #             it for outbound verification pushes (POST /v1/mailboxes sends one synchronously).
 #             The subnet is fixed so the api can trust X-Forwarded-For from it and nothing else.
-#   internal  internal: true (no route to the outside world). api, worker, mysql, redis.
-#             mysql and redis live only here.
+#   internal  internal: true (no route to the outside world). api, worker, mysql, redis, redis-ephemeral.
+#             mysql and both redis instances live only here.
 #   egress    worker only. Gives the worker outbound internet to reach push servers (ntfy, FCM
 #             distributors, ...) without putting it on the network caddy faces. Outbound requests are
 #             SSRF-filtered in the app (private, loopback, link-local, metadata ranges are refused).
@@ -72,7 +68,8 @@ x-goldfish-env: &goldfish-env
   ConnectionStrings__MySql: "Server=mysql;Port=3306;Database=goldfish;User ID=goldfish;Password=${MYSQL_PASSWORD:?set MYSQL_PASSWORD in deploy/.env};SslMode=Required;Maximum Pool Size=50"
   # $$CONFIG= tells StackExchange.Redis that CONFIG is disabled on the server (see redis.conf).
   ConnectionStrings__Redis: "redis:6379,user=goldfish,password=${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env},abortConnect=false,$$CONFIG="
-  # Rate limits, PoW and circuit breakers live in a separate Redis that never writes to disk (see redis-ephemeral.conf).
+  # Rate limits, PoW, idempotency and circuit breakers live in a separate Redis that never writes to disk
+  # (see redis-ephemeral.conf).
   ConnectionStrings__RedisEphemeral: "redis-ephemeral:6379,user=goldfish,password=${REDIS_EPHEMERAL_PASSWORD:?set REDIS_EPHEMERAL_PASSWORD in deploy/.env},abortConnect=false,$$CONFIG="
   # Never accept this server's own name as a push endpoint (loop protection).
   Goldfish__Push__BlockedHosts__0: "${GOLDFISH_DOMAIN:?set GOLDFISH_DOMAIN in deploy/.env}"
@@ -277,7 +274,8 @@ services:
       retries: 5
       start_period: 10s
 
-  # Non-persistent: no volume, AOF and RDB off. Restarting it only resets rate limits.
+  # Non-persistent: no volume, AOF and RDB off. Restarting it resets rate limits and other short-lived state
+  # (see redis-ephemeral.conf).
   redis-ephemeral:
     <<: *hardening
     image: redis:7.4-alpine

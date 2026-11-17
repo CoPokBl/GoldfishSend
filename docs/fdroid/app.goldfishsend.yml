@@ -2,8 +2,12 @@
 #
 # Placeholders to replace:
 #   https://example.org/goldfishsend    the public source repository
-#   https://relay.example.org           the relay server compiled in as the default (must match your release build)
+#   https://push.example.com            the server compiled in as the default (must match your release build)
+#   <fingerprint>                       that server's identity fingerprint (empty if the release has none)
 #   AllowedAPKSigningKeys               the SHA-256 of your release signing certificate (docs/RELEASING.md)
+#
+# Each build entry must use the same -P values as the release it reproduces, from its release notes: releases are
+# versionName 0.1.<n> and versionCode <n> (docs/RELEASING.md, section 3), and the 0.1.0/1 entry below is a placeholder.
 #
 # Known blocker: libsignal's native library (libsignal_jni.so) comes PREBUILT from Signal's Maven repository
 # (build-artifacts.signal.org), and SQLCipher's (libsqlcipher.so) prebuilt from Maven Central. F-Droid's
@@ -43,7 +47,10 @@ Builds:
     # the native libraries, so a different version produces different bytes and breaks reproducibility.
     ndk: r27b
     gradleprops:
-      - gf.defaultServer=https://relay.example.org
+      - gf.defaultServer=https://push.example.com
+      - gf.defaultServerKey=<fingerprint>
+      - gf.versionCode=1
+      - gf.versionName=0.1.0
     # Option A (untested sketch): build libsignal's JNI library from source instead of using the prebuilt AAR.
     # srclibs:
     #   - libsignal@v0.107.0
