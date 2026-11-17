@@ -42,18 +42,19 @@ The release is signed with APK Signature Scheme v3. v1 is off, and AGP omits v2 
 
 ## 3. Automatic releases (GitHub Actions and Obtainium)
 
-`.github/workflows/ci.yml` runs on pull requests and on pushes to any branch except `main`. It runs the server tests
-against MySQL and Redis, builds the server image, and runs the app's unit tests, lint, debug and release builds, and the
-device tests on an emulator.
+`.github/workflows/ci.yml` runs on pull requests and on pushes to any branch except `main`. It runs the server's
+formatting check and tests against MySQL and Redis, a short load test, and a build of the server image. For the app it
+runs the unit tests, lint, the debug and (unsigned) release builds, compiles the baseline-profile generator, and runs
+the device tests on an emulator.
 
 `.github/workflows/release.yml` runs on every push to `main`. It reruns CI, then:
 
 - publishes the server image to `ghcr.io/<owner>/goldfishsend` as `latest`, `<version>` and `sha-<commit>`, for
   `linux/amd64` and `linux/arm64`, with a build provenance attestation;
 - if anything under `android/` or `.github/` changed since the last `v*` tag (or when you run it by hand with
-  **force**), builds the signed APK, checks it was signed with the expected certificate, and creates a GitHub release
-  `v<version>` with `goldfishsend-<version>.apk`, its SHA-256, a provenance attestation, the commit list since the
-  previous release, and the exact command to reproduce the build.
+  **force**), builds the signed APK, checks it was signed with the expected certificate, attests its build provenance,
+  and creates a GitHub release `v<version>` with `goldfishsend-<version>.apk` and its SHA-256. The release notes list
+  the commits since the previous release, the signing fingerprint, and the exact command to reproduce the build.
 
 The version is `0.1.<number of commits on main>`, and the version code is that commit count, so every release is
 higher than the last. Change `VERSION_BASE` in `release.yml` for a new minor or major version.
@@ -74,7 +75,7 @@ and these **variables** (to the environment, or as repository variables):
 | Variable | Value |
 |---|---|
 | `GF_SIGNING_CERT_SHA256` | the certificate fingerprint from section 5, with or without colons. The release fails if the APK was signed with any other key. |
-| `GF_DEFAULT_SERVER` | the app's default server, e.g. `https://relay.example.org` |
+| `GF_DEFAULT_SERVER` | the app's default server, e.g. `https://push.example.com` |
 | `GF_DEFAULT_SERVER_KEY` | that server's identity fingerprint (`docker compose run --rm --no-deps api fingerprint` on the server; see "Server identity" in `server/README.md`). Leave it empty to trust the server's key on first use; the release then warns. |
 | `GF_KEY_ALIAS` | optional, default `goldfishsend` |
 
@@ -97,7 +98,7 @@ as the installed app. Compare the fingerprint in the release notes with the publ
 
 ```bash
 cd android
-./gradlew clean :app:assembleRelease -Pgf.defaultServer=https://your.relay.example \
+./gradlew clean :app:assembleRelease -Pgf.defaultServer=https://push.example.com \
   -Pgf.defaultServerKey=<fingerprint> -Pgf.versionCode=<n> -Pgf.versionName=0.1.<n>
 # app/build/outputs/apk/release/app-release.apk
 ```

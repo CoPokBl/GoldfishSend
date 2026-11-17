@@ -8,21 +8,29 @@ The wire protocol lives in [`../docs/protocol.md`](../docs/protocol.md), and thi
 
 ## Build
 
-Requirements: Android SDK (compileSdk 37, NDK 27.1 for native symbol stripping) and JDK 21.
+Requirements: Android SDK (compileSdk 37, NDK 27.1 for native symbol stripping), JDK 21 to run Gradle (point
+`JAVA_HOME` at it) and a JDK 17 for the Kotlin toolchain.
 
 ```sh
 cd android
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
 ./gradlew :app:assembleDebug          # debug APK (allows http:// for a local dev server)
 ./gradlew :app:assembleRelease        # R8-minified release APK (https only)
-./gradlew :app:testDebugUnitTest      # JVM tests: protocol vectors, HTTP contract (MockWebServer), real libsignal PQXDH handshake
-./gradlew :app:connectedDebugAndroidTest  # on-device: Keystore, SQLCipher, crypto-shredding, locked inbox, panic wipe
+./gradlew :app:testDebugUnitTest      # JVM tests: protocol vectors, HTTP contract (MockWebServer), libsignal sessions, group simulations, fuzz replays
+./gradlew :app:connectedDebugAndroidTest  # on a device or emulator (see below)
 ```
 
-The default server URL is a build property: `./gradlew assembleRelease -Pgf.defaultServer=https://your.server`.
-Users can also change it under *Settings → Network → Server* (or "Advanced" during onboarding).
+The device tests run on the real Keystore, SQLCipher and libsignal stores: the key hierarchy, crypto-shredding and a
+forensic dump of the app's storage (`ForensicDeviceTest`), the locked inbox, wipes and the optional security features,
+server identity pins, Argon2 on ART, and group chats between several profiles in one app, with the test carrying
+messages between them in place of a server. CI runs them on an x86_64 emulator (add `-Pgf.abis=x86_64` for a smaller
+APK). `LiveServerDeviceTest` also talks to a real server through the gateway, and is skipped unless given one, for
+example a local dev server as seen from the emulator:
+`-Pandroid.testInstrumentationRunnerArguments.gfLiveServer=http://10.0.2.2:5234 -Pandroid.testInstrumentationRunnerArguments.gfLiveKey=<b64u fingerprint>`.
 
-Release signing is optional and local: `android/keystore.properties` or `GF_KEYSTORE_*` environment variables
+The default server URL is a build property: `./gradlew assembleRelease -Pgf.defaultServer=https://push.example.com`.
+Users can also change it under *Settings › Network › Server* (or "Advanced" during onboarding).
+
+Release signing is optional and local: `android/keystore.properties` or `GF_KEYSTORE_*` and `GF_KEY_*` environment variables
 (see [`../docs/RELEASING.md`](../docs/RELEASING.md)). Without either, `assembleRelease` produces `app-release-unsigned.apk`.
 
 ### Reproducible builds
@@ -116,8 +124,11 @@ member decides along the way, replay it: `-Pgf.groupFuzz.replay="<seed>; Op(…)
 Official releases are signed with a single key whose certificate SHA-256 fingerprint is:
 
 ```
-TBD: published with the first release (see docs/RELEASING.md §5)
+TBD: published with the first release
 ```
+
+Every release's notes on GitHub carry it too (for maintainers: [`../docs/RELEASING.md`](../docs/RELEASING.md#5-print-and-publish-the-signing-certificate-fingerprint),
+section 5).
 
 Check an APK before installing it with [AppVerifier](https://github.com/soupslurpr/AppVerifier), or run
 `apksigner verify --print-certs goldfishsend.apk` and compare the `SHA-256 digest`. F-Droid and Obtainium refuse
@@ -129,19 +140,20 @@ There's a single `:app` module, so the build stays simple and fast. It has no DI
 
 | Package | Responsibility |
 |---|---|
-| `proto` | Pure Kotlin wire formats: base64url, padding, PoW, mailbox tag/owner hash, push envelope, E2E blob, Content JSON, chunking, invite link/blob. JVM-tested. |
+| `proto` | Pure Kotlin wire formats: base64url, padding, PoW, mailbox tag/owner hash, push envelope, E2E blob, Content JSON, chunking, invite link/blob, group documents (cards, rosters, facts, heads, sender hints). JVM-tested. |
 | `crypto` | `KeyVault` (Keystore and Argon2 key hierarchy), `MessageVault` (per-message keys), `SignalStore` (libsignal stores on SQLCipher) |
-| `db` | `Db` (SQLCipher wrapper, schema) and `Repo` (typed queries; every message body goes through `MessageVault`) |
+| `db` | `Db` (SQLCipher wrapper, schema), `Repo` (typed queries; every message body goes through `MessageVault`) and `GroupRepo` |
 | `net` | `ServerApi` (OkHttp, TLS 1.2+ restricted ciphers, no redirects) with friendly error mapping. `NetStack`: per-request routing (direct, built-in Tor or Orbot, fail closed) and TOFU key pinning. `TorManager` (in-process tor-android). `NetRules`/`PinPolicy` are pure rules, JVM-tested. |
 | `push` | UnifiedPush connector 3.x (`GfPushService`, `PushHub`), registered with the server's VAPID key |
-| `core` | `Graph` (service locator and unlocked `Session`), `Mailboxes`, `Invites`, `Messenger` (receive/send), `Outbox`, `Sweeper`, `LockedInbox`, `Notifier`, `Prefs` |
+| `core` | `Graph` (service locator and unlocked `Session`), `Mailboxes`, `Invites`, `Messenger` (receive/send), `Outbox`, `Groups` and `GroupOutbox` (group wiring and batch sends), `Sweeper`, `LockedInbox`, `Notifier`, `Prefs` |
+| `group` | `GroupEngine`: the group protocol ([`../docs/groups.md`](../docs/groups.md)). Storage and sending sit behind `GroupStore` and `GroupIo`, so the simulations and fuzzers run it on in-memory stores. |
 | `security` | `AppLock`, `Wiper`, `SecurityAudit`, `ClipboardGuard` |
 | `work` | WorkManager workers (outbox, maintenance), boot/expiry receivers, Quick Settings panic tile |
 | `ui` | Material 3 Compose UI (theme, screens, components) |
 
 ### Message flow
 - **Send**: `Messenger.sendText` stores the message (per-message key), chunks it to the padded-size limits, and queues it in `outbox`. `Outbox` then encrypts each row **once** with libsignal, stores the ciphertext, and POSTs it with a fixed idempotency key. It retries with backoff and keeps per-contact ordering.
-- **Receive**: the UnifiedPush connector decrypts RFC 8291. `Messenger` parses the envelope, then either confirms a mailbox verification or looks up the mailbox by tag, decrypts with libsignal and unpads. It then dispatches `hello`, `text`, `receipt`, `timer`, `delete` or `mailbox`.
+- **Receive**: the UnifiedPush connector decrypts RFC 8291. `Messenger` parses the envelope, then either confirms a mailbox verification or looks up the mailbox by tag, decrypts with libsignal and unpads. It then reassembles `chunk` parts and dispatches `hello`, `text`, `receipt`, `timer`, `delete`, `mailbox` or the group types (to `Groups`).
 - **While locked** (passphrase set, or device locked): pushes are sealed with libsignal's HPKE to the *locked-inbox* public key and written to disk. The private key lives inside the encrypted DB, and the inbox is drained on unlock.
 - **Reliability**: if a delivery receipt hasn't arrived after 6 h, the message is re-sent (up to 3 times, deduped by message id on the receiver). This covers push servers that drop messages for offline devices.
 - **Back-pressure**:
@@ -183,7 +195,7 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 - Notifications reveal nothing by default (`VISIBILITY_SECRET`).
 - No backups or device transfer.
 
-**Network** (Settings › Connection, also reachable from onboarding's Advanced section)
+**Network** (Settings › Network › Connection, also reachable from onboarding's Advanced section)
 - **Connection mode**: Direct (default), **Built-in Tor**, or **Orbot**. Built-in Tor embeds the Guardian Project's
   `tor-android` and runs it in-process as a bound, non-exported service, with no extra permissions. Its torrc adds
   `SafeSocks`, `ClientOnly` and `AvoidDiskWrites`. With Tor or Orbot selected, every request to a GoldfishSend server
@@ -197,7 +209,7 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
   written. A change fails closed and shows "This server's identity changed", with the old and new fingerprints and
   **Keep blocked** or **Trust new key** (confirmed a second time). It never auto-accepts. Onion servers are skipped,
   because the onion address is the key. Fingerprints are shown in Connection settings for comparison with the
-  operator's (see server/README.md).
+  operator's (see [`../server/README.md`](../server/README.md#publishing-your-tls-key-fingerprint-optional-extra-pinning)).
 - Tor covers connections to GoldfishSend servers only. **Push delivery still goes through your UnifiedPush
   distributor** (ntfy etc.), which sees delivery timing but never content.
 - A panic wipe deletes the network settings, pins and Tor's state directory, **after** the best-effort mailbox
@@ -210,7 +222,7 @@ Findings can be **dismissed** if there's a legitimate reason to leave them as th
 The audit adds **no extra permissions**. Checks that would need one, such as listing apps that can draw over other apps (which needs `QUERY_ALL_PACKAGES`), are deliberately left out.
 
 ## Known gaps / TODO
-- **No group chats or attachments.** Multi-device isn't supported either.
+- **No attachments or multi-device.** Messages are text; long ones are chunked. One install is one identity.
 - **Key pinning is opt-in and trust-on-first-use.** A first connection that's already intercepted gets pinned.
   Compare the fingerprint with the operator's.
 - **Built-in Tor adds about 8 MB per ABI** (`libtor.so`) to the APK, and isn't yet exercised on a device by the tests.
@@ -219,7 +231,9 @@ The audit adds **no extra permissions**. Checks that would need one, such as lis
 - **Changing server needs an empty contact list.** Mailboxes don't record which server they live on, so you must remove your contacts before switching.
 - **Locked inbox needs one unlock first.** The inbox key pair is created on first unlock, so a push that arrives before the app has ever been unlocked is dropped.
 - **Key material can't always be wiped from memory.** Text you type in fields passes through `EditText` and `String`, which the JVM can't reliably zero. Raw key arrays are zeroed.
-- **The UI is only smoke-tested** on an emulator (onboarding renders). End-to-end delivery through a real push distributor and server hasn't been exercised yet.
+- **Push delivery isn't covered by the automated tests.** The device tests carry messages between profiles
+  themselves, and the baseline-profile journeys drive the UI against an unreachable server. Delivery through a real
+  server and UnifiedPush distributor is tested by hand.
 
 
 ## Optional security features
@@ -239,7 +253,7 @@ All of these live in **Settings**. Only those with no real downside are on by de
 - **Mailbox rotation.** On by default, every 30 days. Each contact gets a fresh mailbox, and the old one is deleted after they've switched.
 - **Clear memory when locking.** On by default.
 
-## Security notes (client audit fixes)
+## More security notes
 
 - **Invite links never act on their own.** Opening a `gfsend://` link only proposes a contact. You see the server and accept first.
 - **Changing the unlock method makes a new master key.** The database is rekeyed and the old device key is deleted, so an older, weaker wrapping (for example "no lock") left in flash can't open anything. Interrupted changes recover automatically.

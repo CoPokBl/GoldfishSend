@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Release the app even if android/ hasn't changed since the last release
+        description: Release the app even if android/ and .github/ haven't changed since the last release
         type: boolean
         default: false
 

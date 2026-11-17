@@ -693,7 +693,7 @@ openssl s_client -connect push.example.com:443 -servername push.example.com </de
   | openssl dgst -sha256 -binary | openssl enc -base64
 ```
 
-The app shows exactly this value under Settings › Connection. **To rotate the key** (suspected compromise, or
+The app shows exactly this value under Settings › Network › Connection. **To rotate the key** (suspected compromise, or
 policy), remove `reuse_private_keys` for one renewal (or delete the key under `caddy_data`), restore it, and
 announce the new fingerprint *before* users see the "server identity changed" warning. Pinned clients block the
 server until each user accepts the new key, so do this rarely and deliberately.

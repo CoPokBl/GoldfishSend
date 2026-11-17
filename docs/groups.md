@@ -315,7 +315,7 @@ cards, rosters, facts that carry a roster.
   whole content.
 - Parts are reassembled per sender (and, in groups, per member), then handled as the content they carry.
 - A chunk never contains a chunk.
-- In 1:1 chats, `text` keeps its own `part`/`parts` fields as before.
+- In 1:1 chats, long texts use `text`'s own `part`/`parts` fields instead.
 
 ### Content types (JSON `t`), all with `g` = groupId
 | t | Fields | Sender | Meaning |
