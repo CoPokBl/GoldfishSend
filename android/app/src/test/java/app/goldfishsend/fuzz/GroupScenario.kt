@@ -609,8 +609,11 @@ class GroupScenario(private val seed: Long) {
                 role == Role.OWNER || role == Role.MEMBER -> (m.state == GroupModel.JOINED && (!waiting || waitingCut)) || m.state == GroupModel.LEFT
                 role == Role.INVITED && waiting -> waitingCut
                 role == Role.INVITED -> m.state == GroupModel.INVITED || inviteeCut || unreachable(p, h)
+                // Waiting, though the invitation is over: sending again was answered with how it ended, unless the owner they
+                // sent it to can't answer (that answer goes over 1:1 only).
+                waiting -> !reachesOwner(p, m) || honest.none { o -> o.id == m.view()?.owner && p.id in o.contacts } || unreachable(p, h)
                 // Out: they know it, or nobody still in can reach them.
-                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || ((m.state == GroupModel.INVITED || pending(p, m)) && inviteeCut) ||
+                else -> m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED || (m.state == GroupModel.INVITED && inviteeCut) ||
                     unreachable(p, h)
             }
             if (!ok) {
