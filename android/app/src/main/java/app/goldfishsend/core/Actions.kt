@@ -18,13 +18,34 @@ import kotlinx.coroutines.flow.update
 object Actions {
     private val jobs = ConcurrentHashMap<String, Deferred<*>>()
     private val _running = MutableStateFlow<Set<String>>(emptySet())
+    private val _failures = MutableStateFlow<List<Failure>>(emptyList())
 
     /** Keys of the actions still running. */
     val running: StateFlow<Set<String>> = _running
 
-    /** Starts [block] under [key], or returns the one already running under it. */
+    /** An action that failed, and what to tell the user. */
+    class Failure(val key: String, val message: String)
+
+    /**
+     * Failures not shown yet. The app shows them wherever the user is (they may have left the screen that started the
+     * action), then [consume]s them. Cleared on lock: they can name a group.
+     */
+    val failures: StateFlow<List<Failure>> = _failures
+
+    fun consume(f: Failure) {
+        _failures.update { it - f }
+    }
+
+    fun clearFailures() {
+        _failures.value = emptyList()
+    }
+
+    /**
+     * Starts [block] under [key], or returns the one already running under it. If it fails (not cancelled), [describe]
+     * says what to tell the user, and the message joins [failures].
+     */
     @Suppress("UNCHECKED_CAST")
-    fun <T> start(key: String, block: suspend () -> T): Deferred<T> = synchronized(jobs) {
+    fun <T> start(key: String, describe: (Throwable) -> String, block: suspend () -> T): Deferred<T> = synchronized(jobs) {
         jobs[key]?.takeIf { it.isActive }?.let { return it as Deferred<T> }
         val job = Graph.scope.async(start = CoroutineStart.LAZY) {
             try {
@@ -32,6 +53,8 @@ object Actions {
             } catch (e: Exception) {
                 if (e !is kotlinx.coroutines.CancellationException) {
                     Log.i("Actions", "$key failed: ${e.javaClass.simpleName}")
+                    val f = Failure(key, describe(e))
+                    _failures.update { it + f }
                 }
                 throw e
             } finally {

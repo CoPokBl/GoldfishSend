@@ -178,15 +178,15 @@ fun NewGroupScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                 onClick = {
                     busy = true
                     val members = picked.toList()
-                    val job = Actions.start(Actions.groupCreate()) { Groups.create(s, name, members) }
+                    val groupName = name.trim()
+                    // A failure is shown app-wide (AppRoot), so the user sees it even if they've left this screen.
+                    val job = Actions.start(Actions.groupCreate(), describe = { e -> "Couldn't create “$groupName”. ${groupError(e, "Try again.")}" }) {
+                        Groups.create(s, name, members)
+                    }
                     scope.launch {
                         val r = runCatching { job.await() }
                         busy = false
-                        r.onSuccess(openChat).onFailure {
-                            if (it !is kotlinx.coroutines.CancellationException) {
-                                snackbar.showSnackbar(groupError(it, "Couldn't create the group. Try again."))
-                            }
-                        }
+                        r.onSuccess(openChat)
                     }
                 },
                 busy = creating,
@@ -577,7 +577,7 @@ private fun AddMembersDialog(s: Session, already: Set<String>, onDismiss: () -> 
 
 /** Shown instead of the composer while we're invited to a group: who invited us, Join or Decline. */
 @Composable
-fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String) -> Unit, onDeclined: () -> Unit) {
+fun GroupInvitationBar(s: Session, cid: Long, groupName: String, inviter: String, onDeclined: () -> Unit) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     // The join runs in the app's scope (Actions), so it completes even if the user leaves while it waits for a mailbox.
@@ -605,13 +605,9 @@ fun GroupInvitationBar(s: Session, cid: Long, inviter: String, onError: (String)
                     }
                 }, modifier = Modifier.weight(1f)) { Text("Decline") }
                 ProgressButton(busy = joining, enabled = !busy && !joining, onClick = {
-                    val job = Actions.start(joinKey) { Groups.join(s, cid) }
-                    scope.launch {
-                        runCatching { job.await() }.onFailure {
-                            if (it !is kotlinx.coroutines.CancellationException) {
-                                onError(groupError(it, "Couldn't join. Try again."))
-                            }
-                        }
+                    // A failure is shown app-wide (AppRoot), so the user sees it even if they've left the chat.
+                    Actions.start(joinKey, describe = { e -> "Couldn't join “$groupName”. ${groupError(e, "Try again.")}" }) {
+                        Groups.join(s, cid)
                     }
                 }, modifier = Modifier.weight(1f).blockWhenObscured()) {
                     Text("Join")

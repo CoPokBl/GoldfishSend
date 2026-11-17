@@ -441,8 +441,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
             }
             when (g?.state) {
                 app.goldfishsend.group.GroupModel.INVITED -> GroupInvitationBar(
-                    s, contactId, g.inviter,
-                    onError = { msg -> scope.launch { snackbar.showSnackbar(msg) } },
+                    s, contactId, c?.name ?: "the group", g.inviter,
                     onDeclined = back,
                 )
                 app.goldfishsend.group.GroupModel.REMOVED, app.goldfishsend.group.GroupModel.LEFT -> Banner(

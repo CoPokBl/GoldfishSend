@@ -280,6 +280,7 @@ object Graph {
     fun lock() {
         val s = _session.value ?: return
         _session.value = null
+        Actions.clearFailures()
         s.close()
         if (prefs.wipeMemoryOnLock) {
             MemoryScrubber.scrubAsync()

@@ -9,6 +9,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.material3.SnackbarHost
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -25,6 +26,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import app.goldfishsend.core.Actions
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Session
 import app.goldfishsend.ui.screens.AddContactScreen
@@ -102,6 +104,15 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
             .onFailure { snackbar.showSnackbar(it.message ?: "Couldn't add that contact.") }
     }
     app.goldfishsend.ui.components.BusyDialog(adding, "Adding contact…")
+    // Group create and join run on after their screen is gone (Actions), so their failures are shown here, wherever the
+    // user is. Collected only while the app is on screen, so one that fails in the background shows on return.
+    val failures by Actions.failures.collectAsStateWithLifecycle()
+    val failure = failures.firstOrNull()
+    LaunchedEffect(failure) {
+        val f = failure ?: return@LaunchedEffect
+        snackbar.showSnackbar(f.message, withDismissAction = true)
+        Actions.consume(f)
+    }
     // Our own server presented a different identity key: explain, and let the user trust it (after re-authenticating).
     app.goldfishsend.ui.screens.ServerIdentityChangedDialog(s)
     confirmLink?.takeIf { InviteLink.isOutdated(it) }?.let {
