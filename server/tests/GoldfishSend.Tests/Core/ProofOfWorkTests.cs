@@ -1,13 +1,13 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
-using System.Text;
 using GoldfishSend.Core.Crypto;
+using GoldfishSend.Core.Options;
 
 namespace GoldfishSend.Tests.Core;
 
 public sealed class ProofOfWorkTests {
-    private static byte[] Hash(byte[] challenge, byte[] nonce) {
-        return SHA256.HashData(Encoding.UTF8.GetBytes("gf/pow/v1").Concat(challenge).Concat(nonce).ToArray());
-    }
+    /// <summary>Small Argon2 parameters, so solving takes milliseconds.</summary>
+    private static PowParameters Small(int difficulty) => new(difficulty, 64, 1);
 
     private static int ReferenceLeadingZeroBits(byte[] hash) {
         var bits = 0;
@@ -20,6 +20,12 @@ public sealed class ProofOfWorkTests {
             }
         }
         return bits;
+    }
+
+    private static byte[] Nonce(ulong n) {
+        var nonce = new byte[8];
+        BinaryPrimitives.WriteUInt64BigEndian(nonce, n);
+        return nonce;
     }
 
     [Theory]
@@ -41,25 +47,12 @@ public sealed class ProofOfWorkTests {
     }
 
     [Fact]
-    public void LeadingZeroBits_All32ZeroBytes_Is256() {
-        Assert.Equal(256, ProofOfWork.LeadingZeroBits(new byte[32]));
-    }
-
-    [Fact]
-    public void LeadingZeroBits_OnlyLastBitSet_Is255() {
-        var hash = new byte[32];
-        hash[31] = 0x01;
-        Assert.Equal(255, ProofOfWork.LeadingZeroBits(hash));
-    }
-
-    [Fact]
     public void LeadingZeroBits_MatchesReferenceOnRandomInputs() {
         var rng = new Random(1234);
         for (var i = 0; i < 500; i++) {
             var hash = new byte[32];
             rng.NextBytes(hash);
-            var zeros = rng.Next(0, 6);
-            Array.Clear(hash, 0, zeros);
+            Array.Clear(hash, 0, rng.Next(0, 6));
             Assert.Equal(ReferenceLeadingZeroBits(hash), ProofOfWork.LeadingZeroBits(hash));
         }
     }
@@ -67,61 +60,50 @@ public sealed class ProofOfWorkTests {
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
-    [InlineData(8)]
-    [InlineData(10)]
-    [InlineData(12)]
-    [InlineData(14)]
-    [InlineData(16)]
+    [InlineData(4)]
+    [InlineData(7)]
     public void SolveThenVerify(int difficulty) {
         var challenge = RandomNumberGenerator.GetBytes(32);
-        var nonce = ProofOfWork.Solve(challenge, difficulty);
+        var nonce = ProofOfWork.Solve(challenge, Small(difficulty));
         Assert.Equal(8, nonce.Length);
-        Assert.True(ProofOfWork.Verify(challenge, nonce, difficulty));
-        // Independent check of the spec formula.
-        Assert.True(ReferenceLeadingZeroBits(Hash(challenge, nonce)) >= difficulty);
+        Assert.True(ProofOfWork.Verify(challenge, nonce, Small(difficulty)));
+        Assert.True(ReferenceLeadingZeroBits(ProofOfWork.Hash(challenge, nonce, 64, 1)) >= difficulty);
     }
 
     [Fact]
-    public void Solve_NonceIsBigEndianCounter() {
+    public void Solve_ReturnsTheFirstBigEndianCounterThatWorks() {
         var challenge = RandomNumberGenerator.GetBytes(32);
-        // Difficulty 0: the very first candidate (0) is accepted.
-        Assert.Equal(new byte[8], ProofOfWork.Solve(challenge, 0));
+        Assert.Equal(new byte[8], ProofOfWork.Solve(challenge, Small(0)));
+        var nonce = ProofOfWork.Solve(challenge, Small(5));
+        var n = BinaryPrimitives.ReadUInt64BigEndian(nonce);
+        for (ulong i = 0; i < n; i++) {
+            Assert.False(ProofOfWork.Verify(challenge, Nonce(i), Small(5)));
+        }
     }
 
     [Fact]
-    public void Verify_AgreesWithReferenceForManyNonces() {
+    public void Verify_AgreesWithTheHashForManyNonces() {
         var challenge = RandomNumberGenerator.GetBytes(32);
-        for (ulong n = 0; n < 2000; n++) {
-            var nonce = BitConverter.GetBytes(n);
-            var zeros = ReferenceLeadingZeroBits(Hash(challenge, nonce));
-            Assert.True(ProofOfWork.Verify(challenge, nonce, Math.Min(zeros, ProofOfWork.MaxDifficulty)));
+        for (ulong n = 0; n < 200; n++) {
+            var zeros = ReferenceLeadingZeroBits(ProofOfWork.Hash(challenge, Nonce(n), 64, 1));
+            Assert.True(ProofOfWork.Verify(challenge, Nonce(n), Small(Math.Min(zeros, ProofOfWork.MaxDifficulty))));
             if (zeros < ProofOfWork.MaxDifficulty) {
-                Assert.False(ProofOfWork.Verify(challenge, nonce, zeros + 1));
+                Assert.False(ProofOfWork.Verify(challenge, Nonce(n), Small(zeros + 1)));
             }
         }
     }
 
     [Fact]
-    public void Verify_RejectsWrongNonce() {
+    public void Hash_DependsOnEveryInput() {
         var challenge = RandomNumberGenerator.GetBytes(32);
-        const int difficulty = 12;
-        // Find a nonce that doesn't meet the difficulty, by the reference formula.
-        var rng = new Random(42);
-        var nonce = new byte[8];
-        do {
-            rng.NextBytes(nonce);
-        } while (ReferenceLeadingZeroBits(Hash(challenge, nonce)) >= difficulty);
-        Assert.False(ProofOfWork.Verify(challenge, nonce, difficulty));
-    }
-
-    [Fact]
-    public void Verify_SolutionIsBoundToChallenge() {
-        var challenge = RandomNumberGenerator.GetBytes(32);
-        var nonce = ProofOfWork.Solve(challenge, 16);
         var other = challenge.ToArray();
-        other[0] ^= 1;
-        var stillValid = ReferenceLeadingZeroBits(Hash(other, nonce)) >= 16;
-        Assert.Equal(stillValid, ProofOfWork.Verify(other, nonce, 16));
+        other[31] ^= 1;
+        var reference = ProofOfWork.Hash(challenge, Nonce(1), 64, 1);
+        Assert.NotEqual(reference, ProofOfWork.Hash(other, Nonce(1), 64, 1));
+        Assert.NotEqual(reference, ProofOfWork.Hash(challenge, Nonce(2), 64, 1));
+        Assert.NotEqual(reference, ProofOfWork.Hash(challenge, Nonce(1), 72, 1));
+        Assert.NotEqual(reference, ProofOfWork.Hash(challenge, Nonce(1), 64, 2));
+        Assert.Equal(reference, ProofOfWork.Hash(challenge, Nonce(1), 64, 1));
     }
 
     [Theory]
@@ -133,23 +115,32 @@ public sealed class ProofOfWorkTests {
     [InlineData(32, 0)]
     public void Verify_RejectsWrongLengths(int challengeLength, int nonceLength) {
         // Difficulty 0 would accept any well-formed input, so only lengths can cause rejection.
-        Assert.False(ProofOfWork.Verify(new byte[challengeLength], new byte[nonceLength], 0));
+        Assert.False(ProofOfWork.Verify(new byte[challengeLength], new byte[nonceLength], Small(0)));
     }
 
     [Theory]
-    [InlineData(-1)]
-    [InlineData(41)]
-    [InlineData(256)]
-    [InlineData(int.MinValue)]
-    [InlineData(int.MaxValue)]
-    public void Verify_RejectsOutOfRangeDifficulty(int difficulty) {
-        Assert.False(ProofOfWork.Verify(new byte[32], new byte[8], difficulty));
+    [InlineData(-1, 64, 1)]
+    [InlineData(21, 64, 1)]
+    [InlineData(15, 16 * 1024, 1)]
+    [InlineData(13, 64 * 1024, 1)]
+    [InlineData(int.MaxValue, 64, 1)]
+    [InlineData(0, 7, 1)]
+    [InlineData(0, 64 * 1024 + 1, 1)]
+    [InlineData(0, int.MaxValue, 1)]
+    [InlineData(0, 64, 0)]
+    [InlineData(0, 64, 5)]
+    public void Verify_RejectsParametersOutsideWhatClientsAccept(int difficulty, int memoryKiB, int iterations) {
+        var parameters = new PowParameters(difficulty, memoryKiB, iterations);
+        Assert.False(parameters.IsValid);
+        Assert.False(ProofOfWork.Verify(new byte[32], new byte[8], parameters));
     }
 
     [Fact]
-    public void Verify_DifficultyZeroAcceptsAnything_AndMaxIsInRange() {
-        var challenge = RandomNumberGenerator.GetBytes(32);
-        Assert.True(ProofOfWork.Verify(challenge, RandomNumberGenerator.GetBytes(8), 0));
-        Assert.Equal(40, ProofOfWork.MaxDifficulty);
+    public void ProductionDefaults_AreValid_EvenAtFullLoad() {
+        var options = new PowOptions();
+        Assert.True(new PowParameters(
+            options.BaseDifficulty + options.MaxNetworkExtraDifficulty + options.MaxGlobalExtraDifficulty,
+            options.MemoryKiB, options.Iterations).IsValid);
+        Assert.Equal((6, 16 * 1024, 1), (options.BaseDifficulty, options.MemoryKiB, options.Iterations));
     }
 }

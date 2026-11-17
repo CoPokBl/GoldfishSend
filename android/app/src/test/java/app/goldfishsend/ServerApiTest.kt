@@ -134,6 +134,14 @@ class ServerApiTest {
     }
 
     @Test
+    fun powChallengeCarriesItsParameters() = runBlocking {
+        reply(200, """{"scheme":"gf/pow/v2","challenge":"AAAA","difficulty":6,"memoryKiB":16384,"iterations":1,"expiresAt":1}""")
+        val ch = api.powChallenge()
+        assertEquals("gf/pow/v2", ch.scheme)
+        assertEquals(app.goldfishsend.proto.Pow.Params(6, 16384, 1), ch.params)
+    }
+
+    @Test
     fun errorCodesParsed() = runBlocking {
         reply(429, """{"error":"rate_limited"}""", "retry-after" to "12")
         try {

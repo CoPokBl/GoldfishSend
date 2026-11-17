@@ -33,11 +33,22 @@ This is the contract between the server (`server/`) and the Android client (`and
 | sealed endpoint | `nonce(12) ‖ AES-256-GCM(sealKey, nonce, plaintext = endpointRecord, aad = mailboxId)` | server only |
 
 ## Proof of work
-- `POST /v1/pow/challenge` returns `{ "challenge": b64u(32 B), "difficulty": int, "expiresAt": unixSeconds }`.
+- `POST /v1/pow/challenge` returns
+  `{ "scheme": "gf/pow/v2", "challenge": b64u(32 B), "difficulty": int, "memoryKiB": int, "iterations": int, "expiresAt": unixSeconds }`.
 - Solution: an 8-byte big-endian unsigned `nonce` such that
-  `SHA256("gf/pow/v1" ‖ challenge ‖ nonce)` has at least `difficulty` leading zero **bits**.
+  `Argon2id(password = "gf/pow/v2" ‖ challenge ‖ nonce, salt = challenge, m = memoryKiB, t = iterations, p = 1, 32 bytes)`
+  (RFC 9106, version 0x13, no secret or associated data) has at least `difficulty` leading zero **bits**. That takes
+  about `2^difficulty` Argon2 calls. Verifying takes one. Vectors: `docs/test-vectors/pow-v2.json`.
+- The server picks the parameters (defaults: 16 MiB, `t = 1`, 6 bits). Clients refuse a challenge with another `scheme`,
+  `difficulty` over 20, `memoryKiB` outside 8–65536, `iterations` outside 1–4, or expected work
+  `2^difficulty × memoryKiB × iterations` over 2^28 KiB (the default server's worst case), and give up after 180 s.
+- Difficulty adapts to load. Creations from the requester's IPv4 /24 or IPv6 /48 in the last 5 minutes raise its own
+  difficulty (one bit when over 5, one more per doubling, up to +6). Verified creations server-wide add up to +2 bits for
+  everyone. A challenge keeps the parameters it was issued with.
 - A challenge is single-use and expires after 5 minutes.
-- Submitted as `"pow": { "challenge": b64u, "nonce": b64u(8 B) }`.
+- Submitted as `"pow": { "challenge": b64u, "nonce": b64u(8 B) }`, or in `GF-PoW` on sends.
+- `503 unavailable` (with `Retry-After`) on a request carrying a solution means the server's verification slots were all
+  busy. The challenge was not used up: retry the same solution.
 
 ## Push payload (plaintext inside the RFC 8291 Web Push layer)
 ```
@@ -197,10 +208,11 @@ All of these are inner requests through `POST /v1/gw` (see above). Statuses and 
 
 ### `GET /v1/info`
 Response: `{ "protocol": 2, "vapidPublicKey": b64u(65 B uncompressed P-256), "maxMessageBytes": 3983, "maxInviteBytes": 4096,
-"defaultTtlSeconds": 259200, "maxTtlSeconds": 1209600, "powDifficulty": int }`
+"defaultTtlSeconds": 259200, "maxTtlSeconds": 1209600, "powDifficulty": int }`. `powDifficulty` is what a challenge
+issued to this client would need right now.
 
 ### `POST /v1/pow/challenge`
-No body. Response as above. Rate limited per IP.
+No body. Response as above. Rate limited per IP and per network.
 
 ### `POST /v1/mailboxes`: create a mailbox
 ```json
@@ -209,7 +221,7 @@ No body. Response as above. Rate limited per IP.
   "endpoint": "https://push.example/...", "p256dh": "b64u 65B", "auth": "b64u 16B" }
 ```
 - `202 { "status": "pending_verification" }`. The server sends a **verification push** (type 0x02) to the endpoint.
-- Error codes: `400 invalid_request | invalid_endpoint`, `403 pow_invalid`, `409 mailbox_exists`, `429 rate_limited`, `502 endpoint_unreachable`.
+- Error codes: `400 invalid_request | invalid_endpoint`, `403 pow_invalid`, `409 mailbox_exists`, `429 rate_limited`, `502 endpoint_unreachable`, `503 unavailable` (see Proof of work).
 - Unverified mailboxes are purged after 10 minutes.
 
 ### `POST /v1/mailboxes/verify`
@@ -279,7 +291,7 @@ for the whole batch, and `GF-PoW` pays for all of it. The binary body format, re
 
 - Verification bodies may be padded. The code is always the first 16 bytes.
 - An `endpointGone: true` on refresh or verify makes the client re-register with its distributor and rotate its mailboxes, which triggers a fresh verification push. It does this at most once every 6 hours.
-- On `POST /v1/messages`, a `429` with scope `ip` or `network` is retried once with `GF-PoW`. Clients refuse challenges harder than 28 bits.
+- On `POST /v1/messages`, a `429` with scope `ip` or `network` is retried once with `GF-PoW`. Clients refuse unreasonable challenges (see Proof of work).
 - Clients read at most 64 KiB of any response body.
 - A first PreKey `hello` is only accepted on the mailbox whose invite published that signed prekey.
 

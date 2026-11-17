@@ -44,7 +44,7 @@ public static class ApiEndpoints {
         app.MapGet("/readyz", Ready);
     }
 
-    private static async Task<IResult> GetInfo(GoldfishOptions options, VapidSigner vapid, PowService pow) {
+    private static async Task<IResult> GetInfo(HttpContext context, GoldfishOptions options, VapidSigner vapid, PowService pow) {
         return Results.Json(new InfoResponse(
             ProtocolLimits.ProtocolVersion,
             vapid.PublicKeyBase64Url,
@@ -52,7 +52,7 @@ public static class ApiEndpoints {
             ProtocolLimits.MaxInviteBytes,
             options.Messages.DefaultTtlSeconds,
             options.Messages.MaxTtlSeconds,
-            await pow.CurrentDifficultyAsync()), ApiJsonContext.Default.InfoResponse);
+            await pow.DifficultyForAsync(Subject(context))), ApiJsonContext.Default.InfoResponse);
     }
 
     private static async Task<IResult> IssueChallenge(HttpContext context, PowService pow, RateLimiter limiter) {
@@ -63,9 +63,11 @@ public static class ApiEndpoints {
                 return Error(ServiceError.RateLimited(limit));
             }
         }
-        var challenge = await pow.IssueAsync();
+        var challenge = await pow.IssueAsync(client);
+        var p = challenge.Parameters;
         return Results.Json(
-            new PowChallengeResponse(B64(challenge.Challenge), challenge.Difficulty, challenge.ExpiresAt.ToUnixTimeSeconds()),
+            new PowChallengeResponse(ProofOfWork.Scheme, B64(challenge.Challenge), p.Difficulty, p.MemoryKiB, p.Iterations,
+                challenge.ExpiresAt.ToUnixTimeSeconds()),
             ApiJsonContext.Default.PowChallengeResponse);
     }
 

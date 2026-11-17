@@ -40,7 +40,9 @@ public static class RatePolicies {
         // Each contact, group joined and group removal costs a mailbox, plus a PoW each.
         [CreatePerIp] = new(30, 3600, 20),
         [CreatePerNetwork] = new(100, 3600, 50),
-        [CreateGlobal] = new(3000, 3600, 300),
+        // Only a resource cap (pending rows, verification pushes), well above real demand, so a flood can't easily lock
+        // everyone out. Floods are slowed by the per-address limits and the per-network PoW difficulty instead.
+        [CreateGlobal] = new(30000, 3600, 3000),
         [NewHostGlobal] = new(120, 3600, 30),
         [PowPerIp] = new(30, 60, 30),
         [PowPerNetwork] = new(300, 60, 100),

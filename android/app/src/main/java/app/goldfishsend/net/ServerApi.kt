@@ -32,7 +32,16 @@ data class ServerInfo(
 )
 
 @Serializable
-data class PowChallenge(val challenge: String, val difficulty: Int, val expiresAt: Long)
+data class PowChallenge(
+    val scheme: String,
+    val challenge: String,
+    val difficulty: Int,
+    val memoryKiB: Int,
+    val iterations: Int,
+    val expiresAt: Long,
+) {
+    val params get() = app.goldfishsend.proto.Pow.Params(difficulty, memoryKiB, iterations)
+}
 
 @Serializable
 data class PowSolution(val challenge: String, val nonce: String)

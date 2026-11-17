@@ -45,7 +45,9 @@ class LiveServerDeviceTest {
         assertEquals(key, api.identity())
         val info = api.info()
         assertEquals(2, info.protocol)
-        assertTrue(api.powChallenge().difficulty >= 0)
+        val ch = api.powChallenge()
+        assertEquals(app.goldfishsend.proto.Pow.SCHEME, ch.scheme)
+        assertNull(app.goldfishsend.proto.Pow.refusal(ch.params))
 
         val blob = Rand.bytes(600)
         val id = api.uploadInvite(blob, 600)

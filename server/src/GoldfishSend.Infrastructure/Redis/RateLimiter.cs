@@ -104,6 +104,12 @@ public sealed class RateLimiter {
         }
     }
 
+    /// <summary>
+    /// The daily-keyed HMAC of a subject, exactly as short-period buckets key it. For other short-lived per-subject state
+    /// in the ephemeral Redis (adaptive PoW load), which then can't be linked to addresses after the day either.
+    /// </summary>
+    public Task<string> DailySubjectKeyAsync(string purpose, ReadOnlyMemory<byte> subject) => HashSubjectAsync(purpose, subject);
+
     private async Task<string> HashSubjectAsync(string policyName, ReadOnlyMemory<byte> subject) {
         var day = DateTime.UtcNow.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
         if (!_dailyKeys.TryGetValue(day, out var key)) {

@@ -200,8 +200,8 @@ object GroupOutbox {
             throw e
         }
         val ch = api.powChallenge()
-        val nonce = Outbox.solvePow(ch.challenge, ch.difficulty)
-        call("${ch.challenge}.${B64.enc(nonce)}")
+        val nonce = Outbox.solvePow(ch)
+        call(Outbox.powHeader(ch, nonce))
     }
 
     /** A server without the batch endpoint: one request per item, with the same per-item results. */

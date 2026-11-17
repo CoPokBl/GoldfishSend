@@ -84,8 +84,8 @@ public sealed class MailboxService {
 
         // The proof of work is checked first: requests without one never touch the address budgets, so junk from a shared
         // address (Tor exit, CGNAT) can't lock everyone behind it out of creating mailboxes.
-        if (!await _pow.RedeemAsync(powChallenge, powNonce)) {
-            return ServiceError.PowInvalid;
+        if (ServiceError.FromPow(await _pow.RedeemAsync(powChallenge, powNonce, ct)) is { } powError) {
+            return powError;
         }
         foreach (var (policy, subject) in new[] {
                      (RatePolicies.CreateGlobal, "global"u8.ToArray()),
@@ -97,6 +97,8 @@ public sealed class MailboxService {
                 return ServiceError.RateLimited(limit);
             }
         }
+        // Raises this network's difficulty only. Server-wide load counts verified mailboxes (VerifyAsync).
+        await _pow.CountCreationAsync(client);
 
         var id = _crypto.MailboxId(sendSecret);
         var sealKey = _crypto.SealKey(sendSecret);
@@ -204,6 +206,9 @@ public sealed class MailboxService {
         if (!await _mailboxes.CompleteVerificationAsync(hashes, max, expiry, ct)) {
             return await OwnerFailureAsync(ServiceError.VerificationFailed, client);
         }
+        // New mailboxes (not rotations) drive the server-wide PoW load. Only a count goes to Redis, nothing about the mailbox
+        // or the client. The completion succeeds once per code, so a mailbox is counted once.
+        await _pow.CountVerifiedAsync(rows.Count(r => r.State == MailboxState.PendingVerification));
         await _signal.NotifyRetryAsync();
         // Verification makes every listed mailbox active again.
         return new MailboxStatus(expiry, EndpointGone: false);

@@ -19,11 +19,4 @@ public sealed class ClientInteropTests {
         Assert.Equal("630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
             Convert.ToHexStringLower(MailboxCrypto.OwnerHash(Secret)));
     }
-
-    [Fact]
-    public void Pow_FirstSolutionMatchesAndroidVector() {
-        var challenge = Enumerable.Repeat((byte)7, 32).ToArray();
-        var nonce = ProofOfWork.Solve(challenge, 12);
-        Assert.Equal("000000000000079d", Convert.ToHexStringLower(nonce)); // 1949, big-endian
-    }
 }

@@ -188,7 +188,7 @@ public sealed class BatchSendTests {
             var challengeResponse = await client.PostAsync("/v1/pow/challenge", null);
             var challengeJson = await challengeResponse.Content.ReadFromJsonAsync<JsonElement>();
             var challenge = Base64Url.DecodeFromChars(challengeJson.GetProperty("challenge").GetString());
-            var nonce = ProofOfWork.Solve(challenge, challengeJson.GetProperty("difficulty").GetInt32());
+            var nonce = ProofOfWork.Solve(challenge, GoldfishFixture.PowOf(challengeJson));
             var pow = $"{B64(challenge)}.{B64(nonce)}";
             var paid = await Results(await PostBatch(client, batch, pow));
             Assert.All(paid, r => Assert.Equal(202, r.GetProperty("status").GetInt32()));

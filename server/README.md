@@ -163,7 +163,7 @@ can reach, and compare the answers with independent references rather than with 
 | Tests | Input | Property |
 |---|---|---|
 | `GatewayFuzzTests` | Outer gateway requests (garbage, truncated, oversized, foreign key ids, bad P-256 points, bit flips), sealed responses, inner requests and responses, padding | Only an intact request opens, and every other one is `Malformed` or `UnknownKey` without an exception. The inner codec agrees with `SpecCodec`, a separate reading of docs/protocol.md, and whatever it accepts re-encodes to the same bytes. |
-| `CodecFuzzTests` | Batch send bodies, proof-of-work solutions, Web Push `p256dh`/`auth` and encryption, endpoint records, push envelopes | Each matches a re-implementation from the spec (the batch grammar, SHA-256 and leading zero bits, the P-256 curve equation with `BigInteger`). |
+| `CodecFuzzTests` | Batch send bodies, proof-of-work solutions and parameters, Web Push `p256dh`/`auth` and encryption, endpoint records, push envelopes | Each matches a re-implementation from the spec (the batch grammar, the PoW parameter bounds and leading zero bits as a `BigInteger`, the P-256 curve equation with `BigInteger`). The Argon2 output itself is pinned by `docs/test-vectors/pow-v2.json`, which the app checks too and which matches OpenSSL's Argon2id. |
 | `SsrfFuzzTests` | Push endpoint URLs (decimal, octal, hex and short IPv4, IDNA dots, fullwidth digits, IPv4-mapped, compatible, NAT64, 6to4, Teredo and ISATAP IPv6, zone ids, userinfo, backslashes, ports, special-use names), addresses, hostile DNS answers | A URL the validator accepts makes HttpClient connect only to a name that may be resolved, or to an address that `SsrfOracle` (the IANA special-purpose registries and glibc's `inet_aton`, written out separately) says is globally reachable. `IpRangeFilter` and the connect-time check allow only such addresses. |
 | `ApiFuzzTests` (integration) | Outer bodies, sealed inner requests with fuzzed paths, headers and bodies, and malformed JSON for every JSON endpoint, through the real pipeline | Outer answers are only the documented `400`/`413`/`421`. Every decrypted request gets an encrypted answer that decodes, with a JSON `{"error": …}` body, and never a `500`. |
 | `GatewayCodecVectorTests` | Writes `docs/test-vectors/gateway-codec-fuzz.json` | The app's `GatewayCodecFuzzVectorsTest` must reach the server's verdict on every case. |
@@ -194,7 +194,8 @@ arriving, and exits non-zero when a threshold is breached (`--help` lists them).
 The server under test must run in Development with `Goldfish__Push__DangerouslyAllowInsecureLoopback=true` (pushes go
 to `http://127.0.0.1`), on the same machine as the tool, with the limits in
 [`tools/LoadTest/server.env`](tools/LoadTest/server.env) relaxed: every simulated client shares one address and every
-simulated phone one push host. That file also lowers the PoW difficulty. **Use a separate (existing) database and
+simulated phone one push host. That file also makes the PoW tiny (test only: 8 calls of 256 KiB) and turns off its
+adaptive difficulty. **Use a separate (existing) database and
 separate Redis databases**, since the run leaves queue, rate-limit and idempotency state behind.
 
 Smoke run, as CI would do it (about a minute; 8 clients, 45 s, 50 ms think time, fails on more than 1% errors, more
@@ -283,12 +284,30 @@ All keys are base64url: 32 bytes each, except `ServerKey` (96). Generate a full 
 
 ### `Goldfish:Pow`
 
+Argon2id proof of work (`gf/pow/v2`, see docs/protocol.md). Solving costs about `2^difficulty` Argon2 calls of
+`MemoryKiB` each, and verifying costs one. Measured with BouncyCastle on an i9-9900K, one 16 MiB call (`t = 1`) takes
+about 30–45 ms in .NET (verification), 17 ms on the JVM, and 47 ms in an x86_64 Android emulator (ART, release-like
+build), or 18 ms per call on its 3 solver threads. A mid-range ARM phone should be about 2× slower per core, so roughly
+25–60 ms per call on 4 threads, and 64 calls at the base difficulty take about 1–3 s (median). That estimate comes from
+CPU benchmark ratios, not a phone, so treat it as good to about 2×.
+
 | Key | Default | Meaning |
 |---|---|---|
-| `BaseDifficulty` | `20` | Leading zero bits required for mailbox creation (and the IP-limit bypass on sends). |
-| `MaxExtraDifficulty` | `6` | Maximum bits added automatically under load. |
-| `ChallengeTtlSeconds` | `300` | Lifetime of a single-use challenge. |
-| `LoadThresholdPerMinute` | `120` | Server-wide mailbox creations per minute before difficulty starts rising (+1 bit per doubling). `0` disables the automatic increase. |
+| `BaseDifficulty` | `6` | Leading zero bits at no load, for mailbox creation and the send-limit bypass: 64 Argon2 calls. |
+| `MemoryKiB` | `16384` | Argon2 memory per call. The app runs up to 4 solver threads, so up to 4× this. 16 MiB is large enough that GPUs are held back by memory bandwidth, and small enough for low-memory phones. |
+| `Iterations` | `1` | Argon2 passes over the memory. Raising `MemoryKiB` buys more memory-hardness for the same time. |
+| `ChallengeTtlSeconds` | `300` | Lifetime of a single-use challenge. It must exceed the app's 180 s solve timeout. |
+| `LoadWindowMinutes` | `5` | How far back creations count toward load. |
+| `NetworkLoadThreshold` | `5` | Creations from one network (IPv4 /24, IPv6 /48) in the window before that network's difficulty rises: +1 bit when over it, +1 more per doubling. A household setting up a few phones stays at base. Counted for every creation that passes the rate limits, verified or not, since it only slows that network. `0` disables it. |
+| `MaxNetworkExtraDifficulty` | `6` | Bits a busy network can gain (64×, a minute or two on a phone). With the default `create-net` limit (burst 50) one network reaches about +4. |
+| `GlobalLoadThresholdPerMinute` | `120` | **Verified** mailboxes per minute, server-wide, before everyone's difficulty rises. Raising it this way needs real push endpoints and a round trip per mailbox. `0` disables it. |
+| `MaxGlobalExtraDifficulty` | `2` | Bits everyone can gain from server-wide load (4×). Kept small, so a flood spread over many networks can't make onboarding slow for everyone. |
+| `MaxConcurrentVerifications` | `0` | Argon2 verifications at once per process (`0`: one per CPU). Each takes about 30 ms of a core and `MemoryKiB` of memory. When all are busy, requests wait at most 250 ms, then get `503` with `Retry-After: 1`, and the challenge is kept for a retry. |
+
+The load counters are per-minute counts in the ephemeral Redis that expire after `LoadWindowMinutes` + 1. The
+per-network ones are keyed by the same daily HMAC as short-period rate-limit buckets. Neither refers to a mailbox. The
+startup check refuses parameters the app would refuse (difficulty over 20 at full load, `MemoryKiB` outside 8–65536,
+`Iterations` outside 1–4, or expected work over 2^14 calls of 16 MiB).
 
 ### `Goldfish:Push` (outbound requests to push servers)
 
@@ -365,14 +384,15 @@ allocation from multiplying its quota by rotating addresses.
 | `push-mailbox` | mailbox | 2 / 1 s, burst 10 | Outbound pushes per mailbox, in front of `push-host`, so a few mailboxes can't take a shared push service's budget |
 | `send-net` | client network | 600 / 60 s, burst 200 | Like `send-ip` (same per-batch cost), checked before it. A valid `GF-PoW` pays for either. |
 | `send-lookup-global` | whole server | 3000 / 1 s, burst 6000 | Every message (single or batched item) before the mailbox lookup. It caps how many token lookups reach MySQL. |
-| `create-global` | whole server | 3000 / 3600 s, burst 300 | `POST /v1/mailboxes` (after the PoW, fails closed) |
+| `create-global` | whole server | 30000 / 3600 s, burst 3000 | `POST /v1/mailboxes` (after the PoW, fails closed). A resource cap only, not the main defence: at most 30 000 rows an hour (unverified ones are purged after 10 minutes) and 8 verification pushes a second, against 2000 message pushes a second for `send-global`. It is about 6000 new users an hour with 5 mailboxes each. Filling it takes 300 networks at the `create-net` rate, each paying its own rising difficulty. |
 | `newhost-global` | whole server | 120 / 3600 s, burst 30 | Verification pushes to push hosts no mailbox has used in 30 days. It stops the server being used to POST to arbitrary sites. |
 | `owner-net` | client network | 300 / 60 s, burst 100 | Owner operations. Always charged. (`owner-ip` is only charged on **failed** ownership or verification, so junk from a shared address can't lock out real owners.) |
 | `invite-fetch-net` | client network | 300 / 60 s, burst 100 | `GET /v1/invites/{id}`, checked before `invite-fetch-ip` |
 
 Order: for every request, the widest scope (global, then network) is checked before the narrowest, so a request a
 wide limit refuses never creates narrow buckets. For mailbox creation, the proof of work is redeemed **before** any
-address budget is charged. Budgets with a period of an hour or more are keyed with a stable cluster secret (in
+address budget is charged: first a GETDEL of the challenge (so only challenges issued under `pow-ip` and `pow-net` ever
+cost an Argon2 call), then one Argon2 call in the `MaxConcurrentVerifications` pool. Budgets with a period of an hour or more are keyed with a stable cluster secret (in
 the ephemeral Redis) instead of the daily key, so the key rotation at UTC midnight doesn't reset them.
 
 Example: `Goldfish__RateLimits__send-ip__Limit=120`, `…__PeriodSeconds=60`, `…__Burst=40`.

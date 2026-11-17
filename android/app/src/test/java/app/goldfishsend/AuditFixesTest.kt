@@ -1,19 +1,15 @@
 package app.goldfishsend
 
 import app.goldfishsend.net.NetRules
-import app.goldfishsend.proto.Pow
 import app.goldfishsend.proto.PushEnvelope
 import app.goldfishsend.proto.Sanitize
 import app.goldfishsend.security.Presence
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assert.fail
 import org.junit.Test
 
 class SanitizeTest {
@@ -52,37 +48,6 @@ class SanitizeTest {
         assertEquals(60, Sanitize.effectiveTimer(0, 60))
         assertEquals(0, Sanitize.effectiveTimer(0, null))
         assertEquals(Sanitize.MAX_TIMER_SECS, Sanitize.effectiveTimer(0, Long.MAX_VALUE))
-    }
-}
-
-class PowClampTest {
-    @Test
-    fun absurdDifficultyIsRefusedImmediately() = runBlocking {
-        for (d in listOf(Pow.MAX_DIFFICULTY + 1, 64, 257, -1)) {
-            try {
-                Pow.solve(ByteArray(32), d)
-                fail("difficulty $d should be refused")
-            } catch (e: Pow.TooHardException) {
-                assertEquals(d, e.difficulty)
-            }
-        }
-    }
-
-    @Test
-    fun solverTimesOut() = runBlocking {
-        val start = System.currentTimeMillis()
-        try {
-            Pow.solve(ByteArray(32) { 9 }, Pow.MAX_DIFFICULTY, timeoutMs = 300)
-            fail("should time out")
-        } catch (e: TimeoutCancellationException) {
-            assertTrue("stopped promptly", System.currentTimeMillis() - start < 5_000)
-        }
-    }
-
-    @Test
-    fun easyChallengesStillSolve() = runBlocking {
-        val ch = ByteArray(32) { 3 }
-        assertTrue(Pow.check(ch, Pow.solve(ch, 10), 10))
     }
 }
 

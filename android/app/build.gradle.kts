@@ -240,6 +240,11 @@ tasks.withType<Test>().configureEach {
         (project.findProperty("gf.fuzz") as String?)?.takeIf { it.isNotBlank() }?.let { systemProperty("jazzer.max_duration", it) }
         outputs.upToDateWhen { false }
     }
+    // -Pgf.powBench: print Argon2id proof-of-work timings on this JVM (PowBenchmarkTest).
+    if (project.hasProperty("gf.powBench")) {
+        systemProperty("gf.powBench", "1")
+        outputs.upToDateWhen { false }
+    }
     // -Pgf.groupFuzz.minutes=10 (or .seeds, .start): a longer run of the random group scenarios (GroupStatefulTest).
     for (k in listOf("start", "seeds", "minutes", "replay")) {
         (project.findProperty("gf.groupFuzz.$k") as String?)?.let {

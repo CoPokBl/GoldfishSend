@@ -89,7 +89,11 @@ public sealed class GoldfishFixture : IAsyncLifetime {
             ["Goldfish__Network__GatewayRequestsPerSecond"] = "100000",
             ["Goldfish__Network__GatewayBurst"] = "100000",
             ["Goldfish__Push__DangerouslyAllowInsecureLoopback"] = "true",
-            ["Goldfish__Pow__BaseDifficulty"] = "8",
+            // Tiny Argon2 parameters keep test PoW to a few milliseconds. Production defaults are in PowOptions.
+            ["Goldfish__Pow__BaseDifficulty"] = "3",
+            ["Goldfish__Pow__MemoryKiB"] = "64",
+            // Every test client shares 127.0.0.1, so the per-network difficulty would climb across tests.
+            ["Goldfish__Pow__NetworkLoadThreshold"] = "0",
             ["Goldfish__Messages__MaxHeldPerMailbox"] = "3",
             // Small enough that the tarpit test can prove one slow host can't take every slot.
             ["Goldfish__Messages__DeliveryParallelism"] = "8",
@@ -210,8 +214,14 @@ public sealed class GoldfishFixture : IAsyncLifetime {
         response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
         var challenge = Base64Url.DecodeFromChars(json.GetProperty("challenge").GetString());
-        var nonce = ProofOfWork.Solve(challenge, json.GetProperty("difficulty").GetInt32());
-        return (challenge, nonce);
+        return (challenge, ProofOfWork.Solve(challenge, PowOf(json)));
+    }
+
+    /// <summary>The parameters of a <c>/v1/pow/challenge</c> response.</summary>
+    public static PowParameters PowOf(JsonElement issued) {
+        Assert.Equal(ProofOfWork.Scheme, issued.GetProperty("scheme").GetString());
+        return new PowParameters(issued.GetProperty("difficulty").GetInt32(), issued.GetProperty("memoryKiB").GetInt32(),
+            issued.GetProperty("iterations").GetInt32());
     }
 
     public sealed record Mailbox(byte[] SendSecret, byte[] OwnerSecret, FakeDevice Device) {
@@ -233,10 +243,10 @@ public sealed class GoldfishFixture : IAsyncLifetime {
     }
 
     /// <summary>Creates and verifies a mailbox, consuming the verification push.</summary>
-    public async Task<Mailbox> CreateActiveMailboxAsync(FakeDevice? device = null) {
+    public async Task<Mailbox> CreateActiveMailboxAsync(FakeDevice? device = null, HttpClient? client = null) {
         device ??= Push.NewDevice();
         var mailbox = new Mailbox(RandomNumberGenerator.GetBytes(32), RandomNumberGenerator.GetBytes(32), device);
-        var response = await RequestMailboxAsync(mailbox.SendSecret, mailbox.OwnerSecret, device);
+        var response = await RequestMailboxAsync(mailbox.SendSecret, mailbox.OwnerSecret, device, client: client);
         Assert.Equal(202, (int)response.StatusCode);
 
         var (type, tag, code) = await device.NextAsync();
