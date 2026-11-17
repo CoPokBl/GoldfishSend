@@ -157,16 +157,21 @@ For a received roster R, with current roster C:
 - **Checks.** A fact must verify under its `id` and be for this group.
 - **Which facts are kept.**
   - **Our roster lists the stint:** the fact counts at once. An acceptance's card is taken too.
-  - **About a newer stint than our roster reaches:** it's kept until the roster catches up, at most 2 per member.
+  - **About a newer stint than our roster reaches:** it's kept until the roster catches up, at most 2 per member and 40
+    in all (anyone can sign facts about identities they make up). When that's full, the ones nearest our roster stay.
   - **About a stint that's over:** it's ignored.
   - **Duplicates:** one fact of each kind per stint.
-- **An acceptance of a withdrawn invitation,** over 1:1 from its author: the owner answers once per head of its own,
-  over 1:1, with its chain from that invitation, which says how it ended.
+- **An acceptance our roster doesn't take,** from its author (the first was lost, or they sent it again, see
+  "Invitees"): taking it again changes nothing, so the owner answers instead, once per head of its own and at most once
+  every 10 minutes per invitee.
+  - **Already let in:** what the owner owes them is owed again, so they get its state.
+  - **The invitation is over** (withdrawn, or a newer one since): its chain from that invitation, which says how it
+    ended, over 1:1.
 - **An acceptance that reaches an inviter who has left.** The invitee only knows the inviter. They answer over 1:1,
-  at most once an hour, with their chain from the invitation, the facts they hold (which say who owns the group now)
-  and the new owner's card if they have it. The invitee then sends their acceptance on to the new owner. If nobody is
-  left to own the group, the answer says so. The same goes for an acceptance the inviter took in before leaving: what
-  they sent the newcomer since may have been lost.
+  at most once every 10 minutes, with their chain from the invitation, the facts they hold (which say who owns the
+  group now) and the new owner's card if they have it. The invitee then sends their acceptance on to the new owner. If
+  nobody is left to own the group, the answer says so. The same goes for an acceptance the inviter took in before
+  leaving: what they sent the newcomer since may have been lost.
 
 #### Heads
 Every `gtext`, `greceipt`, `gdelete` and `gstate` carries the sender's **head** `h`, inside the E2E payload:
@@ -220,10 +225,14 @@ or a head we know changes, for every active member of our view:
   whose chain starts after ours ends (they joined later). So does a message from someone our roster doesn't list,
   whose head is further on. Only an owner of ours can fill the gap, so what we owe it is owed again (at most once an
   hour); if it has left, its answer says who owns the group now.
-- **Senders our roster doesn't list.** The first message from someone our roster doesn't list yet (a newcomer, or an
-  owner who came after our roster) is read if its hint matches the identity in it (a PreKey message). A state is
-  merged, since it checks itself; anything else waits, like an early message, for a roster that lists them. The newest
-  8 such senders are remembered, so the rest of a chunked state is read too.
+- **Senders our roster doesn't list.** A message from someone our roster doesn't list yet (a newcomer, or an owner who
+  came after our roster) is read if its hint matches the identity in it (a PreKey message: we've never written to
+  them in this group, so all their messages are), or names someone we share a session with through another group.
+  - **Nothing is stored for them:** it's decrypted with a copy of the session state that's thrown away, so no session
+    or identity is kept (nor a shared one moved on) for someone who may never be a member.
+  - **Only from further on:** what they send counts only if its head is further on than our roster, where a roster
+    could list them. A state is merged, since it checks itself; anything else waits, like an early message, for a
+    roster that lists them.
 
 Besides members:
 - **Joined, not taken in yet:** we owe the owner our state (our acceptance in it), once per head of ours: through
@@ -244,16 +253,28 @@ member more than 150 versions behind gets the rest the next time they write, an 
 Invitees are outside delivery: they have no inbox in the group, and nobody but the owner owes them anything.
 - **An invitation** is a `gstate` with the roster that invites them, over the owner's 1:1 session.
 - **The acceptance** (with the card) and a **decline** go only to the inviter (the owner), over 1:1. Neither is sent
-  again if lost (expired, or sent to an owner who has left since, its inbox gone): they wait for the owner like
-  anything sent to them. An invitee whose acceptance was lost stays waiting to be let in, until they leave.
+  again by itself if lost (expired, or sent to an owner who has left since, its inbox gone): they wait for the owner
+  like anything sent to them.
+- **Send again.** While waiting to be let in, the user can send the acceptance again, with the card: to whoever owns
+  the group as far as they know, over 1:1 if that's a contact, else through their card. It's allowed 10 minutes after
+  the last thing they sent the owner, and only when the user asks: there's no automatic retry. The owner takes it like
+  the first, or answers it (see "Accepting a fact"), so whichever was lost, the acceptance or the answer, is made up
+  for.
 - **Being let in.** The owner's next roster admits them and carries their card. Then the owner owes them its state, like
   any member who has shown no head.
 - **A withdrawn invitation** goes to them once, over 1:1. If that's lost, they find out when they accept: the owner
-  answers (see "Accepting a fact"). If that answer is lost too, they stay waiting to be let in, until they leave.
+  answers (see "Accepting a fact"). If that answer is lost too, they find out when they send it again.
 - **A decline that reaches an inviter who has left** is answered like an acceptance. The invitee then sends it on to
   the owner that answer names, and to every member they can reach (that owner may have left too), once each.
 - **A pending member's acceptance** goes with their state: someone who accepted may be the only one to have heard that
   the inviter left, and so who owns the group now.
+- **What stays open.** These are accepted, since nothing is sent on its own:
+  - An invitation that's lost never shows up, so there's nothing to answer.
+  - A decline isn't confirmed, and isn't sent again: the invitee is out either way, and the owner lists them as invited
+    until it hears.
+  - Answers that say an invitation is over go only over 1:1. An invitee whose invitation was withdrawn by an owner
+    who isn't their contact keeps waiting, until they leave.
+  - Sending again needs a route: an owner who is a contact, or whose card the invitee holds.
 
 ## Message format
 
@@ -270,8 +291,8 @@ Each inbox uses its own hint key: a rotated inbox keeps its old one while it dra
   same sender.
 - **No match.** A blob with no matching member is dropped.
 - **Newcomers.** A PreKey message whose hint matches the identity inside it, but from someone who isn't a member yet,
-  is read (see "What's owed"): a state is merged, anything else is held for up to 7 days, waiting for a roster that
-  adds them. Then it's dropped.
+  is read without storing a session (see "What's owed"): a state from further on is merged, anything else from further
+  on is held for up to 7 days, waiting for a roster that adds them. Then it's dropped.
 - **Early messages.** Pushes aren't ordered, so a newcomer's first messages can arrive before their acceptance. A
   `gtext`, `greceipt` or `gdelete` from someone the view still lists as `invited` is kept, already decrypted, in the
   encrypted database, for at most 7 days. It's replayed once the view makes them a member.

@@ -115,7 +115,11 @@ server.
 - **Members** see each other's identity keys, self-chosen names and group inboxes (each member's own server and a
   `sendSecret` only for that group). Members who aren't your contacts are marked unverified; you can compare safety
   numbers with each of them. A member can do what any contact can: keep what's said, and send junk to your group inbox
-  (dropped unless it decrypts from a current member).
+  (dropped unless it decrypts from a current member). Anyone holding your inbox's hint key (current members, and past
+  ones while the old inbox drains) can also write as identities they make up, since a newcomer's first message is
+  read before a roster lists them. That stores no session or identity, counts only if it claims to be from further on
+  than your roster, and leaves at most what's bounded anyway: held messages (200 per group, 7 days), chunks, and 40
+  facts about stints your roster doesn't reach.
 - **The owner** decides membership, and is trusted to. A malicious owner can:
   - add anyone, including someone impersonating a person (an identity key the owner vouches for);
   - remove people, or rename the group;
@@ -149,8 +153,9 @@ server.
     sent again only once someone writes. A member whose copy of a departure was lost, and whom nobody who holds it
     can reach, goes on taking the leaver's messages (the leaver still has their sessions) until they hear.
   - **Invitees** are reached over 1:1 only, by the owner. An acceptance, a decline or a withdrawn invitation that's
-    lost isn't sent again: the invitee learns how things stand when they act (the owner answers an acceptance), and
-    the owner when the invitee writes to them again.
+    lost isn't sent again by itself: the invitee learns how things stand when they act (the owner answers an
+    acceptance, and a waiting invitee can send theirs again, at most every 10 minutes), and the owner when the invitee
+    writes to them again.
   - **A lost owner.** If the owner loses their phone (rather than leaving), membership can't change any more. Members
     can still talk, accept, decline and leave.
 
