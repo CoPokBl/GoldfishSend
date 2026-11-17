@@ -27,7 +27,7 @@ import org.signal.libsignal.protocol.state.SignedPreKeyRecord
 
 class InviteException(val human: String) : Exception(human)
 
-/** Contact exchange through one-time invite blobs (protocol.md "Invite QR / link"). */
+/** Contact exchange through one-time invite blobs (docs/protocol.md, "Invite QR code / link"). */
 object Invites {
     const val QR_TTL_SECS = 15 * 60L
     const val LINK_TTL_SECS = 24 * 3600L

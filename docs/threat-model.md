@@ -20,7 +20,7 @@ When the code and this document disagree, that's a bug in one of them.
 
 ## What we protect
 
-1. **Message content** and attachments-to-be, including names and the contact list.
+1. **Message content**, display names and the contact list.
 2. **The social graph:** who is in contact with whom.
 3. **Identity and location:** which phone, which IP and which push account a mailbox belongs to.
 4. **History:** what was said in the past, after keys or devices are compromised (forward secrecy) and after deletion.

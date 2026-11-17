@@ -182,7 +182,8 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 - The DB key is `HMAC(MK, "gf/db-key/v1")`, used as a raw SQLCipher key.
 
 **Storage**
-- SQLCipher has `secure_delete` and `cipher_memory_security` on.
+- SQLCipher runs with `secure_delete` and `cipher_memory_security` on, `journal_mode = DELETE` (no long-lived WAL)
+  and `temp_store = MEMORY`, plus an idle `VACUUM` after bulk deletes.
 - Each message body is encrypted with its own key, wrapped by a message root key. The root key is in turn wrapped by a separate Keystore key (`gf_msg`).
 - Deleting a message deletes its key first. Deleting `gf_msg` makes every message unreadable instantly, even while the app is locked. That's how *Erase messages on restart* works: it runs from `BOOT_COMPLETED` and also when `Settings.Global.BOOT_COUNT` changes at app start.
 
@@ -204,7 +205,13 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 - **Onion servers**: `http://<v3>.onion` server URLs are accepted (the v3 address and its checksum are validated).
   Plain http is allowed only to onion hosts (network security config plus the route check), and only through Tor or
   Orbot. If a contact's server is an onion and Tor is off, the user is asked to turn Tor on. Nothing is sent directly.
-- **Pin server keys** (off by default, because servers legitimately rotate keys): trust on first use of the SHA-256
+- **Server identity** (always on): every request is encrypted to the server's identity key
+  ([`../docs/protocol.md`](../docs/protocol.md#encrypted-transport-and-server-identity)), whose fingerprint is pinned:
+  built in for the default server, from the invite for a contact's server, and on first use for a server typed in by
+  hand. If our own server's key changes, nothing is sent to it until the user re-authenticates and trusts the new
+  identity ("Your server's identity changed", also a critical Security tab finding). A contact's server that presents
+  a different key fails closed too: sends to it wait.
+- **Pin server keys** (an extra layer, off by default, because servers legitimately rotate TLS keys): trust on first use of the SHA-256
   SPKI of each server's leaf certificate, checked in an OkHttp network interceptor before any request bytes are
   written. A change fails closed and shows "This server's identity changed", with the old and new fingerprints and
   **Keep blocked** or **Trust new key** (confirmed a second time). It never auto-accepts. Onion servers are skipped,
@@ -220,21 +227,6 @@ Contacts added by scanning in person are marked **verified**. Contacts added by 
 Findings can be **dismissed** if there's a legitimate reason to leave them as they are, for example root, an unlocked bootloader, accessibility services, USB debugging, a Google push service or a closed-source keyboard a language needs. Dismissed findings stop counting toward the score, and a Restore option keeps them visible. They come back if the situation changes. Findings with no safe justification can't be dismissed: no screen lock, a non-HTTPS server, unencrypted storage, push not working, a cloud keyboard, patches over 180 days old, and an unsupported Android version (`security/AuditRules.kt`).
 
 The audit adds **no extra permissions**. Checks that would need one, such as listing apps that can draw over other apps (which needs `QUERY_ALL_PACKAGES`), are deliberately left out.
-
-## Known gaps / TODO
-- **No attachments or multi-device.** Messages are text; long ones are chunked. One install is one identity.
-- **Key pinning is opt-in and trust-on-first-use.** A first connection that's already intercepted gets pinned.
-  Compare the fingerprint with the operator's.
-- **Built-in Tor adds about 8 MB per ABI** (`libtor.so`) to the APK, and isn't yet exercised on a device by the tests.
-- **Requests over Tor can be linked by the server**, just like requests from one IP: connections are reused across a
-  device's mailboxes on the same server.
-- **Changing server needs an empty contact list.** Mailboxes don't record which server they live on, so you must remove your contacts before switching.
-- **Locked inbox needs one unlock first.** The inbox key pair is created on first unlock, so a push that arrives before the app has ever been unlocked is dropped.
-- **Key material can't always be wiped from memory.** Text you type in fields passes through `EditText` and `String`, which the JVM can't reliably zero. Raw key arrays are zeroed.
-- **Push delivery isn't covered by the automated tests.** The device tests carry messages between profiles
-  themselves, and the baseline-profile journeys drive the UI against an unreachable server. Delivery through a real
-  server and UnifiedPush distributor is tested by hand.
-
 
 ## Optional security features
 
@@ -264,4 +256,16 @@ All of these live in **Settings**. Only those with no real downside are on by de
 - **Restart wipe** also clears pushes waiting in the locked inbox and replaces its key.
 - **The Security tab** uses hardware key attestation for boot and bootloader state where available. It's checked on the device itself, without a server-side chain check, but it's far harder to spoof than system properties.
 
-Database storage: SQLCipher with `journal_mode = DELETE`, `temp_store = MEMORY`, `secure_delete` and `cipher_memory_security`, plus an idle `VACUUM` after bulk deletes.
+## Known gaps
+- **No attachments or multi-device.** Messages are text; long ones are chunked. One install is one identity.
+- **A server typed in by hand is trusted on first use**, for its identity key and, if turned on, its TLS key. A first
+  connection that's already intercepted gets pinned. Compare the fingerprint with the operator's.
+- **Built-in Tor adds about 8 MB per ABI** (`libtor.so`) to the APK, and isn't yet exercised on a device by the tests.
+- **Requests over Tor can be linked by the server**, just like requests from one IP: connections are reused across a
+  device's mailboxes on the same server.
+- **Changing server needs an empty contact list.** Mailboxes don't record which server they live on, so you must remove your contacts before switching.
+- **Locked inbox needs one unlock first.** The inbox key pair is created on first unlock, so a push that arrives before the app has ever been unlocked is dropped.
+- **Key material can't always be wiped from memory.** Text you type in fields passes through `EditText` and `String`, which the JVM can't reliably zero. Raw key arrays are zeroed.
+- **Push delivery isn't covered by the automated tests.** The device tests carry messages between profiles
+  themselves, and the baseline-profile journeys drive the UI against an unreachable server. Delivery through a real
+  server and UnifiedPush distributor is tested by hand.
