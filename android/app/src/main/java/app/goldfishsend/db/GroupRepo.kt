@@ -149,6 +149,10 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
 
     override fun dropHeld(id: Long) = db.exec("DELETE FROM group_held WHERE id = ?", id)
 
+    override fun membersElsewhere(gid: String): Collection<String> = db.query(
+        "SELECT DISTINCT member FROM group_cards WHERE gone = 0 AND cid != (SELECT cid FROM groups WHERE gid = ?)", gid,
+    ) { it.getString(0) }
+
     fun cidOf(gid: String): Long? = db.queryOne("SELECT cid FROM groups WHERE gid = ?", gid) { it.getLong(0) }
 
     private fun trustedRoster(bytes: ByteArray, sig: ByteArray): SignedRoster? =

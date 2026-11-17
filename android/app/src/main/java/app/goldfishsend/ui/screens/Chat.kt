@@ -453,7 +453,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                 )
                 // Joined, but not taken in yet.
                 else -> if (g != null && !g.admitted) {
-                    Banner("Waiting for the group's owner to let you in. You can send messages once they have.")
+                    WaitingToBeLetIn(s, contactId, g.sendAgainAt)
                 } else Composer(draft) { text ->
                     followSent = true
                     dividerCleared = true
@@ -605,6 +605,60 @@ private fun WaitingBar(s: Session, contactId: Long) {
     }
 }
 
+/**
+ * Joined a group, and waiting for its owner to let us in. Our request (or the owner's answer) may have been lost, and
+ * nothing sends it again by itself: the user can, at most once every few minutes ([sendAgainAt]).
+ */
+@Composable
+private fun WaitingToBeLetIn(s: Session, contactId: Long, sendAgainAt: Long?) {
+    val work = rememberWork()
+    var failed by remember { mutableStateOf(false) }
+    val now by rememberTicker(sendAgainAt != null, periodMs = 10_000)
+    val wait = (sendAgainAt ?: 0) - now
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 2.dp)) {
+            Text(
+                "Waiting for the group's owner to let you in. You can send messages once they have.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(end = 8.dp),
+            )
+            if (sendAgainAt != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        when {
+                            failed -> "Couldn't send your request. Try again later."
+                            wait > 0 -> "Request sent. You can send it again in ${minutesText(wait)}."
+                            else -> "Still waiting? Send your request again."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    ProgressButton(
+                        onClick = {
+                            work.run {
+                                failed = !withContext(Dispatchers.IO) {
+                                    runCatching { app.goldfishsend.core.Groups.sendAgain(s, contactId) }.getOrDefault(false)
+                                }
+                            }
+                        },
+                        busy = work.busy,
+                        enabled = wait <= 0,
+                        kind = ButtonKind.TEXT,
+                    ) { Text("Send again") }
+                }
+            }
+        }
+    }
+}
+
+/** A wait in whole minutes, rounded up: "a minute", "4 minutes". */
+private fun minutesText(ms: Long): String {
+    val mins = (ms + 59_999) / 60_000
+    return if (mins <= 1) "a minute" else "$mins minutes"
+}
+
 /** Whether the phone has a network right now (ACCESS_NETWORK_STATE comes with WorkManager). */
 @Composable
 private fun rememberOnline(): Boolean {
@@ -662,7 +716,16 @@ private fun SystemChip(text: String, modifier: Modifier) {
 }
 
 /** A group as the chat screen needs it: our state, who invited us, member names and whether we may edit its info. */
-private class ChatGroup(val state: Int, val inviter: String, val names: Map<String, String>, val canEdit: Boolean, val subtitle: String, val admitted: Boolean)
+private class ChatGroup(
+    val state: Int,
+    val inviter: String,
+    val names: Map<String, String>,
+    val canEdit: Boolean,
+    val subtitle: String,
+    val admitted: Boolean,
+    /** Waiting to be let in: when "Send again" is allowed (null: nothing to send again). */
+    val sendAgainAt: Long?,
+)
 
 private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val m = app.goldfishsend.core.Groups.model(s, cid) ?: return null
@@ -675,7 +738,10 @@ private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val active = r.members.count { it.role != app.goldfishsend.proto.Role.INVITED }
     val invited = r.members.size - active
     val count = "$active ${if (active == 1) "member" else "members"}" + if (invited > 0) ", $invited invited" else ""
-    return ChatGroup(m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), count, app.goldfishsend.group.GroupEngine.admitted(m, me))
+    return ChatGroup(
+        m.state, inviter, names, app.goldfishsend.core.Groups.canEditInfo(m, me), count, app.goldfishsend.group.GroupEngine.admitted(m, me),
+        app.goldfishsend.group.GroupEngine.sendAgainAt(m, me),
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)

@@ -147,6 +147,20 @@ object Groups {
         Outbox.kick()
     }
 
+    /**
+     * "Send again" while waiting to be let in: our acceptance goes to the owner once more ([GroupEngine.sendAgain]).
+     * Returns false if it couldn't go (too soon, or no way to reach the owner).
+     */
+    suspend fun sendAgain(s: Session, cid: Long): Boolean {
+        val ok = withEngine(s) { e ->
+            val m = model(s, cid) ?: return@withEngine false
+            e.sendAgain(m)
+        }
+        s.db.notifyChanged()
+        Outbox.kick()
+        return ok
+    }
+
     /** Declines an invitation, or leaves. An owner who leaves hands the group to the next member ([heir]). */
     suspend fun leave(s: Session, cid: Long) {
         withEngine(s) { e ->
@@ -341,11 +355,14 @@ object Groups {
         Outbox.kick()
     }
 
-    /** Drops the shared session with each of [members] that isn't in any group any more. Call under the session lock. */
+    /**
+     * Drops the shared session, and the identity key libsignal stored with it, for each of [members] who isn't in any
+     * group any more. Call under the session lock.
+     */
     fun forgetSessions(s: Session, members: Collection<String>) {
         for (member in members.toSet()) {
             if (s.repo.groupsWithMember(member) == 0L) {
-                s.signal.deleteSession(GroupCrypto.address(member))
+                s.signal.forget(GroupCrypto.address(member))
             }
         }
     }

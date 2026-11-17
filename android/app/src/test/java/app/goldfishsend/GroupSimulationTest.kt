@@ -1,5 +1,6 @@
 package app.goldfishsend
 
+import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupEvent
 import app.goldfishsend.group.GroupModel
 import app.goldfishsend.proto.B64
@@ -340,5 +341,283 @@ class GroupSimulationTest {
         assertConverged(alice, bob, carol)
         assertEquals("Trip 119", bob.view(gid).name)
         assertTrue(texts(alice).contains("still here"))
+    }
+
+    // ---------- "Send again" while waiting to be let in ----------
+
+    private fun waiting(p: Peer) = !GroupEngine.admitted(p.model(gid), p.id) && p.model(gid).state == GroupModel.JOINED
+
+    /** Bob's acceptance is lost on its way to Alice. Nothing sends it again, until Bob taps "Send again". */
+    @Test
+    fun aLostAcceptanceGoesAgainWhenTheUserAsks() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        alice.create(gid, "Trip", bob)
+        net.deliverAll()
+        bob.join(gid)
+        net.filter = { e -> e.from() != bob }
+        net.deliverAll()
+        net.filter = { true }
+        assertTrue(waiting(bob))
+        assertEquals(Role.INVITED, alice.view(gid).role(bob.id))
+        // Nothing goes by itself, however long Bob waits.
+        now += 7 * 86_400_000L
+        net.deliverAll()
+        assertTrue(waiting(bob))
+        // Tapped: it goes, and then not again for a while.
+        val at = GroupEngine.sendAgainAt(bob.model(gid), bob.id)!!
+        assertTrue(at <= now)
+        assertTrue(bob.engine.sendAgain(bob.model(gid)))
+        assertEquals(now + GroupEngine.SEND_AGAIN_AFTER, GroupEngine.sendAgainAt(bob.model(gid), bob.id))
+        assertFalse(bob.engine.sendAgain(bob.model(gid)))
+        net.deliverAll()
+        assertFalse(waiting(bob))
+        assertEquals(null, GroupEngine.sendAgainAt(bob.model(gid), bob.id))
+        assertConverged(alice, bob)
+        alice.say(gid, "welcome")
+        bob.say(gid, "thanks")
+        net.deliverAll()
+        assertEquals(listOf("welcome"), texts(bob))
+        assertEquals(listOf("thanks"), texts(alice))
+    }
+
+    /**
+     * Alice takes Bob in, but what she sends him is lost. A copy of his acceptance arriving again changes nothing for her;
+     * his "Send again" gets her state, once enough time has passed since she last sent him anything.
+     */
+    @Test
+    fun aLostAdmissionIsAnsweredWhenTheUserSendsAgain() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        alice.create(gid, "Trip", bob)
+        net.deliverAll()
+        bob.join(gid)
+        val acceptance = net.queue.toList()
+        net.filter = { e -> e.to() != bob }
+        net.deliverAll()
+        net.filter = { true }
+        assertEquals(Role.MEMBER, alice.view(gid).role(bob.id))
+        assertTrue(waiting(bob))
+        val ver = alice.roster(gid).roster.ver
+        // A late copy of the acceptance: nothing changes, and nothing is sent.
+        net.queue.addAll(acceptance)
+        net.deliverAll()
+        assertEquals(ver, alice.roster(gid).roster.ver)
+        assertTrue(waiting(bob))
+        now += GroupEngine.SEND_AGAIN_AFTER
+        assertTrue(bob.engine.sendAgain(bob.model(gid)))
+        net.deliverAll()
+        assertEquals(ver, alice.roster(gid).roster.ver)
+        assertFalse(waiting(bob))
+        assertConverged(alice, bob)
+        bob.say(gid, "made it")
+        net.deliverAll()
+        assertEquals(listOf("made it"), texts(alice))
+    }
+
+    /** Alice withdrew Bob's invitation; that, and her answer to his acceptance, were lost. "Send again" tells him. */
+    @Test
+    fun aWithdrawnInvitationIsAnsweredWhenTheUserSendsAgain() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        alice.create(gid, "Trip", bob, carol)
+        net.deliverAll()
+        net.filter = { e -> e.to() != bob }
+        alice.publish(gid, RosterOp.Remove(listOf(bob.id)))
+        net.deliverAll()
+        bob.join(gid)
+        net.deliverAll()
+        net.filter = { true }
+        assertTrue(waiting(bob))
+        now += GroupEngine.SEND_AGAIN_AFTER
+        assertTrue(bob.engine.sendAgain(bob.model(gid)))
+        net.deliverAll()
+        assertEquals(GroupModel.REMOVED, bob.model(gid).state)
+        assertEquals(null, alice.view(gid).role(bob.id))
+    }
+
+    /**
+     * Bob's acceptance was lost, then Alice left and Carol owns the group. Bob doesn't know: "Send again" goes to Alice,
+     * who tells him who owns it now, and he sends it on to Carol, who lets him in.
+     */
+    @Test
+    fun sendAgainFindsTheOwnerAfterTheInviterLeft() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        alice.create(gid, "Trip", bob, carol)
+        net.deliverAll()
+        carol.join(gid)
+        net.deliverAll()
+        bob.join(gid)
+        net.filter = { e -> e.from() != bob }
+        net.deliverAll()
+        net.filter = { true }
+        alice.leave(gid)
+        net.deliverAll()
+        assertEquals(carol.id, carol.view(gid).owner)
+        assertEquals(alice.id, bob.view(gid).owner)
+        now += GroupEngine.SEND_AGAIN_AFTER
+        assertTrue(bob.engine.sendAgain(bob.model(gid)))
+        net.deliverAll()
+        assertFalse(waiting(bob))
+        assertConverged(bob, carol)
+        assertEquals(Role.MEMBER, carol.view(gid).role(bob.id))
+        bob.say(gid, "hi carol")
+        net.deliverAll()
+        assertEquals(listOf("hi carol"), texts(carol))
+    }
+
+    // ---------- senders our roster doesn't list ----------
+
+    /**
+     * Dave joined after Bob's roster, and Bob's admission was lost; Alice left, so Dave owns the group, and Bob can only
+     * hear from him. Dave's state is read although Bob's roster doesn't list him, and leaves nothing behind but what it
+     * says: no session or identity is stored for him until a roster lists him.
+     */
+    @Test
+    fun aFirstStateFromAnOwnerOurRosterDoesNotListIsRead() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        alice.create(gid, "Trip", bob)
+        net.deliverAll()
+        bob.join(gid)
+        net.filter = { e -> e.to() != bob }
+        net.deliverAll()
+        alice.publish(gid, RosterOp.Add(listOf(dave.id)))
+        net.deliverAll()
+        dave.join(gid)
+        net.deliverAll()
+        alice.publish(gid, RosterOp.MakeOwner(dave.id))
+        net.deliverAll()
+        alice.leave(gid)
+        net.deliverAll()
+        net.filter = { true }
+        assertEquals(1L, bob.roster(gid).roster.ver)
+        assertEquals(dave.id, dave.view(gid).owner)
+        val daveAddr = app.goldfishsend.proto.GroupCrypto.address(dave.id).name
+        // Dave, the owner now, owes Bob his state (he has Bob's card from the roster that let him in): his next head goes.
+        now += GroupEngine.RESEND_AFTER
+        dave.engine.updateCard(dave.model(gid), dave.card(gid, dave.model(gid).myCard!!.card.seq + 1, dave.model(gid).myCard!!.card.bundle))
+        val first = net.queue.filter { it.to() == bob }
+        assertTrue(first.isNotEmpty())
+        net.queue.removeAll(first.toSet())
+        first.forEach { net.deliver(it) }
+        // Read, though nothing in it connects to Bob's roster yet; and nothing stored for Dave.
+        assertEquals(1L, bob.roster(gid).roster.ver)
+        assertFalse(daveAddr in bob.signal.written)
+        net.deliverAll()
+        assertConverged(bob, dave)
+        assertFalse(waiting(bob))
+        dave.say(gid, "hello bob")
+        bob.say(gid, "hello dave")
+        net.deliverAll()
+        assertEquals(listOf("hello bob"), texts(bob))
+        assertEquals(listOf("hello dave"), texts(dave))
+    }
+
+    /**
+     * The same, but Bob and Dave already talk in another group: their shared session is past the PreKey stage, so Dave's
+     * messages don't say who they're from. The hint names someone Bob knows from there, and the message is read with that
+     * session without moving it on.
+     */
+    @Test
+    fun aFirstStateOverASessionFromAnotherGroupIsRead() {
+        var now = 1_700_000_000_000L
+        net.clock = { now }
+        val other = B64.enc(Rand.bytes(32))
+        alice.create(other, "Other", bob, dave)
+        net.deliverAll()
+        bob.join(other)
+        net.deliverAll()
+        dave.join(other)
+        net.deliverAll()
+        bob.say(other, "hi dave")
+        net.deliverAll()
+        dave.say(other, "hi bob")
+        net.deliverAll()
+        val daveAddr = app.goldfishsend.proto.GroupCrypto.address(dave.id)
+        val session = bob.signal.loadSession(daveAddr).serialize()
+
+        alice.create(gid, "Trip", bob)
+        net.deliverAll()
+        bob.join(gid)
+        net.filter = { e -> !(e.to() == bob && e.groupOf() == gid) }
+        net.deliverAll()
+        alice.publish(gid, RosterOp.Add(listOf(dave.id)))
+        net.deliverAll()
+        dave.join(gid)
+        net.deliverAll()
+        alice.publish(gid, RosterOp.MakeOwner(dave.id))
+        net.deliverAll()
+        alice.leave(gid)
+        net.deliverAll()
+        net.filter = { true }
+        assertEquals(1L, bob.roster(gid).roster.ver)
+        now += GroupEngine.RESEND_AFTER
+        dave.engine.updateCard(dave.model(gid), dave.card(gid, dave.model(gid).myCard!!.card.seq + 1, dave.model(gid).myCard!!.card.bundle))
+        val first = net.queue.filter { it.to() == bob }
+        assertTrue(first.isNotEmpty())
+        net.queue.removeAll(first.toSet())
+        first.forEach { net.deliver(it) }
+        // Read with the session from the other group, which is left as it was.
+        assertTrue(bob.signal.loadSession(daveAddr).serialize().contentEquals(session))
+        net.deliverAll()
+        assertConverged(bob, dave)
+        assertFalse(waiting(bob))
+        dave.say(gid, "hello bob")
+        bob.say(other, "still here")
+        net.deliverAll()
+        assertEquals(listOf("hello bob"), texts(bob))
+        assertTrue(dave.texts.any { it.first == other && it.third == "still here" })
+    }
+
+    /** Which group an envelope belongs to, as far as the test can tell (inboxes are per group; 1:1 content says). */
+    private fun GroupNet.Envelope.groupOf(): String? = when (this) {
+        is GroupNet.Envelope.ToInbox -> to.inboxes.entries.firstOrNull { sendSecret in it.value }?.key
+        is GroupNet.Envelope.Direct -> content.groupId
+    }
+
+    /**
+     * Mallory, a member, holds Bob's hint key (it's in his card). She makes up identities and writes to Bob as each: facts
+     * about stints far ahead, texts and states from "further on". Bob stores no session or identity for any of them,
+     * keeps only a few of their facts, and holds their texts only within the usual bounds.
+     */
+    @Test
+    fun madeUpSendersWithOurHintKeyLeaveLittleBehind() {
+        val mallory = net.peer("mallory")
+        alice.befriend(mallory)
+        alice.create(gid, "Trip", bob, mallory)
+        net.deliverAll()
+        bob.join(gid)
+        net.deliverAll()
+        mallory.join(gid)
+        net.deliverAll()
+        val bobCard = mallory.model(gid).cards.getValue(bob.id).card
+        val ver = bob.roster(gid).roster.ver
+        val ahead = app.goldfishsend.proto.Head(ver + 1, "x", "y")
+        val fakes = List(60) { Peer("fake$it", net) }
+        for ((i, f) in fakes.withIndex()) {
+            val fact = app.goldfishsend.proto.GroupCrypto.signFact(
+                f.identity.privateKey,
+                app.goldfishsend.proto.Fact(g = gid, kind = app.goldfishsend.proto.FactKind.ACCEPT, id = f.id, since = 1_000_000L + i, ts = 1),
+            )
+            f.sendWithCard(bobCard, factState(fact, ahead))
+            f.sendWithCard(bobCard, Content.GText(gid, "t$i", "from fake $i", 1, h = ahead))
+        }
+        // From where Bob is: nothing for him, not even held.
+        val late = Peer("late", net)
+        late.sendWithCard(bobCard, Content.GText(gid, "late", "from nowhere", 1, h = bob.engine.head(bob.model(gid))))
+        net.deliverAll()
+        val m = bob.model(gid)
+        val fakeAddrs = (fakes + late).map { app.goldfishsend.proto.GroupCrypto.address(it.id).name }.toSet()
+        assertTrue(bob.signal.written.none { it in fakeAddrs })
+        assertTrue(m.facts.count { f -> fakes.any { it.id == f.fact.id } } <= GroupEngine.MAX_AHEAD_ALL)
+        assertEquals(60, bob.store.held(gid).size)
+        assertTrue(texts(bob).isEmpty())
+        assertEquals(ver, bob.roster(gid).roster.ver)
+        // The group still works.
+        alice.say(gid, "still fine")
+        net.deliverAll()
+        assertEquals(listOf("still fine"), texts(bob))
     }
 }
