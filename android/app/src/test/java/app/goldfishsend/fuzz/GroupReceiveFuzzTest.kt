@@ -12,6 +12,7 @@ import app.goldfishsend.group.GroupEvent
 import app.goldfishsend.group.GroupIo
 import app.goldfishsend.group.GroupModel
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.CardBundle
 import app.goldfishsend.proto.CardInbox
 import app.goldfishsend.proto.Chunker
@@ -58,7 +59,11 @@ class GroupReceiveFuzzTest {
             val action = data.consumeInt(0, 7)
             GroupEngine.debugLog?.invoke("action $action")
             when (action) {
-                0 -> bob.engine.receive(W.gid, W.bobHint, data.consumeBytes(600))
+                // Raw bytes, or anything a member (who can wrap for Bob's inbox) puts inside the wrapping.
+                0 -> data.consumeBytes(600).let { raw ->
+                    val wrapped = if (raw.isNotEmpty() && data.consumeBoolean()) BlobWrap.seal(BlobWrap.groupKey(W.bobHint), raw) else raw
+                    bob.engine.receive(W.gid, W.bobHint, wrapped)
+                }
                 1 -> bob.fromMallory(content(data))
                 2 -> bob.engine.onDirect(W.id(W.mallory), content(data))
                 3 -> bob.claimingOther(data, content(data))
@@ -287,7 +292,7 @@ class GroupReceiveFuzzTest {
             val b = store(bob)
             val me = GroupEngine(MemoryGroupStore(), m, mallory, NullIo)
             val blob = me.encryptTo(id(bob), bobCard.card, Content.GState("x", app.goldfishsend.NO_HEAD).encode())
-            val raw = GroupBlob.decode(blob)!!
+            val raw = app.goldfishsend.openGroupBlob(B64.dec(bobCard.card.hintKey), blob)
             org.signal.libsignal.protocol.SessionCipher(b, GroupEngine.LOCAL, GroupCrypto.address(id(mallory)))
                 .decrypt(org.signal.libsignal.protocol.message.PreKeySignalMessage(raw.body))
             malloryToBob = m.loadSession(GroupCrypto.address(id(bob))).serialize()
@@ -371,10 +376,10 @@ class GroupReceiveFuzzTest {
 
         /** Mallory's session, but the sender hint names someone else. */
         fun claimingOther(data: FuzzedDataProvider, c: Content) {
-            val blob = GroupBlob.decode(malloryEngine.encryptTo(W.id(W.bob), W.bobCard.card, c.encode().take(1900).toByteArray()))!!
+            val blob = app.goldfishsend.openGroupBlob(W.bobHint, malloryEngine.encryptTo(W.id(W.bob), W.bobCard.card, c.encode().take(1900).toByteArray()))
             val other = W.all[data.consumeInt(0, W.all.size - 1)]
             val mac = GroupCrypto.hint(W.bobHint, blob.nonce, other.publicKey.serialize())
-            engine.receive(W.gid, W.bobHint, GroupBlob(blob.type, blob.nonce, mac, blob.body).encode())
+            engine.receive(W.gid, W.bobHint, app.goldfishsend.wrapGroupBlob(W.bobHint, GroupBlob(blob.type, blob.nonce, mac, blob.body)))
         }
 
         /** Sam isn't in the group but has Bob's card. */

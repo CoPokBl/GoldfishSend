@@ -50,7 +50,10 @@ sealed class PushEnvelope(val tag: ByteArray) {
     }
 }
 
-/** E2E blob: 1 byte libsignal CiphertextMessage type, then the serialized ciphertext. */
+/**
+ * A 1:1 blob inside its wrapping ([BlobWrap]): 1 byte libsignal CiphertextMessage type, then the serialized ciphertext.
+ * The server only ever sees it wrapped.
+ */
 class E2eBlob(val type: Int, val body: ByteArray) {
     fun encode(): ByteArray = byteArrayOf(type.toByte()) + body
 
@@ -58,7 +61,7 @@ class E2eBlob(val type: Int, val body: ByteArray) {
         const val PREKEY = 3
         const val WHISPER = 2
 
-        /** protocol.md: maxMessageBytes */
+        /** protocol.md: maxMessageBytes, the largest wrapped blob the server takes. */
         const val MAX_BYTES = 3983
 
         fun decode(bytes: ByteArray): E2eBlob? {

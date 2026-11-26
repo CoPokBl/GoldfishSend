@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 8
+    const val VERSION = 9
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -229,9 +229,36 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 9) {
+                for (s in V9) {
+                    db.exec(s)
+                }
+                // Mailboxes made before have no wrap key. Their contacts can't read anything we send now either, but the
+                // rows stay usable for new ones (the pool).
+                for (id in db.query("SELECT id FROM mailboxes WHERE wrap_key IS NULL") { it.getLong(0) }) {
+                    db.exec("UPDATE mailboxes SET wrap_key = ? WHERE id = ?", app.goldfishsend.proto.BlobWrap.newKey(), id)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Wrapped blobs (docs/protocol.md, "Blob"), and replay records for last-resort prekeys. */
+    internal val V9 = listOf(
+        // The key that wraps every blob sent to this mailbox, given with its sendSecret (invite, hello, mailbox message).
+        // A group inbox's comes from its hint key instead.
+        "ALTER TABLE mailboxes ADD COLUMN wrap_key BLOB",
+        // The contact's: what we wrap our blobs to them with.
+        "ALTER TABLE contacts ADD COLUMN out_wrap_key BLOB",
+        // PreKey messages that started a session from a group card's last-resort prekeys, so one replayed after its
+        // session is gone can't start it again. The newest few thousand per prekey; dropped with the prekey.
+        """CREATE TABLE sig_kyber_used (
+            kyber_id INTEGER NOT NULL,
+            spk_id INTEGER NOT NULL,
+            base_key BLOB NOT NULL,
+            PRIMARY KEY (kyber_id, spk_id, base_key)
+        )""",
+    )
 
     /** Held messages sealed like message bodies, tombstones for removed messages, and mailboxes still to delete. */
     internal val V8 = listOf(

@@ -14,6 +14,7 @@ import app.goldfishsend.net.PowChallenge
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
 import app.goldfishsend.proto.Padding
@@ -122,7 +123,8 @@ object Outbox {
         }
         val server = contact.outServer
         val secret = contact.outSecret
-        if (server == null || secret == null) {
+        val wrapKey = contact.outWrapKey
+        if (server == null || secret == null || wrapKey == null) {
             return false
         }
         // Their safety number changed and the user hasn't reviewed it: don't encrypt anything to the unreviewed identity.
@@ -141,22 +143,35 @@ object Outbox {
                             s.repo.outboxBackoff(item.seq, item.attempts, System.currentTimeMillis() + MAILBOX_WAIT_RETRY_MS)
                             return false
                         }
-                        Content.Hello(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), s.repo.displayName, Graph.ownServerKey()).encode()
+                        val mbKey = mb.wrapKey ?: run {
+                            fail(s, item)
+                            return true
+                        }
+                        Content.Hello(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), s.repo.displayName, Graph.ownServerKey(), B64.enc(mbKey)).encode()
                     }
                     else -> s.repo.openOutboxContent(item) ?: run {
                         s.repo.outboxDelete(item.seq)
                         return true
                     }
                 }
-                blob = s.lock.withLock {
-                    s.db.tx {
-                        val msg = SessionCipher(s.signal, Messenger.LOCAL, Messenger.remote(item.contactId)).encrypt(Padding.pad(plaintext))
-                        val b = E2eBlob(msg.type, msg.serialize()).encode()
-                        s.repo.outboxSetBlob(item.seq, b)
-                        b
+                // Wrapped for their mailbox ([BlobWrap]): the server sees none of libsignal's headers. Too large to wrap rolls
+                // the encryption back, so the session doesn't move on for a message that never goes.
+                val sealed = s.lock.withLock {
+                    runCatching {
+                        s.db.tx {
+                            val msg = SessionCipher(s.signal, Messenger.LOCAL, Messenger.remote(item.contactId)).encrypt(Padding.pad(plaintext))
+                            val inner = E2eBlob(msg.type, msg.serialize()).encode()
+                            require(inner.size <= BlobWrap.MAX_INNER) { "too large" }
+                            val b = BlobWrap.seal(wrapKey, inner)
+                            s.repo.outboxSetBlob(item.seq, b)
+                            b
+                        }
                     }
                 }
-                if (blob.size > E2eBlob.MAX_BYTES) {
+                blob = sealed.getOrNull() ?: run {
+                    if (sealed.exceptionOrNull() !is IllegalArgumentException) {
+                        throw sealed.exceptionOrNull()!!
+                    }
                     fail(s, item)
                     return true
                 }

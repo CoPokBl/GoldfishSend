@@ -7,6 +7,7 @@ import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.InviteBundle
 import app.goldfishsend.proto.InviteCrypto
@@ -74,6 +75,10 @@ object Invites {
         }
         val mb = Mailboxes.take(s, purpose)
             ?: throw InviteException("Still getting things ready. This only takes a moment the first time.")
+        val wrapKey = mb.wrapKey ?: run {
+            s.repo.releasePoolMailbox(mb.id)
+            throw InviteException("Still getting things ready. This only takes a moment the first time.")
+        }
         val serverKey = try {
             Graph.ownServerKey()
         } catch (e: ApiException) {
@@ -110,6 +115,8 @@ object Invites {
                     kyberPreKey = B64.enc(kyber.publicKey.serialize()),
                     kyberPreKeySig = B64.enc(kyberSig),
                     name = s.repo.displayName,
+                    // Inside the bundle, which only the link's key opens: the server never learns it.
+                    wrapKey = B64.enc(wrapKey),
                 )
             }
         }
@@ -175,7 +182,10 @@ object Invites {
             throw InviteException("This invite points to a server that isn't secure.")
         }
         val bundleKey = bundle.serverKey
-        if (bundle.v < 2 || !Gateway.isFingerprint(bundleKey) || (bundle.server == link.server && bundleKey != link.serverKey)) {
+        val wrapKey = runCatching { B64.dec(bundle.wrapKey) }.getOrNull()?.takeIf { it.size == BlobWrap.KEY_BYTES }
+        if (bundle.v != InviteBundle.VERSION || !Gateway.isFingerprint(bundleKey) || wrapKey == null ||
+            (bundle.server == link.server && bundleKey != link.serverKey)
+        ) {
             throw InviteException("This code doesn't look right. Ask for a new one.")
         }
         val contactId = s.lock.withLock {
@@ -188,6 +198,7 @@ object Invites {
                     outServer = bundle.server,
                     outSecret = B64.dec(bundle.sendSecret),
                     outServerKey = bundleKey,
+                    outWrapKey = wrapKey,
                 )
                 val identity = IdentityKey(B64.dec(bundle.identityKey))
                 val pk = PreKeyBundle(

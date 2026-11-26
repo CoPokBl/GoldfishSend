@@ -28,9 +28,11 @@ data class Contact(
     val pendingServerKey: String? = null,
     /** A group chat (docs/groups.md): [name] is the group name, [timerSecs] the group timer. */
     val isGroup: Boolean = false,
+    /** The key that wraps our blobs to [outSecret]'s mailbox ([app.goldfishsend.proto.BlobWrap]), from the contact. */
+    val outWrapKey: ByteArray? = null,
 ) {
     val ready: Boolean
-        get() = outServer != null && outSecret != null
+        get() = outServer != null && outSecret != null && outWrapKey != null
 }
 
 data class Mailbox(
@@ -54,6 +56,11 @@ data class Mailbox(
     val inviteKyberId: Int? = null,
     /** A group inbox's hint key (docs/groups.md, "Blob"). Null for 1:1 mailboxes. */
     val hintKey: ByteArray? = null,
+    /**
+     * The key that wraps every blob sent to this mailbox ([app.goldfishsend.proto.BlobWrap]), handed out with its
+     * sendSecret. A group inbox's blobs are wrapped under a key from its [hintKey] instead.
+     */
+    val wrapKey: ByteArray? = null,
 ) {
     companion object {
         const val PURPOSE_QR = 0
@@ -199,11 +206,12 @@ class Repo(val db: Db, private val vault: MessageVault) {
         outServerKey = if (c.isNull(14)) null else c.getString(14),
         pendingServerKey = if (c.isNull(15)) null else c.getString(15),
         isGroup = c.getInt(16) != 0,
+        outWrapKey = if (c.isNull(17)) null else c.getBlob(17),
     )
 
     private val contactCols =
         "id, name, identity_key, verified, timer_secs, out_server, out_secret, received_any, unreachable, created_at, last_activity, unread, " +
-            "pending_identity, hidden, out_server_key, pending_server_key, is_group"
+            "pending_identity, hidden, out_server_key, pending_server_key, is_group, out_wrap_key"
 
     fun contact(id: Long): Contact? = db.queryOne("SELECT $contactCols FROM contacts WHERE id = ?", id, map = ::contact)
 
@@ -233,26 +241,28 @@ class Repo(val db: Db, private val vault: MessageVault) {
         outServer: String?,
         outSecret: ByteArray?,
         outServerKey: String? = null,
+        outWrapKey: ByteArray? = null,
     ): Long {
         val now = System.currentTimeMillis()
         return db.insert(
-            "INSERT INTO contacts (name, verified, timer_secs, out_server, out_secret, out_server_key, created_at, last_activity) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            Sanitize.name(name) ?: "Contact", verified, timerSecs, outServer, outSecret, outServerKey, now, now,
+            "INSERT INTO contacts (name, verified, timer_secs, out_server, out_secret, out_server_key, out_wrap_key, created_at, last_activity) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            Sanitize.name(name) ?: "Contact", verified, timerSecs, outServer, outSecret, outServerKey, outWrapKey, now, now,
         )
     }
 
     /**
-     * Where to reach a contact, from their E2E-authenticated `hello` or `mailbox` message. [serverKey] replaces the pin
-     * (and resolves a pending identity change). Without one, the pin is kept if the server didn't change, or is
-     * learned on first use if it did.
+     * Where to reach a contact, from their E2E-authenticated `hello` or `mailbox` message: the mailbox and its [wrapKey].
+     * [serverKey] replaces the pin (and resolves a pending identity change). Without one, the pin is kept if the server
+     * didn't change, or is learned on first use if it did.
      */
-    fun updateContactOutbound(id: Long, server: String, secret: ByteArray, serverKey: String?) {
+    fun updateContactOutbound(id: Long, server: String, secret: ByteArray, serverKey: String?, wrapKey: ByteArray) {
         val current = contact(id)
         val key = serverKey ?: current?.outServerKey?.takeIf { current.outServer == server }
         db.exec(
-            "UPDATE contacts SET out_server = ?, out_secret = ?, out_server_key = ?, pending_server_key = NULL, unreachable = 0 WHERE id = ?",
-            server, secret, key, id,
+            "UPDATE contacts SET out_server = ?, out_secret = ?, out_server_key = ?, out_wrap_key = ?, pending_server_key = NULL, " +
+                "unreachable = 0 WHERE id = ?",
+            server, secret, key, wrapKey, id,
         )
     }
 
@@ -771,11 +781,12 @@ class Repo(val db: Db, private val vault: MessageVault) {
         inviteSpkId = if (c.isNull(13)) null else c.getInt(13),
         inviteKyberId = if (c.isNull(14)) null else c.getInt(14),
         hintKey = if (c.isNull(15)) null else c.getBlob(15),
+        wrapKey = if (c.isNull(16)) null else c.getBlob(16),
     )
 
     private val mbCols =
         "id, contact_id, purpose, send_secret, owner_secret, tag, state, expires_at, created_at, invite_used, invite_expires_at, " +
-            "replaced_at, drain_until, invite_spk_id, invite_kyber_id, hint_key"
+            "replaced_at, drain_until, invite_spk_id, invite_kyber_id, hint_key, wrap_key"
 
     /** Binds a claimed mailbox to a group as its inbox, with its hint key. */
     fun bindGroupInbox(id: Long, groupCid: Long, hintKey: ByteArray) = db.exec(
@@ -832,9 +843,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
         "SELECT COUNT(*) FROM mailboxes WHERE contact_id IS NULL AND invite_used = 0 AND state != ?", Mailbox.STATE_ACTIVE,
     )
 
+    /** A new mailbox row, with a fresh wrap key: it goes out with the sendSecret, to whoever may send to it. */
     fun insertMailbox(purpose: Int, sendSecret: ByteArray, ownerSecret: ByteArray, tag: ByteArray): Long = db.insert(
-        "INSERT INTO mailboxes (purpose, send_secret, owner_secret, tag, state, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        purpose, sendSecret, ownerSecret, tag, Mailbox.STATE_CREATING, System.currentTimeMillis(),
+        "INSERT INTO mailboxes (purpose, send_secret, owner_secret, tag, state, created_at, wrap_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        purpose, sendSecret, ownerSecret, tag, Mailbox.STATE_CREATING, System.currentTimeMillis(), app.goldfishsend.proto.BlobWrap.newKey(),
     )
 
     fun setMailboxState(id: Long, state: Int, expiresAt: String? = null) {

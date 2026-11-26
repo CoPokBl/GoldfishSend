@@ -34,12 +34,12 @@ object FuzzKit {
 
     /** Any [Content] value, with fuzzed fields. */
     fun FuzzedDataProvider.content(): Content = when (consumeInt(0, 15)) {
-        0 -> Content.Hello(str(80), str(60), if (consumeBoolean()) str(80) else null, if (consumeBoolean()) str(60) else null)
+        0 -> Content.Hello(str(80), str(60), if (consumeBoolean()) str(80) else null, if (consumeBoolean()) str(60) else null, str(50))
         1 -> Content.Text(str(40), str(300), consumeLong(), optLong(), optBool(), optInt(), optInt())
         2 -> Content.Receipt(strings(8, 30), str(12))
         3 -> Content.Timer(consumeLong())
         4 -> Content.Delete(strings(8, 30))
-        5 -> Content.Mailbox(str(80), str(60), if (consumeBoolean()) str(60) else null)
+        5 -> Content.Mailbox(str(80), str(60), if (consumeBoolean()) str(60) else null, str(50))
         6 -> Content.Chunk(str(30), consumeInt(), consumeInt(), str(300))
         7 -> Content.GText(str(50), str(40), str(300), consumeLong(), optLong(), optBool(), head())
         8 -> Content.GReceipt(str(50), strings(8, 30), str(12), head())

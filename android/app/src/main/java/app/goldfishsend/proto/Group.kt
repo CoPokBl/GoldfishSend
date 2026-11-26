@@ -296,7 +296,10 @@ object GroupCrypto {
     fun tag(id: String): String = B64.enc(Hash.sha256(B64.dec(id))).take(22)
 }
 
-/** `type ‖ nonce(16) ‖ mac(16) ‖ libsignal ciphertext` (docs/groups.md, "Blob"). */
+/**
+ * `type ‖ nonce(16) ‖ mac(16) ‖ libsignal ciphertext` (docs/groups.md, "Blob"): a group blob inside its wrapping
+ * ([BlobWrap], under the inbox's [BlobWrap.groupKey]). The server only ever sees it wrapped.
+ */
 class GroupBlob(val type: Int, val nonce: ByteArray, val mac: ByteArray, val body: ByteArray) {
     fun encode(): ByteArray = byteArrayOf((type or 0x10).toByte()) + nonce + mac + body
 

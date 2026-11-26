@@ -474,8 +474,16 @@ object Mailboxes {
         }
         val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
         s.repo.bindMailbox(fresh.id, cid)
-        Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
+        Messenger.sendControl(s, cid, announce(fresh, Graph.ownServerKey()))
     }
+
+    /** The E2E `mailbox` message for [mb]: where to reach us, and the key its blobs are wrapped with. */
+    private fun announce(mb: Mailbox, serverKey: String) = app.goldfishsend.proto.Content.Mailbox(
+        Graph.prefs.serverUrl,
+        B64.enc(mb.sendSecret),
+        serverKey,
+        B64.enc(mb.wrapKey ?: error("mailbox without a wrap key")),
+    )
 
     /**
      * Mailbox rotation (Prefs.mailboxRotationDays). Each contact periodically gets a fresh inbound mailbox, announced through
@@ -505,7 +513,7 @@ object Mailboxes {
             val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
             s.repo.bindMailbox(fresh.id, cid)
             s.repo.markReplaced(old.id, now)
-            Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
+            Messenger.sendControl(s, cid, announce(fresh, Graph.ownServerKey()))
         }
         if (due.isNotEmpty()) {
             Graph.scope.launchSafe { ensurePool(s) }
@@ -521,8 +529,8 @@ object Mailboxes {
             return
         }
         for (c in s.repo.people()) {
-            val mb = s.repo.mailboxForContact(c.id) ?: continue
-            Messenger.sendControl(s, c.id, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), serverKey))
+            val mb = s.repo.mailboxForContact(c.id)?.takeIf { it.wrapKey != null } ?: continue
+            Messenger.sendControl(s, c.id, announce(mb, serverKey))
         }
         // Groups learn it from a new card.
         Graph.scope.launchSafe { Groups.announceServerKey(s) }

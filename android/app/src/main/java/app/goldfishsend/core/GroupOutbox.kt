@@ -10,28 +10,22 @@ import app.goldfishsend.db.setMemberUnreachable
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.BatchItem
 import app.goldfishsend.net.BatchResult
-import app.goldfishsend.net.BatchUnsupportedException
 import app.goldfishsend.net.MessageBatch
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
-import app.goldfishsend.proto.E2eBlob
-import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.sync.withLock
 
 /**
  * Group fan-out (docs/groups.md): one outbox row per member, kept in order per member, encrypted once and then sent with
- * `POST /v1/messages/batch` per server (at most 32 items and 16 KiB per request). A slow member, or one whose server's
- * identity changed, only holds up their own rows.
+ * `POST /v1/messages` per server (at most 32 items and 16 KiB per request), the same endpoint and blob sizes as 1:1
+ * sends. A slow member, or one whose server's identity changed, only holds up their own rows.
  */
 object GroupOutbox {
     private const val TAG = "GroupOutbox"
 
     /** Backoff tops out at 30 minutes, so this is roughly a week of waiting for a member's card. */
     private const val CARD_WAIT_ATTEMPTS = 340
-
-    /** Servers without the batch endpoint (until when): sent one by one meanwhile. */
-    private val noBatch = ConcurrentHashMap<String, Long>()
 
     /** Sends everything due for group [cid], a member's head row at a time, until nothing more goes out. */
     suspend fun drain(s: Session, cid: Long) {
@@ -120,9 +114,8 @@ object GroupOutbox {
                     Log.w(TAG, "can't encrypt to member: ${e.javaClass.simpleName}")
                     null
                 }
-                val b = r.blob
-                if (b == null || b.size > E2eBlob.MAX_BYTES) {
-                    r.blob = null
+                // Null: it couldn't be encrypted, or was too large to wrap (which rolled the encryption back).
+                if (r.blob == null) {
                     failRow(s, r.item)
                 }
             }
@@ -155,16 +148,7 @@ object GroupOutbox {
         val api = Graph.api(server, pin(s, cid, members, serverKey))
         val items = batch.map { BatchItem(B64.dec(it.route.card.inbox.sendSecret), it.item.idem, null, it.blob!!) }
         val results: List<BatchResult> = try {
-            if ((noBatch[server] ?: 0L) > System.currentTimeMillis()) {
-                singles(api, items)
-            } else {
-                try {
-                    withPow(s, server, api, batch) { pow -> api.sendBatch(items, pow) }
-                } catch (e: BatchUnsupportedException) {
-                    noBatch[server] = System.currentTimeMillis() + 6 * 3600_000L
-                    singles(api, items)
-                }
-            }
+            withPow(s, server, api, batch) { pow -> api.sendBatch(items, pow) }
         } catch (e: ApiException) {
             // The whole batch failed (client rate limit, server or network): retry it whole, same idempotency keys.
             for (r in batch) {
@@ -209,19 +193,6 @@ object GroupOutbox {
             throw e
         }
         Outbox.payPow(s, server, api) { pow -> call(pow) }
-    }
-
-    /** A server without the batch endpoint: one request per item, with the same per-item results. */
-    private suspend fun singles(api: ServerApi, items: List<BatchItem>): List<BatchResult> = items.map { i ->
-        try {
-            BatchResult(202, id = api.sendMessage(i.sendSecret, i.blob, i.idempotencyKey, i.ttlSeconds))
-        } catch (e: ApiException) {
-            if (e.status == 404 || e.status == 429 || e.status == 507) {
-                BatchResult(e.status, error = e.code, scope = e.scope, retryAfter = e.retryAfterSeconds)
-            } else {
-                throw e
-            }
-        }
     }
 
     /**

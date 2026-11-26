@@ -5,6 +5,7 @@ import app.goldfishsend.fuzz.FuzzKit.str
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.E2eBlob
 import app.goldfishsend.proto.GroupBlob
 import app.goldfishsend.proto.InviteBundle
@@ -63,7 +64,7 @@ class ParserFuzzTest {
             sendSecret = data.str(50), registrationId = data.consumeInt(), deviceId = data.consumeInt(),
             identityKey = data.str(50), signedPreKeyId = data.consumeInt(), signedPreKey = data.str(50),
             signedPreKeySig = data.str(90), kyberPreKeyId = data.consumeInt(), kyberPreKey = data.str(50),
-            kyberPreKeySig = data.str(90), name = if (data.consumeBoolean()) data.str(80) else null,
+            kyberPreKeySig = data.str(90), name = if (data.consumeBoolean()) data.str(80) else null, wrapKey = data.str(50),
         )
         val key = data.consumeBytes(32).copyOf(32)
         check(InviteBundle.decode(b.encode()) == b)
@@ -87,6 +88,8 @@ class ParserFuzzTest {
     }
 
     private fun blobs(raw: ByteArray) {
+        // What the relay delivers is wrapped: under a key nobody holds here, nothing opens.
+        check(BlobWrap.open(ByteArray(32), raw) == null)
         E2eBlob.decode(raw)?.let { check(it.encode().contentEquals(raw)) }
         GroupBlob.decode(raw)?.let { check(it.encode().contentEquals(raw)) }
         check(GroupBlob.decode(raw) == null || GroupBlob.isGroup(raw) && E2eBlob.decode(raw) == null)

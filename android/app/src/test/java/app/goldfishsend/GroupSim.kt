@@ -10,12 +10,15 @@ import app.goldfishsend.core.ReceiveGuard
 import app.goldfishsend.db.MAX_CHUNKS_PER_CONTACT
 import app.goldfishsend.group.HeldBlob
 import app.goldfishsend.group.PeerSync
+import app.goldfishsend.crypto.LastResortLog
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.CardBundle
 import app.goldfishsend.proto.CardInbox
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.GroupCard
+import app.goldfishsend.proto.GroupBlob
 import app.goldfishsend.proto.GroupCrypto
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.Rand
@@ -26,6 +29,7 @@ import app.goldfishsend.proto.SignedFact
 import app.goldfishsend.proto.SignedRoster
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
+import org.signal.libsignal.protocol.ReusedBaseKeyException
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.signal.libsignal.protocol.ecc.ECPublicKey
@@ -47,14 +51,33 @@ fun factState(f: SignedFact, h: Head = NO_HEAD) = Content.GState(f.fact.g, h, fa
 
 fun cardState(c: SignedCard, h: Head = NO_HEAD) = Content.GState(c.card.g, h, cards = listOf(Signed(B64.enc(c.bytes), B64.enc(c.sig))))
 
-/**
- * Like the app's SignalStore: group prekeys are last-resort, so using them deletes nothing. [written]: the address names
- * a session or identity was ever stored for.
- */
-class LastResortStore(kp: IdentityKeyPair, reg: Int) : InMemorySignalProtocolStore(kp, reg) {
-    val written = mutableSetOf<String>()
+/** The group blob inside a wrapped one, as anyone holding the inbox's [hintKey] reads it (a test, or an attacker). */
+fun openGroupBlob(hintKey: ByteArray, wrapped: ByteArray): GroupBlob =
+    GroupBlob.decode(BlobWrap.open(BlobWrap.groupKey(hintKey), wrapped)!!)!!
 
-    override fun markKyberPreKeyUsed(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) = Unit
+/** [blob] wrapped for the inbox whose hint key is [hintKey], as the server relays it. */
+fun wrapGroupBlob(hintKey: ByteArray, blob: GroupBlob): ByteArray = BlobWrap.seal(BlobWrap.groupKey(hintKey), blob.encode())
+
+/**
+ * Like the app's SignalStore: group prekeys are last-resort, so using them deletes nothing, and each session they start
+ * is recorded, so a PreKey message that would start one again is refused. [written]: the address names a session or
+ * identity was ever stored for.
+ */
+class LastResortStore(kp: IdentityKeyPair, reg: Int) : InMemorySignalProtocolStore(kp, reg), LastResortLog {
+    val written = mutableSetOf<String>()
+    private val used = HashSet<String>()
+
+    private fun usedKey(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) =
+        "$kyberPreKeyId $signedPreKeyId ${B64.enc(baseKey.serialize())}"
+
+    override fun markKyberPreKeyUsed(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) {
+        if (!used.add(usedKey(kyberPreKeyId, signedPreKeyId, baseKey))) {
+            throw ReusedBaseKeyException("replayed")
+        }
+    }
+
+    override fun baseKeySeen(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey): Boolean =
+        usedKey(kyberPreKeyId, signedPreKeyId, baseKey) in used
 
     override fun storeSession(address: SignalProtocolAddress, record: SessionRecord) {
         written += address.name

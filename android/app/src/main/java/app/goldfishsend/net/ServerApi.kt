@@ -2,6 +2,7 @@ package app.goldfishsend.net
 
 import app.goldfishsend.BuildConfig
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -89,7 +90,7 @@ data class ExpiresResponse(val expiresAt: String, val endpointGone: Boolean = fa
 @Serializable
 data class IdResponse(val id: String)
 
-/** One item of `POST /v1/messages/batch`. [ttlSeconds] null means the server default. */
+/** One item of `POST /v1/messages`: a wrapped blob for one mailbox. [ttlSeconds] null means the server default. */
 class BatchItem(val sendSecret: ByteArray, val idempotencyKey: ByteArray, val ttlSeconds: Long?, val blob: ByteArray)
 
 /** Per-item result: 202 with [id], or 404/429/507 with [error], [scope] and [retryAfter] (seconds). */
@@ -105,10 +106,10 @@ data class BatchResult(
 @Serializable
 data class BatchResponse(val results: List<BatchResult>)
 
-/** The server doesn't have `POST /v1/messages/batch`: send one by one. */
-class BatchUnsupportedException : IOException("batch send unsupported")
-
-/** `u8 count ‖ count × (sendSecret(32) ‖ idempotencyKey(16) ‖ u32 ttlSeconds ‖ u16 len ‖ blob)`, big-endian. */
+/**
+ * The body of `POST /v1/messages`, the one send endpoint, for 1:1 and group sends alike:
+ * `u8 count ‖ count × (sendSecret(32) ‖ idempotencyKey(16) ‖ u32 ttlSeconds ‖ u16 len ‖ blob)`, big-endian.
+ */
 object MessageBatch {
     const val MAX_ITEMS = 32
     const val ITEM_HEADER = 32 + 16 + 4 + 2
@@ -124,7 +125,7 @@ object MessageBatch {
         val d = java.io.DataOutputStream(out)
         d.writeByte(items.size)
         for (i in items) {
-            require(i.sendSecret.size == 32 && i.idempotencyKey.size == 16 && i.blob.size in 1..0xFFFF)
+            require(i.sendSecret.size == 32 && i.idempotencyKey.size == 16 && i.blob.size in BlobWrap.SIZES)
             d.write(i.sendSecret)
             d.write(i.idempotencyKey)
             d.writeInt(((i.ttlSeconds ?: 0L).coerceIn(0L, 0xFFFFFFFFL)).toInt())
@@ -154,7 +155,7 @@ object MessageBatch {
             val idem = ByteArray(16).also { buf.get(it) }
             val ttl = buf.int.toLong() and 0xFFFFFFFFL
             val len = buf.short.toInt() and 0xFFFF
-            if (len < 1 || buf.remaining() < len) {
+            if (len !in BlobWrap.SIZES || buf.remaining() < len) {
                 return null
             }
             val blob = ByteArray(len).also { buf.get(it) }
@@ -327,51 +328,36 @@ class ServerApi(
     }
 
     /**
-     * Sends an E2E blob. [pow] is an optional solved challenge as "challenge.nonce" (b64u), which pays for the request when
-     * the per-IP limit was hit (shared IPs, Tor). The body is always `application/octet-stream` (the server returns 415 otherwise).
+     * Sends one wrapped blob ([BlobWrap]) to one mailbox: a batch of one ([sendBatch]), so a 1:1 send looks like a group
+     * send to a member alone on their server. Its result, if it isn't accepted, is thrown as an [ApiException] (404, 429,
+     * 507 with their scope and Retry-After), like a whole-request failure.
      */
-    suspend fun sendMessage(sendSecret: ByteArray, blob: ByteArray, idempotencyKey: ByteArray, ttlSeconds: Long?, pow: String? = null): String =
-        withContext(Dispatchers.IO) {
-            val headers = mutableListOf(
-                "content-type" to OCTET_TYPE,
-                "gf-send-token" to B64.enc(sendSecret),
-                "gf-idempotency-key" to B64.enc(idempotencyKey),
-            )
-            if (ttlSeconds != null) {
-                headers += "gf-ttl" to ttlSeconds.toString()
-            }
-            if (pow != null) {
-                headers += "gf-pow" to pow
-            }
-            exchange("POST", "v1/messages", headers, blob) { r -> decode(r, IdResponse.serializer()).id }
+    suspend fun sendMessage(sendSecret: ByteArray, blob: ByteArray, idempotencyKey: ByteArray, ttlSeconds: Long?, pow: String? = null): String {
+        val r = sendBatch(listOf(BatchItem(sendSecret, idempotencyKey, ttlSeconds, blob)), pow).single()
+        if (r.status == 202 && r.id != null) {
+            return r.id
         }
+        throw ApiException(r.error ?: "http_${r.status}", r.status, retryAfterSeconds = r.retryAfter, scope = r.scope)
+    }
 
     /**
-     * Sends up to 32 E2E blobs in one request (docs/groups.md, "Server: batch send"). Per-item results come back in order.
-     * A whole-batch failure throws [ApiException], to be retried as a whole with the same idempotency keys. A server
-     * without the endpoint throws [BatchUnsupportedException].
+     * Sends up to 32 wrapped blobs in one request (docs/protocol.md, `POST /v1/messages`). [pow] is an optional solved
+     * challenge as "challenge.nonce" (b64u), which pays for the request when the per-IP or per-network limit was hit
+     * (shared IPs, Tor). Per-item results come back in order. A whole-request failure throws [ApiException], to be retried
+     * as a whole with the same idempotency keys.
      */
     suspend fun sendBatch(items: List<BatchItem>, pow: String? = null): List<BatchResult> = withContext(Dispatchers.IO) {
         val headers = mutableListOf("content-type" to OCTET_TYPE)
         if (pow != null) {
             headers += "gf-pow" to pow
         }
-        try {
-            exchange("POST", "v1/messages/batch", headers, MessageBatch.encode(items)) { r ->
-                val results = decode(r, BatchResponse.serializer()).results
-                if (results.size != items.size) {
-                    throw ApiException("bad_server", 502, retryAfterSeconds = 60)
-                }
-                // Per-item Retry-After comes from the server's JSON: clamped like the header.
-                results.map { it.copy(retryAfter = clampRetryAfter(it.retryAfter)) }
+        exchange("POST", "v1/messages", headers, MessageBatch.encode(items)) { r ->
+            val results = decode(r, BatchResponse.serializer()).results
+            if (results.size != items.size || results.any { it.status == 202 && it.id == null }) {
+                throw ApiException("bad_server", 502, retryAfterSeconds = 60)
             }
-        } catch (e: ApiException) {
-            // Through the gateway, an unknown inner route is a bare 404 from routing (no JSON error code), unlike a send's
-            // `not_found`.
-            if (e.status == 404 && e.code == "http_404") {
-                throw BatchUnsupportedException()
-            }
-            throw e
+            // Per-item Retry-After comes from the server's JSON: clamped like the header.
+            results.map { it.copy(retryAfter = clampRetryAfter(it.retryAfter)) }
         }
     }
 

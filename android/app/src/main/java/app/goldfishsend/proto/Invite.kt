@@ -10,7 +10,7 @@ import kotlinx.serialization.Serializable
 /** InviteBundle JSON (protocol.md). */
 @Serializable
 data class InviteBundle(
-    val v: Int = 2,
+    val v: Int = VERSION,
     val server: String,
     /** The fingerprint (b64u) of [server]'s identity key. */
     val serverKey: String? = null,
@@ -25,10 +25,17 @@ data class InviteBundle(
     val kyberPreKey: String,
     val kyberPreKeySig: String,
     val name: String? = null,
+    /**
+     * The key (b64u, 32 bytes) that wraps every blob sent to [sendSecret]'s mailbox ([BlobWrap]). The bundle is encrypted
+     * under the link's key, which never reaches a server, so the server never learns it.
+     */
+    val wrapKey: String,
 ) {
     fun encode(): ByteArray = BundleJson.encodeToString(serializer(), this).utf8()
 
     companion object {
+        const val VERSION = 3
+
         fun decode(bytes: ByteArray): InviteBundle = BundleJson.decodeUntrusted(serializer(), bytes.toString(Charsets.UTF_8))
     }
 }
@@ -41,13 +48,13 @@ private val BundleJson = kotlinx.serialization.json.Json {
 }
 
 /**
- * `gfsend://invite#v=2&s=<server>&f=<server fingerprint>&i=<id>&k=<key>`. [serverKey] pins the inviter's server before
+ * `gfsend://invite#v=3&s=<server>&f=<server fingerprint>&i=<id>&k=<key>`. [serverKey] pins the inviter's server before
  * anything is fetched from it.
  */
 data class InviteLink(val server: String, val serverKey: String, val id: String, val key: ByteArray) {
     fun toUri(): String {
         val s = URLEncoder.encode(server, "UTF-8")
-        return "$SCHEME_PREFIX#v=2&s=$s&f=$serverKey&i=$id&k=${B64.enc(key)}"
+        return "$SCHEME_PREFIX#v=$VERSION&s=$s&f=$serverKey&i=$id&k=${B64.enc(key)}"
     }
 
     override fun equals(other: Any?): Boolean =
@@ -57,6 +64,9 @@ data class InviteLink(val server: String, val serverKey: String, val id: String,
 
     companion object {
         const val SCHEME_PREFIX = "gfsend://invite"
+
+        /** The link's version, which is also its bundle's ([InviteBundle.VERSION]). */
+        const val VERSION = InviteBundle.VERSION
 
         /**
          * The link inside [raw]. People often copy the whole shared message ("Let's chat… gfsend://invite#…"), so the
@@ -83,12 +93,15 @@ data class InviteLink(val server: String, val serverKey: String, val id: String,
             }.toMap()
         }
 
-        /** A link from an app version before server identity keys. It can't be accepted: ask for a new one. */
-        fun isOutdated(raw: String): Boolean = params(raw)?.get("v") == "1"
+        /**
+         * A link from an earlier app version (before server identity keys, or before wrapped blobs). It can't be accepted:
+         * ask for a new one.
+         */
+        fun isOutdated(raw: String): Boolean = params(raw)?.get("v").let { it == "1" || it == "2" }
 
         fun parse(raw: String): InviteLink? {
             val params = params(raw) ?: return null
-            if (params["v"] != "2") {
+            if (params["v"] != VERSION.toString()) {
                 return null
             }
             return try {

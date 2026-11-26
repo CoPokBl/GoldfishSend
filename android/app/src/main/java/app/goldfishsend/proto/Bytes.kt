@@ -43,6 +43,12 @@ object Hash {
         }
         return mac.doFinal()
     }
+
+    /** HKDF-SHA256 (RFC 5869) with a 32-byte output: one expand block. An empty [salt] means 32 zero bytes. */
+    fun hkdf32(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
+        val prk = hmacSha256(if (salt.isEmpty()) ByteArray(32) else salt, ikm)
+        return hmacSha256(prk, info, byteArrayOf(1))
+    }
 }
 
 fun ByteArray.wipe() {

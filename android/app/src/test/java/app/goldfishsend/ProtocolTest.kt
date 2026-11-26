@@ -132,7 +132,7 @@ class InviteTest {
         for (server in listOf("https://relay.example.org", "https://h.example:8443/sub/path", "http://10.0.2.2:5000")) {
             val link = InviteLink(server, fp, id, key)
             val uri = link.toUri()
-            assertTrue(uri.startsWith("gfsend://invite#v=2&s="))
+            assertTrue(uri.startsWith("gfsend://invite#v=3&s="))
             assertTrue(uri.contains("&f=$fp&"))
             assertEquals(link, InviteLink.parse(uri))
             assertTrue(!InviteLink.isOutdated(uri))
@@ -150,23 +150,27 @@ class InviteTest {
     @Test
     fun parseRejectsBadInput() {
         val good = InviteLink("https://x.example", fp, id, key).toUri()
-        assertNull(InviteLink.parse("https://x.example/#v=2"))
-        assertNull(InviteLink.parse(good.replace("v=2", "v=3")))
-        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&f=$fp&i=$id&k=${B64.enc(ByteArray(16))}"))
-        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&f=$fp&i=abc&k=${B64.enc(key)}"))
+        assertNull(InviteLink.parse("https://x.example/#v=3"))
+        assertNull(InviteLink.parse(good.replace("v=3", "v=4")))
+        assertNull(InviteLink.parse("gfsend://invite#v=3&s=https%3A%2F%2Fx&f=$fp&i=$id&k=${B64.enc(ByteArray(16))}"))
+        assertNull(InviteLink.parse("gfsend://invite#v=3&s=https%3A%2F%2Fx&f=$fp&i=abc&k=${B64.enc(key)}"))
         // The server fingerprint is required, and must be 32 bytes.
-        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&i=$id&k=${B64.enc(key)}"))
-        assertNull(InviteLink.parse("gfsend://invite#v=2&s=https%3A%2F%2Fx&f=${B64.enc(ByteArray(16))}&i=$id&k=${B64.enc(key)}"))
+        assertNull(InviteLink.parse("gfsend://invite#v=3&s=https%3A%2F%2Fx&i=$id&k=${B64.enc(key)}"))
+        assertNull(InviteLink.parse("gfsend://invite#v=3&s=https%3A%2F%2Fx&f=${B64.enc(ByteArray(16))}&i=$id&k=${B64.enc(key)}"))
         assertNull(InviteLink.parse("gfsend://invite"))
         assertNotNull(InviteLink.parse("  $good  "))
     }
 
     @Test
-    fun v1LinksAreOutdated() {
+    fun earlierLinksAreOutdated() {
         val v1 = "gfsend://invite#v=1&s=https%3A%2F%2Fx.example&i=$id&k=${B64.enc(key)}"
         assertNull(InviteLink.parse(v1))
         assertTrue(InviteLink.isOutdated(v1))
         assertTrue(!InviteLink.isOutdated("https://example.org/#v=1"))
+        // Before wrapped blobs: its bundle has no wrap key.
+        val v2 = InviteLink("https://x.example", fp, id, key).toUri().replace("v=3", "v=2")
+        assertNull(InviteLink.parse(v2))
+        assertTrue(InviteLink.isOutdated(v2))
     }
 
     private fun bundle() = InviteBundle(
@@ -182,6 +186,7 @@ class InviteTest {
         kyberPreKey = B64.enc(Rand.bytes(1569)),
         kyberPreKeySig = B64.enc(Rand.bytes(64)),
         name = "Ada",
+        wrapKey = B64.enc(Rand.bytes(32)),
     )
 
     @Test
@@ -220,7 +225,7 @@ class InviteTest {
     @Test
     fun bundleJsonFieldNames() {
         val json = bundle().encode().toString(Charsets.UTF_8)
-        for (f in listOf("\"v\":2", "\"server\"", "\"serverKey\":\"$fp\"", "\"sendSecret\"", "\"registrationId\"", "\"deviceId\":1", "\"identityKey\"", "\"signedPreKeyId\"",
+        for (f in listOf("\"v\":3", "\"wrapKey\"", "\"server\"", "\"serverKey\":\"$fp\"", "\"sendSecret\"", "\"registrationId\"", "\"deviceId\":1", "\"identityKey\"", "\"signedPreKeyId\"",
             "\"signedPreKey\"", "\"signedPreKeySig\"", "\"kyberPreKeyId\"", "\"kyberPreKey\"", "\"kyberPreKeySig\"", "\"name\"")) {
             assertTrue("missing $f in $json", json.contains(f))
         }
@@ -232,18 +237,20 @@ class ContentTest {
 
     @Test
     fun roundTripsAllTypes() {
-        rt(Content.Hello("https://s.example", "abc", "Bob"))
-        rt(Content.Hello("https://s.example", "abc"))
-        rt(Content.Hello("https://s.example", "abc", "Bob", "Zm9v"))
-        rt(Content.Mailbox("https://s.example", "abc", "Zm9v"))
-        assertTrue(Content.Mailbox("https://s", "a", "Zm9v").encode().toString(Charsets.UTF_8).contains("\"serverKey\":\"Zm9v\""))
-        assertTrue(Content.Hello("https://s", "a", null, "Zm9v").encode().toString(Charsets.UTF_8).contains("\"serverKey\":\"Zm9v\""))
+        rt(Content.Hello("https://s.example", "abc", "Bob", wrapKey = "d2s"))
+        rt(Content.Hello("https://s.example", "abc", wrapKey = "d2s"))
+        rt(Content.Hello("https://s.example", "abc", "Bob", "Zm9v", "d2s"))
+        rt(Content.Mailbox("https://s.example", "abc", "Zm9v", "d2s"))
+        assertTrue(Content.Mailbox("https://s", "a", "Zm9v", "d2s").encode().toString(Charsets.UTF_8).contains("\"serverKey\":\"Zm9v\""))
+        assertTrue(Content.Hello("https://s", "a", null, "Zm9v", "d2s").encode().toString(Charsets.UTF_8).contains("\"serverKey\":\"Zm9v\""))
+        assertTrue(Content.Hello("https://s", "a", null, null, "d2s").encode().toString(Charsets.UTF_8).contains("\"wrapKey\":\"d2s\""))
+        assertTrue(Content.Mailbox("https://s", "a", null, "d2s").encode().toString(Charsets.UTF_8).contains("\"wrapKey\":\"d2s\""))
         rt(Content.Text("id1", "hello \"world\" 🐟", 1700000000000, 3600, true, 0, 2))
         rt(Content.Text("id2", "plain", 1))
         rt(Content.Receipt(listOf("a", "b"), Content.Receipt.READ))
         rt(Content.Timer(86400))
         rt(Content.Delete(listOf("x")))
-        rt(Content.Mailbox("https://s.example", "zzz"))
+        rt(Content.Mailbox("https://s.example", "zzz", wrapKey = "d2s"))
     }
 
     @Test
@@ -263,8 +270,8 @@ class ContentTest {
         assertEquals(Content.Timer(0), Content.decode("""{"t":"timer","secs":0}""".toByteArray()))
         // Unknown fields from newer clients are ignored.
         assertEquals(
-            Content.Hello("https://a", "s", null),
-            Content.decode("""{"t":"hello","server":"https://a","sendSecret":"s","future":true}""".toByteArray()),
+            Content.Hello("https://a", "s", null, wrapKey = "w"),
+            Content.decode("""{"t":"hello","server":"https://a","sendSecret":"s","wrapKey":"w","future":true}""".toByteArray()),
         )
     }
 

@@ -1,6 +1,7 @@
 package app.goldfishsend.group
 
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.Fact
@@ -29,6 +30,7 @@ import kotlinx.serialization.builtins.serializer
 import org.signal.libsignal.protocol.DuplicateMessageException
 import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
+import org.signal.libsignal.protocol.ReusedBaseKeyException
 import org.signal.libsignal.protocol.SessionBuilder
 import org.signal.libsignal.protocol.SessionCipher
 import org.signal.libsignal.protocol.SignalProtocolAddress
@@ -619,7 +621,8 @@ class GroupEngine(
 
     /**
      * Encrypts [plaintext] (a Content encoding) to member [to] with their [card], starting a PQXDH session from it if
-     * needed. The card may belong to a member who just left or was removed: the roster telling them still goes out.
+     * needed, and wraps it for their inbox ([BlobWrap.groupKey] of the card's hint key): what comes back is what the
+     * server relays. The card may belong to a member who just left or was removed: the roster telling them still goes out.
      */
     fun encryptTo(to: String, card: GroupCard, plaintext: ByteArray): ByteArray {
         if (card.id != to) {
@@ -647,13 +650,18 @@ class GroupEngine(
         }
         val msg = SessionCipher(signal, LOCAL, addr).encrypt(Padding.pad(plaintext))
         val nonce = Rand.bytes(GroupCrypto.HINT_NONCE)
-        val mac = GroupCrypto.hint(B64.dec(card.hintKey), nonce, meBytes)
-        return GroupBlob(msg.type, nonce, mac, msg.serialize()).encode()
+        val hintKey = B64.dec(card.hintKey)
+        val mac = GroupCrypto.hint(hintKey, nonce, meBytes)
+        return BlobWrap.seal(BlobWrap.groupKey(hintKey), GroupBlob(msg.type, nonce, mac, msg.serialize()).encode())
     }
 
-    /** A blob that arrived on our inbox for [gid], whose hint key is [inboxHintKey]. Finds the sender by hint. */
+    /**
+     * A blob that arrived on our inbox for [gid], whose hint key is [inboxHintKey]: unwrapped with the key derived from it,
+     * then the sender is found by hint.
+     */
     fun receive(gid: String, inboxHintKey: ByteArray, raw: ByteArray) {
-        val blob = GroupBlob.decode(raw) ?: return
+        val inner = BlobWrap.open(BlobWrap.groupKey(inboxHintKey), raw) ?: return
+        val blob = GroupBlob.decode(inner) ?: return
         val m = store.load(gid) ?: return
         val r = m.roster?.roster ?: return
         if (m.state != GroupModel.JOINED) {
@@ -727,23 +735,37 @@ class GroupEngine(
         } catch (e: DuplicateMessageException) {
             dbg { "already had what ${who(sender)} sent before they were listed" }
             false
+        } catch (e: ReusedBaseKeyException) {
+            // Its PreKey message started a session from our last-resort prekeys before: a replay.
+            dbg { "replayed PreKey message from ${who(sender)}" }
+            false
         } catch (e: Exception) {
             // It was read once, and the real session can't move past it: nothing can decrypt it again either.
             true
         }
     }
 
-    /** The padded plaintext of [blob] from [sender], or null if the PreKey message names someone else. Throws if it fails. */
+    /**
+     * The padded plaintext of [blob] from [sender], or null if the PreKey message names someone else. Throws if it fails.
+     * A PreKey message for the real store is decrypted in a [ScratchStore] first and only then written to it: libsignal
+     * stores the session before it refuses a replayed one ([app.goldfishsend.crypto.LastResortLog]).
+     */
     private fun open(sender: String, blob: GroupBlob, keys: SignalProtocolStore): ByteArray? {
         val addr = GroupCrypto.address(sender)
         val key = IdentityKey(B64.dec(sender))
-        val cipher = SessionCipher(keys, LOCAL, addr)
         // libsignal stores the sender's identity itself, once the message has decrypted.
         return if (blob.type == PREKEY) {
             val msg = PreKeySignalMessage(blob.body)
-            if (msg.identityKey != key) null else cipher.decrypt(msg)
+            if (msg.identityKey != key) {
+                null
+            } else if (keys === signal) {
+                val staged = ScratchStore(signal)
+                SessionCipher(staged, LOCAL, addr).decrypt(msg).also { staged.commit() }
+            } else {
+                SessionCipher(keys, LOCAL, addr).decrypt(msg)
+            }
         } else {
-            cipher.decrypt(SignalMessage(blob.body))
+            SessionCipher(keys, LOCAL, addr).decrypt(SignalMessage(blob.body))
         }
     }
 
@@ -761,10 +783,29 @@ class GroupEngine(
 
     // ---------- incoming content ----------
 
-    /** Group content that arrived over a 1:1 session with contact [from] (identity key, b64u). */
+    /**
+     * Group content that arrived over a 1:1 session with contact [from] (identity key, b64u). About a group we know, only
+     * from someone it concerns ([mayWriteDirect]); about one we don't, only an invitation from its owner ([invitation]).
+     */
     fun onDirect(from: String, content: Content) {
         val gid = content.groupId ?: return
+        val m = store.load(gid)
+        if (m != null && !mayWriteDirect(m, from)) {
+            dbg { "${who(me)} ignores 1:1 group content from ${who(from)}, who isn't in g=${gid.take(6)}" }
+            return
+        }
         onContent(gid, from, content, direct = true)
+    }
+
+    /**
+     * Whether [from] may tell us anything over 1:1 about [m]: someone our roster lists (owner, member or invitee), the one
+     * who invited us, or a peer we're in touch with about it (one we answer, or took out). Any other contact who knows
+     * the group's id has nothing for us: their rosters, facts and cards would check themselves, but merging them is work
+     * (and held facts) a stranger shouldn't be able to cause.
+     */
+    private fun mayWriteDirect(m: GroupModel, from: String): Boolean {
+        val r = m.roster?.roster ?: return false
+        return r.member(from) != null || from == m.invitedBy || from in m.peers
     }
 
     /**

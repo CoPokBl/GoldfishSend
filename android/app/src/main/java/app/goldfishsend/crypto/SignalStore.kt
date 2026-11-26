@@ -6,6 +6,7 @@ import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.IdentityKeyPair
 import org.signal.libsignal.protocol.InvalidKeyIdException
 import org.signal.libsignal.protocol.NoSessionException
+import org.signal.libsignal.protocol.ReusedBaseKeyException
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.ecc.ECPublicKey
 import org.signal.libsignal.protocol.groups.state.SenderKeyRecord
@@ -16,8 +17,19 @@ import org.signal.libsignal.protocol.state.SessionRecord
 import org.signal.libsignal.protocol.state.SignalProtocolStore
 import org.signal.libsignal.protocol.state.SignedPreKeyRecord
 
+/**
+ * Which sessions a store's last-resort prekeys (a group card's, reused by every initiator) have started: the (Kyber
+ * prekey, signed prekey, base key) of each PreKey message that set one up. libsignal only asks the store whether one was
+ * used before when it starts a session, so a PreKey message replayed once its session is gone (its sender left every
+ * group we shared, and was forgotten) would otherwise start that session again and decrypt again.
+ */
+interface LastResortLog {
+    /** Whether a PreKey message with these ids and [baseKey] already started a session from last-resort prekeys. */
+    fun baseKeySeen(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey): Boolean
+}
+
 /** libsignal protocol store backed by the SQLCipher database. */
-class SignalStore(private val db: Db) : SignalProtocolStore {
+class SignalStore(private val db: Db) : SignalProtocolStore, LastResortLog {
     private fun key(a: SignalProtocolAddress): String = "${a.name}.${a.deviceId}"
 
     private val identity: IdentityKeyPair by lazy {
@@ -131,22 +143,41 @@ class SignalStore(private val db: Db) : SignalProtocolStore {
     override fun containsKyberPreKey(kyberPreKeyId: Int): Boolean =
         db.long("SELECT COUNT(*) FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId) > 0
 
-    /** Deletes an unused Kyber prekey (its invite expired or was abandoned). */
+    /** Deletes a Kyber prekey (its invite expired or was abandoned, or we left the group), and its replay record. */
     fun removeKyberPreKey(kyberPreKeyId: Int) {
         db.exec("DELETE FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId)
+        db.exec("DELETE FROM sig_kyber_used WHERE kyber_id = ?", kyberPreKeyId)
     }
 
     /**
      * One-time Kyber prekeys are deleted on use (forward secrecy). The signed prekey goes with it. A group's last-resort
-     * prekeys (published in its card, used by every member who starts a session) stay until we leave or replace the card.
+     * prekeys (published in its card, used by every member who starts a session) stay until we leave or replace the card,
+     * so each session they start is recorded instead, and a PreKey message that would start one again is refused
+     * ([LastResortLog]). The record keeps the newest [MAX_USED_PER_KEY] per prekey: a member can only push old ones out
+     * by starting that many sessions, and a replay of an older one still fails while its sender's session is held
+     * (libsignal finds the base key there and rejects the message as a duplicate).
      */
     override fun markKyberPreKeyUsed(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey) {
-        if (db.long("SELECT COUNT(*) FROM sig_kyber_prekey WHERE id = ? AND last_resort = 1", kyberPreKeyId) > 0) {
+        if (isLastResort(kyberPreKeyId)) {
+            if (baseKeySeen(kyberPreKeyId, signedPreKeyId, baseKey)) {
+                throw ReusedBaseKeyException("PreKey message replayed")
+            }
+            db.exec("INSERT INTO sig_kyber_used (kyber_id, spk_id, base_key) VALUES (?, ?, ?)", kyberPreKeyId, signedPreKeyId, baseKey.serialize())
+            db.exec(
+                "DELETE FROM sig_kyber_used WHERE kyber_id = ? AND rowid NOT IN " +
+                    "(SELECT rowid FROM sig_kyber_used WHERE kyber_id = ? ORDER BY rowid DESC LIMIT ?)",
+                kyberPreKeyId, kyberPreKeyId, MAX_USED_PER_KEY,
+            )
             return
         }
         db.exec("DELETE FROM sig_kyber_prekey WHERE id = ?", kyberPreKeyId)
         db.exec("DELETE FROM sig_signed_prekey WHERE id = ?", signedPreKeyId)
     }
+
+    override fun baseKeySeen(kyberPreKeyId: Int, signedPreKeyId: Int, baseKey: ECPublicKey): Boolean = db.long(
+        "SELECT COUNT(*) FROM sig_kyber_used WHERE kyber_id = ? AND spk_id = ? AND base_key = ?",
+        kyberPreKeyId, signedPreKeyId, baseKey.serialize(),
+    ) > 0
 
     /** Marks a Kyber prekey as last-resort (a group card's), so using it doesn't delete it. */
     fun markLastResort(kyberPreKeyId: Int) {
@@ -205,4 +236,9 @@ class SignalStore(private val db: Db) : SignalProtocolStore {
             "SELECT record FROM sig_sender_key WHERE address = ? AND dist = ?",
             key(sender), distributionId.toString(),
         ) { SenderKeyRecord(it.getBlob(0)) }
+
+    companion object {
+        /** Sessions recorded per last-resort prekey ([markKyberPreKeyUsed]): about 100 KB at most. */
+        const val MAX_USED_PER_KEY = 2048
+    }
 }

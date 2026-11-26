@@ -11,10 +11,10 @@ import app.goldfishsend.db.RESEND_WINDOW_MS
 import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
-import app.goldfishsend.proto.GroupBlob
 import app.goldfishsend.db.memberRoutes
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.PushEnvelope
@@ -82,13 +82,14 @@ object Messenger {
     private suspend fun receiveOne(s: Session, tag: ByteArray, raw: ByteArray) {
         val mb = s.repo.mailboxByTag(tag) ?: return
         if (mb.purpose == Mailbox.PURPOSE_GROUP) {
-            // A group inbox: only group blobs (docs/groups.md), from whichever member the sender hint names.
-            if (GroupBlob.isGroup(raw)) {
-                Groups.receive(s, mb, raw)
-            }
+            // A group inbox (docs/groups.md): unwrapped with its hint key's wrap key, then read from whichever member the
+            // sender hint names.
+            Groups.receive(s, mb, raw)
             return
         }
-        val blob = E2eBlob.decode(raw) ?: return
+        // Everything the server relays is wrapped under this mailbox's own key, which only the contact holds.
+        val inner = mb.wrapKey?.let { BlobWrap.open(it, raw) } ?: return
+        val blob = E2eBlob.decode(inner) ?: return
         val d = try {
             s.lock.withLock { decrypt(s, mb, blob) }
         } catch (e: DuplicateMessageException) {
@@ -191,13 +192,14 @@ object Messenger {
             is Content.Chunk, is Content.GText, is Content.GReceipt, is Content.GDelete, is Content.GState -> Unit
             is Content.Hello -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
-                if (secret == null || secret.size != 32 || !ServerApi.isValidContactServer(c.server)) {
+                val wrapKey = wrapKey(c.wrapKey)
+                if (secret == null || secret.size != 32 || wrapKey == null || !ServerApi.isValidContactServer(c.server)) {
                     return
                 }
                 if (c.serverKey != null && !Gateway.isFingerprint(c.serverKey)) {
                     return
                 }
-                s.repo.updateContactOutbound(cid, c.server, secret, c.serverKey)
+                s.repo.updateContactOutbound(cid, c.server, secret, c.serverKey, wrapKey)
                 val contact = s.repo.contact(cid)
                 val name = Sanitize.name(c.name)
                 if (name != null && contact?.name == Invites.DEFAULT_NAME) {
@@ -231,16 +233,20 @@ object Messenger {
             }
             is Content.Mailbox -> {
                 val secret = runCatching { B64.dec(c.sendSecret) }.getOrNull()
+                val wrapKey = wrapKey(c.wrapKey)
                 val keyOk = c.serverKey == null || Gateway.isFingerprint(c.serverKey)
-                if (secret != null && secret.size == 32 && keyOk && ServerApi.isValidContactServer(c.server)) {
+                if (secret != null && secret.size == 32 && wrapKey != null && keyOk && ServerApi.isValidContactServer(c.server)) {
                     // E2E-authenticated by the contact, so a new server fingerprint here resolves a pending identity change.
-                    s.repo.updateContactOutbound(cid, c.server, secret, c.serverKey)
+                    s.repo.updateContactOutbound(cid, c.server, secret, c.serverKey, wrapKey)
                     s.db.notifyChanged()
                     Outbox.kick()
                 }
             }
         }
     }
+
+    /** A mailbox's wrap key from a `hello` or `mailbox` message (b64u, 32 bytes), or null. */
+    private fun wrapKey(b64: String): ByteArray? = runCatching { B64.dec(b64) }.getOrNull()?.takeIf { it.size == BlobWrap.KEY_BYTES }
 
     private suspend fun onText(s: Session, cid: Long, t: Content.Text) {
         val parts = t.parts ?: 1

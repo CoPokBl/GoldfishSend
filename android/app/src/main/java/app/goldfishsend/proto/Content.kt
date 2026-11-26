@@ -9,9 +9,19 @@ import kotlinx.serialization.json.Json
 /** E2E Content JSON (docs/protocol.md, "E2E blob"). Discriminator field is `t`. */
 @Serializable
 sealed class Content {
+    /**
+     * The scanner's first message: their return mailbox, and its [wrapKey] (b64u, 32 bytes), which wraps everything sent to
+     * it ([BlobWrap]). Only the two of them know it, so the server can't read what's inside the blobs.
+     */
     @Serializable
     @SerialName("hello")
-    data class Hello(val server: String, val sendSecret: String, val name: String? = null, val serverKey: String? = null) : Content()
+    data class Hello(
+        val server: String,
+        val sendSecret: String,
+        val name: String? = null,
+        val serverKey: String? = null,
+        val wrapKey: String,
+    ) : Content()
 
     @Serializable
     @SerialName("text")
@@ -42,9 +52,10 @@ sealed class Content {
     @SerialName("delete")
     data class Delete(val ids: List<String>) : Content()
 
+    /** The sender moved its inbox for this contact, with the new mailbox's [wrapKey] (see [Hello]). */
     @Serializable
     @SerialName("mailbox")
-    data class Mailbox(val server: String, val sendSecret: String, val serverKey: String? = null) : Content()
+    data class Mailbox(val server: String, val sendSecret: String, val serverKey: String? = null, val wrapKey: String) : Content()
 
     /** Any content too large for one message, split into parts (docs/groups.md, "Chunking"). Never nested. */
     @Serializable

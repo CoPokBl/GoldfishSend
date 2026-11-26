@@ -362,10 +362,12 @@ class GroupScenario(private val seed: Long) {
                 val claimed = peer(op.c)
                 val card = mallory.store.routes[gid]?.get(target.id)?.card ?: return
                 val content = Content.GText(gid, "f$msg", "forged ${msg++} as ${claimed.name}", now)
-                val blob = GroupBlob.decode(mallory.engine.encryptTo(target.id, card, content.encode()))!!
-                val mac = GroupCrypto.hint(B64.dec(card.hintKey), blob.nonce, claimed.identity.publicKey.serialize())
+                val hintKey = B64.dec(card.hintKey)
+                val blob = app.goldfishsend.openGroupBlob(hintKey, mallory.engine.encryptTo(target.id, card, content.encode()))
+                val mac = GroupCrypto.hint(hintKey, blob.nonce, claimed.identity.publicKey.serialize())
                 log("mallory sends as ${claimed.name} to ${target.name}")
-                net.queue.addLast(GroupNet.Envelope.ToInbox(target, card.inbox.sendSecret, GroupBlob(blob.type, blob.nonce, mac, blob.body).encode(), mallory))
+                val forged = app.goldfishsend.wrapGroupBlob(hintKey, GroupBlob(blob.type, blob.nonce, mac, blob.body))
+                net.queue.addLast(GroupNet.Envelope.ToInbox(target, card.inbox.sendSecret, forged, mallory))
             }
             4 -> {
                 // Sam isn't in the group; Mallory gave him a member's card.

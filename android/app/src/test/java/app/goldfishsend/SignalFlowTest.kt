@@ -1,6 +1,7 @@
 package app.goldfishsend
 
 import app.goldfishsend.proto.B64
+import app.goldfishsend.proto.BlobWrap
 import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.E2eBlob
@@ -10,6 +11,7 @@ import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.PushEnvelope
 import app.goldfishsend.proto.Rand
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.signal.libsignal.protocol.IdentityKey
@@ -89,16 +91,27 @@ class SignalFlowTest {
             kyberPreKey = B64.enc(kyber.publicKey.serialize()),
             kyberPreKeySig = B64.enc(kyberSig),
             name = "Alice",
+            wrapKey = B64.enc(aliceWrap),
         )
     }
 
+    /** Alice's mailbox's wrap key (from her invite) and Bob's (from his hello). */
+    private val aliceWrap = BlobWrap.newKey()
+    private val bobWrap = BlobWrap.newKey()
+
+    private fun wrapFor(remote: SignalProtocolAddress) = if (remote == aliceSeenFromBob) aliceWrap else bobWrap
+
+    /** Encrypted and wrapped for [remote]'s mailbox, exactly as Outbox sends it. The type byte is inside the wrapping. */
     private fun encrypt(store: InMemorySignalProtocolStore, remote: SignalProtocolAddress, content: Content): ByteArray {
         val msg = SessionCipher(store, self, remote).encrypt(Padding.pad(content.encode()))
-        return E2eBlob(msg.type, msg.serialize()).encode()
+        return BlobWrap.seal(wrapFor(remote), E2eBlob(msg.type, msg.serialize()).encode())
     }
 
+    private fun type(remote: SignalProtocolAddress, wrapped: ByteArray): Int = BlobWrap.open(wrapFor(remote), wrapped)!![0].toInt()
+
     private fun decrypt(store: InMemorySignalProtocolStore, remote: SignalProtocolAddress, raw: ByteArray): Content {
-        val blob = E2eBlob.decode(raw)!!
+        // [store] receives on its own mailbox: Alice's when the sender is Bob.
+        val blob = E2eBlob.decode(BlobWrap.open(if (remote == bobSeenFromAlice) aliceWrap else bobWrap, raw)!!)!!
         val cipher = SessionCipher(store, self, remote)
         val pt = if (blob.type == E2eBlob.PREKEY) cipher.decrypt(PreKeySignalMessage(blob.body)) else cipher.decrypt(SignalMessage(blob.body))
         return Content.decode(Padding.unpad(pt))
@@ -119,29 +132,35 @@ class SignalFlowTest {
         )
         SessionBuilder(bob, aliceSeenFromBob, self).process(pk)
 
-        val hello = Content.Hello("https://bob.example", B64.enc(Rand.bytes(32)), "Bob")
+        val hello = Content.Hello("https://bob.example", B64.enc(Rand.bytes(32)), "Bob", wrapKey = B64.enc(bobWrap))
         val helloBlob = encrypt(bob, aliceSeenFromBob, hello)
-        assertEquals(CiphertextMessage.PREKEY_TYPE, helloBlob[0].toInt())
+        assertEquals(CiphertextMessage.PREKEY_TYPE, type(aliceSeenFromBob, helloBlob))
+        // The server sees none of it: the size is one of the fixed ones, and Bob's identity key isn't in the bytes.
+        assertTrue(helloBlob.size in BlobWrap.SIZES)
+        assertFalse(helloBlob.toList().windowed(33).any { it.toByteArray().contentEquals(bob.identityKeyPair.publicKey.serialize()) })
         assertEquals(hello, decrypt(alice, bobSeenFromAlice, helloBlob))
 
         assertTrue("one-time prekeys must be consumed", 11 in alice.deletedKyber && 10 in alice.deletedSigned)
 
         // Bob keeps sending PreKey messages until Alice replies. They must still decrypt after the prekeys are deleted.
         val text = Content.Text("t1", "hi", 1)
-        assertEquals(CiphertextMessage.PREKEY_TYPE, encrypt(bob, aliceSeenFromBob, text).also {
+        assertEquals(CiphertextMessage.PREKEY_TYPE, type(aliceSeenFromBob, encrypt(bob, aliceSeenFromBob, text).also {
             assertEquals(text, decrypt(alice, bobSeenFromAlice, it))
-        }[0].toInt())
+        }))
 
         val reply = encrypt(alice, bobSeenFromAlice, Content.Text("t2", "hello Bob", 2))
-        assertEquals(CiphertextMessage.WHISPER_TYPE, reply[0].toInt())
+        assertEquals(CiphertextMessage.WHISPER_TYPE, type(bobSeenFromAlice, reply))
         assertEquals("hello Bob", (decrypt(bob, aliceSeenFromBob, reply) as Content.Text).body)
 
         val after = encrypt(bob, aliceSeenFromBob, Content.Receipt(listOf("t2"), "read"))
-        assertEquals(CiphertextMessage.WHISPER_TYPE, after[0].toInt())
+        assertEquals(CiphertextMessage.WHISPER_TYPE, type(aliceSeenFromBob, after))
         decrypt(alice, bobSeenFromAlice, after)
     }
 
-    /** Largest padded plaintexts allowed by protocol.md must fit maxMessageBytes once encrypted. */
+    /**
+     * Largest padded plaintexts allowed by protocol.md must fit maxMessageBytes once encrypted and wrapped, a group's with
+     * its 32-byte hint too.
+     */
     @Test
     fun maxSizedMessagesFitPushBudget() {
         val invite = aliceInvite()
@@ -159,26 +178,30 @@ class SignalFlowTest {
         var maxPre = 0
         for (p in preParts) {
             val blob = encrypt(bob, aliceSeenFromBob, p)
-            assertEquals(CiphertextMessage.PREKEY_TYPE, blob[0].toInt())
-            maxPre = maxOf(maxPre, blob.size)
+            assertEquals(CiphertextMessage.PREKEY_TYPE, type(aliceSeenFromBob, blob))
+            assertTrue(blob.size in BlobWrap.SIZES)
+            maxPre = maxOf(maxPre, BlobWrap.open(aliceWrap, blob)!!.size)
             decrypt(alice, bobSeenFromAlice, blob)
         }
-        assertTrue("PreKey blob $maxPre exceeds ${E2eBlob.MAX_BYTES}", maxPre <= E2eBlob.MAX_BYTES)
+        // Group blobs carry the hint inside too, and every group message may be a PreKey one.
+        assertTrue("PreKey blob $maxPre exceeds ${BlobWrap.MAX_INNER}", maxPre + 32 <= BlobWrap.MAX_INNER)
 
         // Whisper phase: chunks padded to ≤ 3584, in both directions.
         decrypt(bob, aliceSeenFromBob, encrypt(alice, bobSeenFromAlice, Content.Text("r", "ok", 1)))
         var maxWhisper = 0
         for (p in Chunker.split("big2", longBody, 1, null, null, Padding.MAX_PLAINTEXT)) {
             val blob = encrypt(bob, aliceSeenFromBob, p)
-            assertEquals(CiphertextMessage.WHISPER_TYPE, blob[0].toInt())
-            maxWhisper = maxOf(maxWhisper, blob.size)
+            assertEquals(CiphertextMessage.WHISPER_TYPE, type(aliceSeenFromBob, blob))
+            assertTrue(blob.size in BlobWrap.SIZES)
+            maxWhisper = maxOf(maxWhisper, BlobWrap.open(aliceWrap, blob)!!.size)
             decrypt(alice, bobSeenFromAlice, blob)
         }
-        assertTrue("Whisper blob $maxWhisper exceeds ${E2eBlob.MAX_BYTES}", maxWhisper <= E2eBlob.MAX_BYTES)
+        assertTrue("Whisper blob $maxWhisper exceeds ${BlobWrap.MAX_INNER}", maxWhisper <= BlobWrap.MAX_INNER)
 
-        // And the whole thing must fit the push envelope's 3993-byte plaintext.
-        val env = PushEnvelope.build(PushEnvelope.TYPE_MESSAGE, ByteArray(8), ByteArray(maxOf(maxPre, maxWhisper)))
-        assertTrue(env.size <= 3993)
-        println("max PreKey blob = $maxPre B, max Whisper blob = $maxWhisper B (budget ${E2eBlob.MAX_BYTES})")
+        // And the largest wrapped blob must fit the push envelope's 3993-byte plaintext.
+        assertEquals(E2eBlob.MAX_BYTES, BlobWrap.SIZES.last())
+        val env = PushEnvelope.build(PushEnvelope.TYPE_MESSAGE, ByteArray(8), ByteArray(BlobWrap.SIZES.last()))
+        assertEquals(3993, env.size)
+        println("max PreKey blob = $maxPre B, max Whisper blob = $maxWhisper B inside the wrapping (budget ${BlobWrap.MAX_INNER})")
     }
 }
