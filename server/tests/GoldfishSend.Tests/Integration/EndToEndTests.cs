@@ -59,6 +59,8 @@ public sealed class EndToEndTests {
         foreach (var sealedEndpoint in rows) {
             Assert.Equal(-1, sealedEndpoint.AsSpan().IndexOf(url));
             Assert.Equal(-1, sealedEndpoint.AsSpan().IndexOf(mailbox.Device.Auth));
+            // Padded, so the length doesn't group one device's mailboxes.
+            Assert.Equal(GoldfishSend.Core.Crypto.MailboxCrypto.SealedEndpointSize, sealedEndpoint.Length);
         }
         var ids = await Dapper.SqlMapper.QueryAsync<byte[]>(conn, "SELECT id FROM mailboxes");
         Assert.DoesNotContain(ids, id => id.AsSpan().SequenceEqual(mailbox.SendSecret));

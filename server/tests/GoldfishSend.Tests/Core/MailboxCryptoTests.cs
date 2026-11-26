@@ -113,7 +113,7 @@ public sealed class MailboxCryptoTests {
         var id = Crypto.MailboxId(SendSecret);
 
         var sealedRecord = MailboxCrypto.SealEndpoint(key, record, id);
-        Assert.Equal(SecretBox.Overhead + record.Serialize().Length, sealedRecord.Length);
+        Assert.Equal(MailboxCrypto.SealedEndpointSize, sealedRecord.Length);
 
         var opened = MailboxCrypto.UnsealEndpoint(key, sealedRecord, id);
         Assert.Equal(record.Url, opened.Url);
@@ -139,7 +139,58 @@ public sealed class MailboxCryptoTests {
         var plain = new byte[sealedRecord.Length - 28];
         using var gcm = new AesGcm(key, 16);
         gcm.Decrypt(sealedRecord.AsSpan(0, 12), sealedRecord.AsSpan(12, plain.Length), sealedRecord.AsSpan(12 + plain.Length), plain, id);
-        Assert.Equal(record.Serialize(), plain);
+        var serialized = record.Serialize();
+        Assert.Equal(2 + 2048 + 65 + 16, plain.Length);
+        Assert.Equal(serialized, plain[..serialized.Length]);
+        Assert.All(plain[serialized.Length..], b => Assert.Equal(0, b));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(37)]
+    [InlineData(2048)]
+    public void Sealed_LengthDoesNotDependOnTheUrl(int urlLength) {
+        var sample = SampleRecord();
+        var record = new EndpointRecord(new string('a', urlLength), sample.P256dh, sample.Auth);
+        var key = Crypto.SealKey(SendSecret);
+        var id = Crypto.MailboxId(SendSecret);
+
+        var sealedRecord = MailboxCrypto.SealEndpoint(key, record, id);
+        Assert.Equal(MailboxCrypto.SealedEndpointSize, sealedRecord.Length);
+        // It still fits the mailboxes.sealed_endpoint and pending_endpoint columns.
+        Assert.True(sealedRecord.Length <= 2304);
+        Assert.Equal(record.Url, MailboxCrypto.UnsealEndpoint(key, sealedRecord, id).Url);
+    }
+
+    [Fact]
+    public void Unseal_UnpaddedRecord_Throws() {
+        var record = SampleRecord();
+        var key = Crypto.SealKey(SendSecret);
+        var id = Crypto.MailboxId(SendSecret);
+        var sealedRecord = SecretBox.Seal(key, record.Serialize(), id);
+        Assert.Throws<FormatException>(() => MailboxCrypto.UnsealEndpoint(key, sealedRecord, id));
+    }
+
+    [Fact]
+    public void Unseal_NonZeroPadding_Throws() {
+        var record = SampleRecord();
+        var key = Crypto.SealKey(SendSecret);
+        var id = Crypto.MailboxId(SendSecret);
+        var plain = new byte[MailboxCrypto.PaddedEndpointSize];
+        record.Serialize().CopyTo(plain, 0);
+        plain[^1] = 1;
+        Assert.Throws<FormatException>(() => MailboxCrypto.UnsealEndpoint(key, SecretBox.Seal(key, plain, id), id));
+    }
+
+    [Fact]
+    public void Unseal_OversizedUrlLength_Throws() {
+        var key = Crypto.SealKey(SendSecret);
+        var id = Crypto.MailboxId(SendSecret);
+        var plain = new byte[MailboxCrypto.PaddedEndpointSize];
+        plain[0] = 0xFF;
+        plain[1] = 0xFF;
+        Assert.Throws<FormatException>(() => MailboxCrypto.UnsealEndpoint(key, SecretBox.Seal(key, plain, id), id));
     }
 
     [Fact]
