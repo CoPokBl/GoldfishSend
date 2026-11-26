@@ -153,6 +153,9 @@ class SignalStore(private val db: Db) : SignalProtocolStore {
         db.exec("UPDATE sig_kyber_prekey SET last_resort = 1 WHERE id = ?", kyberPreKeyId)
     }
 
+    fun isLastResort(kyberPreKeyId: Int): Boolean =
+        db.long("SELECT COUNT(*) FROM sig_kyber_prekey WHERE id = ? AND last_resort = 1", kyberPreKeyId) > 0
+
     // --- SessionStore ---
 
     override fun loadSession(address: SignalProtocolAddress): SessionRecord? =

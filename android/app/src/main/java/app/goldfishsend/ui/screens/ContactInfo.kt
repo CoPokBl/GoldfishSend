@@ -80,18 +80,39 @@ internal fun safetyNumber(s: Session, remote: ByteArray): String? = runCatching 
         .displayableFingerprint.displayText
 }.getOrNull()
 
+/**
+ * The keys behind what the screen shows, read in one go with the numbers computed from them, so a number on screen is
+ * always the number of the key that its button acts on.
+ */
+private class SafetyView(val key: ByteArray?, val number: String, val pendingKey: ByteArray?, val pendingNumber: String?)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: () -> Unit) {
     val scope = rememberCoroutineScope()
     val contact by rememberQuery(s, contactId) { it.repo.contact(contactId) }
-    // Null while it's computed (it takes a moment), empty when there's nothing to compare yet.
-    val safety by rememberQuery(s, contact?.identityKey?.size) { q -> contact?.identityKey?.let { safetyNumber(q, it) }.orEmpty() }
+    // Null while it's computed (it takes a moment). Each run reads the row itself, never the one on screen, which can
+    // be a change behind.
+    val view by rememberQuery(s, contactId) { q ->
+        q.repo.contact(contactId)?.let { now ->
+            SafetyView(
+                key = now.identityKey,
+                // Empty when there's nothing to compare yet.
+                number = now.identityKey?.let { safetyNumber(q, it) }.orEmpty(),
+                pendingKey = now.pendingIdentity,
+                pendingNumber = now.pendingIdentity?.let { safetyNumber(q, it) },
+            )
+        }
+    }
+    val safety = view?.number
     var rename by remember { mutableStateOf(false) }
     var timer by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     var confirmAccept by remember { mutableStateOf(false) }
+    var confirmReject by remember { mutableStateOf(false) }
+    // The pending key whose number was on screen when Accept or Keep was tapped.
+    var reviewed by remember { mutableStateOf<ByteArray?>(null) }
     val activity = LocalActivity.current as FragmentActivity
     val reauth = rememberReAuth(s, activity)
     val trusting = rememberWork()
@@ -99,7 +120,7 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
     val erasing = rememberWork()
     val deleting = rememberWork()
     val c = contact ?: return
-    val newSafety by rememberQuery(s, c.pendingIdentity?.size) { q -> c.pendingIdentity?.let { safetyNumber(q, it) } }
+    val newSafety = view?.pendingNumber
 
     Scaffold(
         topBar = {
@@ -189,9 +210,9 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                         Text("${c.name}'s safety number changed", style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "This usually means they reinstalled GoldfishSend or got a new phone, but it could also mean someone " +
-                                "is pretending to be them. Messages are paused. Compare the new number below with ${c.name}, in person " +
-                                "or on a call, before accepting.",
+                            "A reinstalled app or a new phone can't normally reach this chat again, so this could mean someone " +
+                                "is pretending to be ${c.name}. Messages are paused. Compare the new number below with ${c.name}, in " +
+                                "person or on a call, before accepting it.",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Spacer(Modifier.height(12.dp))
@@ -206,7 +227,14 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                             }
                         }
                         Spacer(Modifier.height(12.dp))
-                        ProgressButton(onClick = { confirmAccept = true }, busy = accepting.busy) { Text("Accept new safety number") }
+                        ProgressButton(
+                            onClick = { reviewed = view?.pendingKey?.takeIf { newSafety != null }; confirmAccept = reviewed != null },
+                            busy = accepting.busy,
+                        ) { Text("Accept new safety number") }
+                        TextButton(
+                            onClick = { reviewed = view?.pendingKey?.takeIf { newSafety != null }; confirmReject = reviewed != null },
+                            enabled = !accepting.busy,
+                        ) { Text("Keep the previous number") }
                     }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -251,7 +279,11 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                     "Only after comparing safety numbers in person or over a call",
                     Icons.Rounded.Verified,
                     checked = c.verified,
-                    onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setVerified(contactId, v); s.db.notifyChanged() } },
+                    // Only the key whose number is on screen can be marked verified: if it changed meanwhile, nothing is.
+                    onChange = { v ->
+                        val shown = view?.key?.takeIf { view?.number?.isNotEmpty() == true }
+                        scope.launch(Dispatchers.IO) { s.repo.setVerified(contactId, v, shown); s.db.notifyChanged() }
+                    },
                 )
                 val hiddenOn by rememberQuery(s) { q -> !q.decoy && q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
                 if (hiddenOn == true) {
@@ -314,12 +346,26 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
             }
         }
     }
-    if (confirmAccept) {
+    val key = reviewed
+    if (confirmAccept && key != null) {
         ConfirmDialog(
             "Accept the new safety number?",
             "Only do this if you've confirmed with ${c.name} that the new number is theirs. They'll be marked as not verified.",
             "Accept", false, { confirmAccept = false },
-        ) { accepting.run { withContext(Dispatchers.IO) { app.goldfishsend.core.Messenger.acceptIdentityChange(s, contactId) } } }
+        ) {
+            // Bound to the key whose number was on screen: if another change came in meanwhile, nothing is accepted.
+            accepting.run { withContext(Dispatchers.IO) { Messenger.acceptIdentityChange(s, contactId, key) } }
+        }
+    }
+    if (confirmReject && key != null) {
+        ConfirmDialog(
+            "Keep the previous safety number?",
+            "The messages that came with the new number are discarded, and messages to ${c.name} go to the previous one again. " +
+                "If they really changed phones, they'll have to add you again.",
+            "Keep previous", true, { confirmReject = false },
+        ) {
+            accepting.run { withContext(Dispatchers.IO) { Messenger.rejectIdentityChange(s, contactId, key) } }
+        }
     }
     if (confirmDelete) {
         ConfirmDialog(

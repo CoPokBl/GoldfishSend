@@ -55,7 +55,13 @@ class Session(val db: Db, private var mk: ByteArray, val messages: MessageVault)
         mk = newMk
     }
 
+    /** Set once [close] starts: work still running for this session (a locked-inbox drain) stops instead of failing on. */
+    @Volatile
+    var closed = false
+        private set
+
     fun close() {
+        closed = true
         db.close()
         mk.wipe()
         messages.wipe()
@@ -278,6 +284,8 @@ object Graph {
 
     /** Locks: closes the DB and wipes keys from memory. */
     fun lock() {
+        // The invite on screen belongs to this profile only (a wipe or a decoy may follow in this same process).
+        Invites.forgetCachedQr()
         val s = _session.value ?: return
         _session.value = null
         Actions.clearFailures()

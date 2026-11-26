@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 7
+    const val VERSION = 8
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -224,9 +224,51 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 8) {
+                for (s in V8) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Held messages sealed like message bodies, tombstones for removed messages, and mailboxes still to delete. */
+    internal val V8 = listOf(
+        // Rebuilt: held blobs were sealed only by the DB key, so wipes and timers didn't reach them. Nothing was released.
+        "DROP TABLE held_incoming",
+        // Raw E2E blobs that arrived with a changed identity key [identity], waiting for the user to review it. Sealed like a
+        // message body ([MessageVault], label "held/<id>"), with the chat's timer as their expiry, so erasing messages,
+        // the reboot wipe and disappearing timers destroy them too.
+        """CREATE TABLE held_incoming (
+            id TEXT PRIMARY KEY,
+            contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            identity BLOB NOT NULL,
+            tag BLOB NOT NULL,
+            blob BLOB NOT NULL,
+            key BLOB NOT NULL,
+            bucket INTEGER,
+            received_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        )""",
+        // Wire ids of incoming messages that were viewed once, deleted or expired, so a re-send of one (its sender never got
+        // our receipt) doesn't bring it back. Ids only, kept until no re-send can still arrive.
+        """CREATE TABLE gone_incoming (
+            contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            wire_id TEXT NOT NULL,
+            until INTEGER NOT NULL,
+            PRIMARY KEY (contact_id, wire_id)
+        )""",
+        // Our mailboxes whose chat is gone (blocked contact, left group, server switch) but that the server may still hold.
+        // Retried until the server confirms, so a blocked contact can't keep writing to one.
+        """CREATE TABLE doomed_mailboxes (
+            send_secret BLOB PRIMARY KEY,
+            owner_secret BLOB NOT NULL,
+            server TEXT NOT NULL,
+            server_key TEXT,
+            created_at INTEGER NOT NULL
+        )""",
+    )
 
     /** Group delivery by state and heads (docs/groups.md, "State"). Groups made before can't be read any more. */
     internal val V7 = listOf(

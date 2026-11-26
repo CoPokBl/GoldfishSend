@@ -80,6 +80,9 @@ object MsgKind {
     const val SYSTEM = 1
 }
 
+/** One of our mailboxes whose chat is gone, still to delete on [server] (pinned to [serverKey]). */
+class DoomedMailbox(val sendSecret: ByteArray, val ownerSecret: ByteArray, val server: String, val serverKey: String?, val createdAt: Long)
+
 data class Message(
     val id: String,
     val contactId: Long,
@@ -132,6 +135,18 @@ data class OutboxItem(
 /** Typed data access over [Db]. Message bodies are always stored through [MessageVault]. */
 /** Incomplete chunked messages kept per contact (64 parts × 4 messages). */
 const val MAX_CHUNKS_PER_CONTACT = 256L
+
+/** Messages held behind a changed safety number, per contact. */
+const val MAX_HELD_PER_CONTACT = 200L
+
+/** How long after sending an unreceipted message may be re-sent automatically. */
+const val RESEND_WINDOW_MS = 7 * 86_400_000L
+
+/**
+ * How long the wire id of a removed incoming message is remembered. A re-send leaves within [RESEND_WINDOW_MS] of the
+ * original and the server keeps it for at most 14 days, so none can arrive later than this (with a margin).
+ */
+const val GONE_KEEP_MS = RESEND_WINDOW_MS + 16 * 86_400_000L
 
 class Repo(val db: Db, private val vault: MessageVault) {
     // --- kv ---
@@ -255,26 +270,65 @@ class Repo(val db: Db, private val vault: MessageVault) {
     fun mailboxesForContact(contactId: Long): List<Mailbox> =
         db.query("SELECT $mbCols FROM mailboxes WHERE contact_id = ?", contactId, map = ::mailbox)
 
-    fun setVerified(id: Long, v: Boolean) = db.exec("UPDATE contacts SET verified = ? WHERE id = ?", v, id)
+    /** Unverifying always works. Verifying only if [key] is still the contact's identity key: the one the user compared. */
+    fun setVerified(id: Long, v: Boolean, key: ByteArray?): Boolean = if (v) {
+        key != null && db.update("UPDATE contacts SET verified = 1 WHERE id = ? AND identity_key = ?", id, key) == 1
+    } else {
+        db.update("UPDATE contacts SET verified = 0 WHERE id = ?", id) == 1
+    }
 
     // --- identity changes ---
 
     fun setPendingIdentity(id: Long, key: ByteArray?) = db.exec("UPDATE contacts SET pending_identity = ? WHERE id = ?", key, id)
 
-    /** Accepts a reviewed identity change: the new key becomes the contact's key, and they're no longer verified. */
-    fun acceptPendingIdentity(id: Long, key: ByteArray) =
-        db.exec("UPDATE contacts SET identity_key = ?, pending_identity = NULL, verified = 0 WHERE id = ?", key, id)
+    /**
+     * Accepts a reviewed identity change: the new key becomes the contact's key, and they're no longer verified. Only while
+     * [key] is still the pending one (the one the user compared); false otherwise.
+     */
+    fun acceptPendingIdentity(id: Long, key: ByteArray): Boolean = db.update(
+        "UPDATE contacts SET identity_key = ?, pending_identity = NULL, verified = 0 WHERE id = ? AND pending_identity = ?", key, id, key,
+    ) == 1
 
-    fun holdIncoming(contactId: Long, tag: ByteArray, blob: ByteArray) {
-        // Bounded: a flood from a hostile peer can't fill storage.
-        if (db.queryOne("SELECT COUNT(*) FROM held_incoming WHERE contact_id = ?", contactId) { it.getLong(0) }!! >= 200) {
-            return
+    /** Drops a pending identity change the user rejected (only while it's still [key]). The held messages go with it. */
+    fun rejectPendingIdentity(id: Long, key: ByteArray): Boolean = db.tx {
+        val ok = db.update("UPDATE contacts SET pending_identity = NULL WHERE id = ? AND pending_identity = ?", id, key) == 1
+        if (ok) {
+            clearHeldIncoming(id)
         }
-        db.insert("INSERT INTO held_incoming (contact_id, tag, blob, received_at) VALUES (?, ?, ?, ?)", contactId, tag, blob, System.currentTimeMillis())
+        ok
     }
 
-    fun heldIncoming(contactId: Long): List<Pair<ByteArray, ByteArray>> =
-        db.query("SELECT tag, blob FROM held_incoming WHERE contact_id = ? ORDER BY id", contactId) { it.getBlob(0) to it.getBlob(1) }
+    /**
+     * Keeps a message that came with the changed identity [identity] until the user reviews it. It's sealed like a message
+     * body and expires at [expiresAt] (its key bucket is destroyed then, even while locked).
+     */
+    fun holdIncoming(contactId: Long, identity: ByteArray, tag: ByteArray, blob: ByteArray, expiresAt: Long) {
+        // Bounded: a flood from a hostile peer can't fill storage.
+        if (db.long("SELECT COUNT(*) FROM held_incoming WHERE contact_id = ?", contactId) >= MAX_HELD_PER_CONTACT) {
+            return
+        }
+        val id = B64.enc(Rand.bytes(16))
+        val sealed = vault.seal("held/$id", blob, expiresAt)
+        db.exec(
+            "INSERT INTO held_incoming (id, contact_id, identity, tag, blob, key, bucket, received_at, expires_at) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            id, contactId, identity, tag, sealed.ciphertext, sealed.wrappedKey, sealed.bucket, System.currentTimeMillis(), expiresAt,
+        )
+    }
+
+    /**
+     * The held messages (tag, blob) that came with [identity], oldest first. Whatever came with another key is left out, so
+     * it's never replayed under this one. Expired ones, and ones whose key was destroyed, are left out too.
+     */
+    fun heldIncoming(contactId: Long, identity: ByteArray, now: Long): List<Pair<ByteArray, ByteArray>> = db.query(
+        "SELECT id, tag, blob, key, bucket FROM held_incoming WHERE contact_id = ? AND identity = ? AND expires_at > ? " +
+            "ORDER BY received_at, rowid",
+        contactId, identity, now,
+    ) { c ->
+        runCatching {
+            c.getBlob(1) to vault.open("held/" + c.getString(0), c.getBlob(3), c.getBlob(2), if (c.isNull(4)) null else c.getLong(4))
+        }.getOrNull()
+    }.filterNotNull()
 
     fun clearHeldIncoming(contactId: Long) = db.exec("DELETE FROM held_incoming WHERE contact_id = ?", contactId)
 
@@ -411,6 +465,13 @@ class Repo(val db: Db, private val vault: MessageVault) {
         if (db.long("SELECT COUNT(*) FROM messages WHERE contact_id = ? AND wire_id = ? AND outgoing = ?", contactId, wireId, outgoing) > 0) {
             return null
         }
+        // A re-send of one that was viewed, deleted or expired here: it stays gone.
+        if (!outgoing && db.long(
+                "SELECT COUNT(*) FROM gone_incoming WHERE contact_id = ? AND wire_id = ? AND until > ?", contactId, wireId, System.currentTimeMillis(),
+            ) > 0
+        ) {
+            return null
+        }
         val id = B64.enc(Rand.bytes(16))
         val sealed = vault.seal(id, body.toByteArray(Charsets.UTF_8), expiresAt)
         db.tx {
@@ -480,8 +541,19 @@ class Repo(val db: Db, private val vault: MessageVault) {
         }
     }
 
+    /**
+     * Remembers the wire ids of the incoming messages that [where] (a condition on `messages`) selects, so a re-send of one
+     * doesn't bring it back. Called just before they're deleted.
+     */
+    private fun tombstone(where: String, vararg args: Any?) = db.exec(
+        "INSERT OR REPLACE INTO gone_incoming (contact_id, wire_id, until) " +
+            "SELECT contact_id, wire_id, ? FROM messages WHERE outgoing = 0 AND kind = ${MsgKind.TEXT} AND ($where)",
+        System.currentTimeMillis() + GONE_KEEP_MS, *args,
+    )
+
     fun deleteMessage(id: String) {
         db.tx {
+            tombstone("id = ?", id)
             db.exec("DELETE FROM group_receipts WHERE message_id = ?", id)
             db.exec("DELETE FROM message_keys WHERE message_id = ?", id)
             db.exec("DELETE FROM outbox WHERE message_id = ?", id)
@@ -505,19 +577,28 @@ class Repo(val db: Db, private val vault: MessageVault) {
             deleteMessage(id)
         }
         db.exec("DELETE FROM chunks WHERE created_at < ?", now - 7 * 24 * 3600_000L)
+        // Held messages go on the chat's timer like any other.
+        db.exec("DELETE FROM held_incoming WHERE expires_at <= ?", now)
+        db.exec("DELETE FROM gone_incoming WHERE until <= ?", now)
         if (ids.size >= 20) {
             markNeedsVacuum()
         }
         return ids.size
     }
 
-    fun nextExpiry(): Long? = db.queryOne("SELECT MIN(expires_at) FROM messages WHERE expires_at IS NOT NULL") {
+    fun nextExpiry(): Long? = db.queryOne(
+        "SELECT MIN(e) FROM (SELECT MIN(expires_at) AS e FROM messages WHERE expires_at IS NOT NULL " +
+            "UNION ALL SELECT MIN(expires_at) AS e FROM held_incoming)",
+    ) {
         if (it.isNull(0)) null else it.getLong(0)
     }
 
     /** Deletes a chat's messages with their keys, and its message content that is still queued, partial or held. */
     fun clearConversation(contactId: Long) {
         db.tx {
+            tombstone("contact_id = ?", contactId)
+            // Messages held behind a changed safety number are this chat's messages too.
+            db.exec("DELETE FROM held_incoming WHERE contact_id = ?", contactId)
             db.exec("DELETE FROM group_receipts WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
             db.exec("DELETE FROM message_keys WHERE message_id IN (SELECT id FROM messages WHERE contact_id = ?)", contactId)
             // Unsent copies hold the plaintext sealed only under the message root key, which outlives the clear.
@@ -528,9 +609,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
         }
     }
 
-    /** Deletes every message and its key. The contacts and sessions stay. */
+    /**
+     * Deletes every message and its key, and the messages held behind a changed safety number (a pending change stays
+     * pending, with nothing left to deliver). The contacts and sessions stay.
+     */
     fun wipeAllMessages() {
         db.tx {
+            tombstone("1")
+            db.exec("DELETE FROM held_incoming")
             db.exec("DELETE FROM group_receipts")
             db.exec("DELETE FROM message_keys")
             db.exec("DELETE FROM messages")
@@ -545,12 +631,15 @@ class Repo(val db: Db, private val vault: MessageVault) {
         markNeedsVacuum()
     }
 
-    /** Outgoing text messages still awaiting a delivery receipt after [olderThan]. */
-    fun unreceipted(olderThan: Long, maxResends: Int): List<Message> = db.query(
+    /**
+     * Outgoing text messages still awaiting a delivery receipt after [olderThan], and sent after [notBefore]. The window is
+     * bounded so that the recipient's tombstones ([GONE_KEEP_MS]) outlast every re-send.
+     */
+    fun unreceipted(olderThan: Long, notBefore: Long, maxResends: Int): List<Message> = db.query(
         "SELECT $msgCols FROM messages m JOIN message_keys mk ON mk.message_id = m.id " +
-            "WHERE m.outgoing = 1 AND m.kind = ? AND m.status = ? AND m.ts < ? AND m.resend_count < ? " +
+            "WHERE m.outgoing = 1 AND m.kind = ? AND m.status = ? AND m.ts < ? AND m.ts > ? AND m.resend_count < ? " +
             "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = m.id)",
-        MsgKind.TEXT, MsgStatus.SENT, olderThan, maxResends,
+        MsgKind.TEXT, MsgStatus.SENT, olderThan, notBefore, maxResends,
     ) { message(it) }
 
     fun incrementResend(id: String) = db.exec("UPDATE messages SET resend_count = resend_count + 1 WHERE id = ?", id)
@@ -721,6 +810,32 @@ class Repo(val db: Db, private val vault: MessageVault) {
         db.exec("UPDATE mailboxes SET invite_used = 1, invite_expires_at = ? WHERE id = ?", expiresAt, id)
 
     fun deleteMailboxRow(id: Long) = db.exec("DELETE FROM mailboxes WHERE id = ?", id)
+
+    // --- mailboxes still to delete on the server ---
+
+    /**
+     * Drops the rows of [boxes] and records them as doomed on [server] (our server, pinned to [serverKey]), in one
+     * transaction: they're deleted there later, retried until it confirms ([DoomedMailbox]).
+     */
+    fun doomMailboxes(boxes: List<Mailbox>, server: String, serverKey: String?) = db.tx {
+        val now = System.currentTimeMillis()
+        for (b in boxes) {
+            db.exec(
+                "INSERT OR REPLACE INTO doomed_mailboxes (send_secret, owner_secret, server, server_key, created_at) VALUES (?, ?, ?, ?, ?)",
+                b.sendSecret, b.ownerSecret, server, serverKey, now,
+            )
+            db.exec("DELETE FROM mailboxes WHERE id = ?", b.id)
+        }
+    }
+
+    fun doomedMailboxes(): List<DoomedMailbox> = db.query(
+        "SELECT send_secret, owner_secret, server, server_key, created_at FROM doomed_mailboxes ORDER BY created_at",
+    ) { DoomedMailbox(it.getBlob(0), it.getBlob(1), it.getString(2), if (it.isNull(3)) null else it.getString(3), it.getLong(4)) }
+
+    /** The server confirmed (or it can't hold the mailbox any more). */
+    fun forgetDoomed(sendSecret: ByteArray) = db.exec("DELETE FROM doomed_mailboxes WHERE send_secret = ?", sendSecret)
+
+    fun forgetDoomedBefore(t: Long) = db.exec("DELETE FROM doomed_mailboxes WHERE created_at < ?", t)
 
     /** Mailboxes advertised in an invite that expired without anyone using it. */
     fun abandonedInviteMailboxes(now: Long): List<Mailbox> = db.query(

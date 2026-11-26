@@ -1,7 +1,6 @@
 package app.goldfishsend.ui.screens
 
 import app.goldfishsend.ui.components.rememberReAuth
-import androidx.compose.material.icons.rounded.GppMaybe
 import androidx.compose.material.icons.rounded.Autorenew
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Emergency
@@ -104,6 +103,7 @@ import app.goldfishsend.ui.components.ProgressRow
 import app.goldfishsend.ui.components.rememberWork
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private enum class Picker { NOTIF, CLIPBOARD, DEFAULT_TIMER, TIMER_START, LOCK_TIMEOUT, FAILED, INACTIVITY, DURESS_ACTION, PANIC, ROTATION }
@@ -178,6 +178,13 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     Icons.Rounded.NotificationsActive,
                     onClick = { picker = Picker.NOTIF },
                 )
+                SwitchRow(
+                    "Silent while locked",
+                    "No notification for messages that arrive while GoldfishSend is locked. Until you unlock, it can't tell " +
+                        "which chat a message is for, so this is what keeps hidden chats silent then too.",
+                    Icons.Rounded.NotificationsOff,
+                    p.quietWhileLocked,
+                ) { p.quietWhileLocked = it }
                 SwitchRow("Read receipts", "Let contacts know when you've read their messages", Icons.Rounded.DoneAll, p.readReceipts) { p.readReceipts = it }
                 SwitchRow("Block screenshots", "Also hides chats in the recent-apps view", Icons.Rounded.Screenshot, p.screenshotProtection) { p.screenshotProtection = it }
                 SettingRow(
@@ -297,7 +304,8 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                 if (hiddenOn == true) {
                     SwitchRow(
                         "Notify for hidden chats",
-                        "A notification with no name or text. Off means hidden chats stay completely silent.",
+                        "A notification with no name or text. Off means hidden chats stay silent while unlocked; to keep " +
+                            "them silent while locked too, turn on \"Silent while locked\".",
                         Icons.Rounded.NotificationsOff,
                         p.notifyHiddenChats,
                     ) { p.notifyHiddenChats = it }
@@ -337,12 +345,6 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     Icons.Rounded.Autorenew,
                     onClick = { picker = Picker.ROTATION },
                 )
-                SwitchRow(
-                    "Pause on any safety number change",
-                    "Verified contacts are always paused. This also pauses unverified ones until you review the change.",
-                    Icons.Rounded.GppMaybe,
-                    p.holdAllKeyChanges,
-                ) { p.holdAllKeyChanges = it }
             }
             item {
                 SectionHeader("Automatic erasing")
@@ -605,15 +607,25 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                         return@run
                     }
                     withContext(Dispatchers.IO) {
-                        // Drop pooled mailboxes on the old server; new ones are created on the new server.
-                        for (m in s.repo.allMailboxes()) {
-                            s.repo.deleteMailboxRow(m.id)
+                        // Drop our mailboxes on the old server; new ones are created on the new server. They're deleted
+                        // there too (retried until it confirms), and an outstanding invite's prekeys go with them.
+                        s.lock.withLock {
+                            s.db.tx {
+                                val boxes = s.repo.allMailboxes()
+                                for (m in boxes.filter { it.contactId == null }) {
+                                    m.inviteSpkId?.let { s.signal.removeSignedPreKey(it) }
+                                    m.inviteKyberId?.let { s.signal.removeKyberPreKey(it) }
+                                }
+                                s.repo.doomMailboxes(boxes, Graph.prefs.serverUrl, Graph.prefs.serverKey)
+                            }
                         }
+                        app.goldfishsend.core.Invites.forgetCachedQr()
                     }
                     Graph.prefs.serverUrl = target
                     Graph.prefs.serverKey = fp ?: learned
                     Graph.prefs.serverKeyChanged = null
                     Graph.scope.launchSafe { PushHub.register(ctx) }
+                    Graph.scope.launchSafe { app.goldfishsend.core.Mailboxes.deleteDoomed(s) }
                     onDismiss()
                 }
             }) { Text("Save") }
