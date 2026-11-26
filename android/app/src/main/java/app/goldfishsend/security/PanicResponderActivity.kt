@@ -42,18 +42,23 @@ import kotlinx.coroutines.launch
  *   package may later cause anything destructive. Its identity comes from getCallingActivity(), which the trigger app
  *   can't spoof because it has to start us with startActivityForResult. This changes the same settings as the panic
  *   section of Settings, so it's guarded the same way: only while the app is unlocked, after confirming it's the user
- *   ([rememberReAuth]), with tapjacking protection, and in a decoy session nothing real is shown or changed.
+ *   ([rememberReAuth]), with tapjacking protection, and in a decoy session only the decoy's own settings are shown or
+ *   changed.
  * - TRIGGER: always locks (harmless, so any trigger may cause it). Erasing happens only if the caller is the approved
  *   trigger app and the user chose an erasing response.
- * - DISCONNECT: the approved app removes itself, while the app is unlocked (a locked or decoy GoldfishSend never changes
- *   the real settings). Ignoring it is harmless: a trigger app doesn't send to a responder it has disconnected.
+ * - DISCONNECT: the approved app removes itself, while the app is unlocked (a locked GoldfishSend changes nothing, and a
+ *   decoy only its own copy). Ignoring it is harmless: a trigger app doesn't send to a responder it has disconnected.
  *
  * Nothing happens unless the user has set a response (OFF by default). No permissions are needed.
+ *
+ * Connecting and disconnecting change the open profile's settings: while a decoy session is open, the decoy's own copy,
+ * so a coercer can't quietly disarm (or re-point) the real profile's panic response. A trigger always acts on the real
+ * profile's settings.
  */
 class PanicResponderActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Graph.prefs.screenshotProtection) {
+        if (Graph.uiPrefs.screenshotProtection) {
             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         }
         val caller = callingActivity?.packageName
@@ -63,9 +68,10 @@ class PanicResponderActivity : FragmentActivity() {
                 finishAndRemoveTask()
             }
             ACTION_DISCONNECT -> lifecycleScope.launch {
-                val s = Graph.realSession ?: Graph.tryAutoUnlock()
-                if (s != null && caller != null && caller == Graph.prefs.panicTrigger) {
-                    Graph.prefs.panicTrigger = null
+                // The open profile's settings: in a decoy, only the decoy's own copy changes.
+                val s = Graph.session.value ?: Graph.tryAutoUnlock()
+                if (s != null && caller != null && caller == s.prefs.panicTrigger) {
+                    s.prefs.panicTrigger = null
                     setResult(RESULT_OK)
                 }
                 finish()
@@ -105,9 +111,9 @@ class PanicResponderActivity : FragmentActivity() {
             // Without an app lock a cold start hasn't opened the database yet. With one, nothing is opened here.
             val s = Graph.session.value ?: Graph.tryAutoUnlock()
             setContent {
-                val p = Graph.prefs
+                val p = s?.prefs ?: Graph.prefs
                 GoldfishTheme(p.themeMode, p.amoled, p.dynamicColor) {
-                    // Connecting changes real settings, so it needs the app unlocked. A decoy session only pretends.
+                    // Connecting changes the open profile's settings, so it needs the app unlocked.
                     if (s == null) {
                         UnlockFirst(label)
                     } else {
@@ -133,7 +139,8 @@ class PanicResponderActivity : FragmentActivity() {
         val reauth = rememberReAuth(s, this)
         val values = listOf(PanicResponse.LOCK, PanicResponse.WIPE_MESSAGES, PanicResponse.WIPE_EVERYTHING)
         val options = listOf("Lock GoldfishSend", "Lock and erase all messages", "Erase everything")
-        var choice by remember { mutableStateOf(preselect(Graph.prefs.panicResponse, s.decoy)) }
+        // The open profile's own setting: a decoy's copy never shows the real one.
+        var choice by remember { mutableStateOf(preselect(s.prefs.panicResponse)) }
         var asking by remember { mutableStateOf(true) }
         if (!asking) {
             return
@@ -165,11 +172,9 @@ class PanicResponderActivity : FragmentActivity() {
                     onClick = {
                         asking = false
                         reauth.require("Connecting a panic app.", cancel = ::cancel) {
-                            // A decoy session shows the dialog as the real owner would see it, but changes nothing real.
-                            if (!s.decoy) {
-                                Graph.prefs.panicTrigger = caller
-                                Graph.prefs.panicResponse = choice
-                            }
+                            // A decoy session changes only its own copy, as the panic section of its Settings does.
+                            s.prefs.panicTrigger = caller
+                            s.prefs.panicResponse = choice
                             setResult(RESULT_OK)
                             finish()
                         }
@@ -191,8 +196,8 @@ class PanicResponderActivity : FragmentActivity() {
         const val ACTION_CONNECT = "info.guardianproject.panic.action.CONNECT"
         const val ACTION_DISCONNECT = "info.guardianproject.panic.action.DISCONNECT"
 
-        /** The response first selected: the current one, except that a decoy session never shows the real setting. */
-        internal fun preselect(current: PanicResponse, decoy: Boolean): PanicResponse =
-            if (decoy || current == PanicResponse.OFF) PanicResponse.LOCK else current
+        /** The response first selected: the open profile's current one ([current]), or Lock while it's off. */
+        internal fun preselect(current: PanicResponse): PanicResponse =
+            if (current == PanicResponse.OFF) PanicResponse.LOCK else current
     }
 }

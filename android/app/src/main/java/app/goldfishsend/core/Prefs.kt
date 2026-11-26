@@ -1,6 +1,7 @@
 package app.goldfishsend.core
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.compose.runtime.mutableLongStateOf
 import app.goldfishsend.BuildConfig
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,8 +23,15 @@ enum class PanicResponse { OFF, LOCK, WIPE_MESSAGES, WIPE_EVERYTHING }
  */
 enum class DuressAction { WIPE_ALL, DECOY }
 
-class Prefs(context: Context) {
-    private val sp = context.getSharedPreferences("gf_prefs", Context.MODE_PRIVATE)
+/**
+ * Settings. The device's own live in "gf_prefs". A decoy session (duress PIN) has its own copy of every setting, a
+ * [Prefs] backed by its encrypted database ([DecoyPrefs]), so nothing changed there reaches the real profile. What the
+ * duress PIN does lives in the vault ([app.goldfishsend.crypto.KeyVault.duressAction]) and whether hidden chats notify
+ * lives in each profile's database: as plain preferences, they would say that either feature had been set up.
+ */
+class Prefs(private val sp: SharedPreferences) {
+    constructor(context: Context) : this(context.getSharedPreferences(FILE, Context.MODE_PRIVATE))
+
     private val _version = MutableStateFlow(0L)
 
     /** Bumped on every change, so Compose can recompose. */
@@ -146,11 +154,26 @@ class Prefs(context: Context) {
         get() = int("max_failed", 10)
         set(v) = setInt("max_failed", v)
 
-    /** Written synchronously (commit), so a crash or kill mid-attempt can't hand out a free guess. */
+    /**
+     * Wrong attempts since the last real unlock: they drive the erase. Only the correct real secret resets it, never the
+     * duress PIN, so the duress PIN can't be used to earn more guesses. Written synchronously (commit), so a crash or kill
+     * mid-attempt can't hand out a free guess.
+     */
     var failedAttempts: Int
         get() = int("failed", 0)
         set(v) {
             sp.edit().putInt("failed", v).commit()
+            changed()
+        }
+
+    /**
+     * Wrong attempts since the last unlock of either kind, for the "attempts left" warning. A duress unlock resets this
+     * one, as a real unlock would, so the warning doesn't give the decoy away; the erase still goes by [failedAttempts].
+     */
+    var failedAttemptsShown: Int
+        get() = int("failed_shown", 0)
+        set(v) {
+            sp.edit().putInt("failed_shown", v).commit()
             changed()
         }
 
@@ -269,21 +292,6 @@ class Prefs(context: Context) {
         get() = str("panic_trigger")
         set(v) = setStr("panic_trigger", v)
 
-    /** What the duress PIN does. WIPE_ALL keeps the original behaviour. The others open the app without hidden chats. */
-    var duressAction: DuressAction
-        get() = when (val v = str("duress_action")) {
-            null -> DuressAction.WIPE_ALL
-            // Older non-erasing choices (they needed the real key) become the decoy profile.
-            "HIDE_HIDDEN_CHATS", "DELETE_HIDDEN_CHATS" -> DuressAction.DECOY
-            else -> runCatching { DuressAction.valueOf(v) }.getOrDefault(DuressAction.WIPE_ALL)
-        }
-        set(v) = setStr("duress_action", v.name)
-
-    /** Whether hidden chats post notifications at all (generic ones, never contents). Off by default. */
-    var notifyHiddenChats: Boolean
-        get() = bool("notify_hidden", false)
-        set(v) = setBool("notify_hidden", v)
-
     /**
      * Pause any contact whose safety number changes until the user reviews it. Verified contacts are always paused.
      * Off by default for unverified contacts, matching Signal: the change is accepted with a visible notice.
@@ -296,6 +304,20 @@ class Prefs(context: Context) {
     var wipeMemoryOnLock: Boolean
         get() = bool("wipe_memory_on_lock", true)
         set(v) = setBool("wipe_memory_on_lock", v)
+
+    // --- A decoy profile's own copies of device-wide choices (NetPrefs, the push app). Unused by the real profile. ---
+
+    var decoyProxyMode: String?
+        get() = str("decoy_proxy_mode")
+        set(v) = setStr("decoy_proxy_mode", v)
+
+    var decoyPinServers: Boolean
+        get() = bool("decoy_pin_servers", false)
+        set(v) = setBool("decoy_pin_servers", v)
+
+    var decoyPushDistributor: String?
+        get() = str("decoy_push")
+        set(v) = setStr("decoy_push", v)
 
     /** Dismiss keys of Security-tab findings the user chose to hide (see Finding.dismissKey). */
     val dismissedFindings: Set<String>
@@ -322,6 +344,8 @@ class Prefs(context: Context) {
     }
 
     companion object {
+        const val FILE = "gf_prefs"
+
         /** The fingerprint built in with `-Pgf.defaultServerKey`, which applies only to the built-in default server. */
         fun builtInServerKey(url: String): String? =
             BuildConfig.DEFAULT_SERVER_KEY.takeIf { it.isNotEmpty() && url.trimEnd('/') == BuildConfig.DEFAULT_SERVER_URL.trimEnd('/') }

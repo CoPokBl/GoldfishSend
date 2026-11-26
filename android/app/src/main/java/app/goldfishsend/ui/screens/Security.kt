@@ -79,7 +79,7 @@ private fun severityColor(s: Severity): Color = when (s) {
 @Composable
 fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit) {
     val ctx = LocalContext.current
-    val prefsVersion by Graph.prefs.version.collectAsState()
+    val prefsVersion by s.prefs.version.collectAsState()
     val dbVersion by s.db.changes.collectAsState()
     var resumes by remember { mutableIntStateOf(0) }
     var pushPicker by remember { mutableStateOf(false) }
@@ -89,7 +89,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
         onPauseOrDispose { }
     }
     val report by produceState<AuditReport?>(null, prefsVersion, dbVersion, resumes) {
-        value = withContext(Dispatchers.IO) { SecurityAudit.run(ctx, runCatching { s.repo.unverifiedCount() }.getOrNull()) }
+        value = withContext(Dispatchers.IO) { SecurityAudit.run(ctx, runCatching { s.repo.unverifiedCount() }.getOrNull(), s.prefs, s.decoy) }
     }
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
 
@@ -100,7 +100,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
     }
 
     fun apply(fix: Fix) {
-        val p = Graph.prefs
+        val p = s.prefs
         when (fix) {
             Fix.SYSTEM_UPDATE -> open(Intent("android.settings.SYSTEM_UPDATE_SETTINGS"))
             Fix.SECURITY_SETTINGS -> open(Intent(Settings.ACTION_SECURITY_SETTINGS))
@@ -152,7 +152,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
                     FindingCard(
                         f,
                         onFix = { f.fix?.let(::apply) },
-                        onDismiss = if (f.dismissible) ({ Graph.prefs.dismissFinding(f.dismissKey) }) else null,
+                        onDismiss = if (f.dismissible) ({ s.prefs.dismissFinding(f.dismissKey) }) else null,
                     )
                 }
             }
@@ -168,7 +168,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
                 }
                 if (showDismissed) {
                     items(r.dismissed, key = { "d:" + it.dismissKey }) { f ->
-                        FindingCard(f, onRestore = { Graph.prefs.restoreFinding(f.dismissKey) })
+                        FindingCard(f, onRestore = { s.prefs.restoreFinding(f.dismissKey) })
                     }
                 }
             }
@@ -183,7 +183,7 @@ fun SecurityScreen(s: Session, openPassphrase: () -> Unit, openChats: () -> Unit
         }
     }
     if (pushPicker) {
-        PushPickerDialog { pushPicker = false }
+        PushPickerDialog(s) { pushPicker = false }
     }
 }
 

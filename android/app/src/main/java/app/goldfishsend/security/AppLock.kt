@@ -8,14 +8,14 @@ import app.goldfishsend.core.Outbox
 import app.goldfishsend.core.Session
 import app.goldfishsend.core.Shredder
 import app.goldfishsend.core.Sweeper
+import app.goldfishsend.core.UnlockInterrupted
 import app.goldfishsend.core.launchSafe
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import app.goldfishsend.core.DuressAction
-import app.goldfishsend.core.Messenger
-import app.goldfishsend.proto.wipe
+import app.goldfishsend.crypto.KeyVault
 
 sealed class UnlockResult {
     data object Ok : UnlockResult()
@@ -25,6 +25,9 @@ sealed class UnlockResult {
     data object Wiped : UnlockResult()
 
     data object DeviceLocked : UnlockResult()
+
+    /** The app was locked (screen off, wipe) while this unlock was in progress, so it stays locked. */
+    data object Interrupted : UnlockResult()
 }
 
 /** App lock: auto-lock timeout, lock on screen-off, wrong-passphrase wipe and duress PIN. */
@@ -35,12 +38,16 @@ object AppLock {
     const val KV_HIDDEN_ON = "hidden_on"
     const val KV_DURESS_ON = "duress_on"
 
+    /** Whether hidden chats post (generic) notifications. In each profile's database, like the other hidden-chat state. */
+    const val KV_NOTIFY_HIDDEN = "notify_hidden"
+
     private val lockable: Boolean
         get() = Graph.vault.requiresUserUnlock
 
     fun onBackground() {
         backgroundedAt = SystemClock.elapsedRealtime()
-        val timeout = Graph.prefs.lockTimeoutSecs
+        // The open session's own setting: a decoy's auto-lock is the decoy's.
+        val timeout = Graph.uiPrefs.lockTimeoutSecs
         if (lockable && timeout == 0) {
             Graph.lock()
         } else if (lockable) {
@@ -55,12 +62,13 @@ object AppLock {
         handler.removeCallbacks(timedLock)
         val at = backgroundedAt
         backgroundedAt = null
-        if (lockable && at != null && SystemClock.elapsedRealtime() - at >= Graph.prefs.lockTimeoutSecs * 1000L) {
+        if (lockable && at != null && SystemClock.elapsedRealtime() - at >= Graph.uiPrefs.lockTimeoutSecs * 1000L) {
             Graph.lock()
         }
-        // The user is looking at the app. Background auto-unlocks never count as presence, and recordPresence checks the
-        // inactivity limit before it refreshes anything.
-        if (Graph.isUnlocked) {
+        // The user is looking at the app. Background auto-unlocks never count as presence, and nor does a decoy session:
+        // using the decoy mustn't hold off the real profile's erase-if-unused. recordPresence checks the inactivity limit
+        // before it refreshes anything.
+        if (Graph.realSession != null) {
             Wiper.recordPresence()
         }
     }
@@ -73,51 +81,47 @@ object AppLock {
     }
 
     fun onScreenOff() {
-        if (lockable && Graph.prefs.lockOnScreenOff) {
+        if (lockable && Graph.uiPrefs.lockOnScreenOff) {
             Graph.lock()
         }
     }
 
-    /** One attempt at a time, process-wide, so concurrent attempts can't race the failure counter. */
+    /** One attempt at a time, process-wide, so concurrent attempts can't race the failure counters. */
     private val attemptMutex = Mutex()
 
+    /**
+     * Every attempt costs the same: the real secret and the duress slot are both checked (one Argon2 run each) whatever
+     * the outcome, so timing reveals neither whether a duress PIN exists nor whether an unlock opened the real profile.
+     *
+     * Wrong attempts count towards the erase until the real secret is entered. The duress PIN doesn't reset that count
+     * (it would otherwise hand out unlimited guesses at the real secret); it only resets the count the warning shows.
+     */
     suspend fun unlock(passphrase: CharArray): UnlockResult = withContext(Dispatchers.Default) {
+        // Before the slow part: a lock from here on (screen off) must win over this unlock.
+        val since = Graph.lockEpoch
         val vault = Graph.vault
         android.os.Trace.beginAsyncSection("gf.unlock", 0)
         try {
             attemptMutex.withLock {
-                val prefs = Graph.prefs
-                // Count the attempt before checking it. A kill during the (slow) Argon2 check still costs an attempt.
-                val failed = prefs.failedAttempts + 1
-                prefs.failedAttempts = failed
+                val attempt = Attempt(Graph.prefs)
                 val real = try {
                     vault.unlockWithPassphrase(passphrase)
                 } catch (e: Exception) {
-                    prefs.failedAttempts = failed - 1
+                    attempt.undo()
                     return@withLock UnlockResult.DeviceLocked
                 }
-                // Always check the duress verifier too, so timing doesn't reveal whether a duress PIN exists.
-                val duress = real == null && vault.isDuress(passphrase)
+                val duress = runCatching { vault.openDuress(passphrase) }.getOrNull()
                 when {
                     real != null -> {
-                        prefs.failedAttempts = 0
-                        afterUnlock(Graph.openSession(real))
-                        Wiper.recordPresence()
-                        UnlockResult.Ok
+                        duress?.wipe()
+                        attempt.right()
+                        opened { afterUnlock(Graph.openSession(real, since)) }
                     }
-                    duress -> {
-                        prefs.failedAttempts = 0
-                        onDuress(passphrase)
+                    duress != null -> {
+                        attempt.duress()
+                        onDuress(duress, since)
                     }
-                    else -> {
-                        val max = prefs.maxFailedAttempts
-                        if (max > 0 && failed >= max) {
-                            Wiper.wipeEverything(Graph.app)
-                            UnlockResult.Wiped
-                        } else {
-                            UnlockResult.Wrong(if (max > 0) max - failed else null)
-                        }
-                    }
+                    else -> wrongAttempt(attempt)
                 }
             }
         } finally {
@@ -126,33 +130,85 @@ object AppLock {
         }
     }
 
+    private fun wrongAttempt(attempt: Attempt): UnlockResult = when (val left = attempt.wrong()) {
+        Attempt.ERASE -> {
+            Wiper.wipeEverything(Graph.app)
+            UnlockResult.Wiped
+        }
+        else -> UnlockResult.Wrong(left)
+    }
+
+    private suspend fun opened(open: suspend () -> Unit): UnlockResult = try {
+        open()
+        Wiper.recordPresence()
+        UnlockResult.Ok
+    } catch (e: UnlockInterrupted) {
+        UnlockResult.Interrupted
+    }
+
     /**
      * The duress PIN was entered. It can't decrypt anything real. Either everything is erased, or the separate decoy
-     * profile opens (keyed by the duress PIN alone), and the real data stays encrypted and untouched.
+     * profile opens (keyed by the duress slot alone), and the real data stays encrypted and untouched.
      */
-    private suspend fun onDuress(pin: CharArray): UnlockResult {
-        if (Graph.prefs.duressAction == DuressAction.WIPE_ALL) {
+    private suspend fun onDuress(match: KeyVault.DuressMatch, since: Long): UnlockResult {
+        if (Graph.vault.duressAction == DuressAction.WIPE_ALL) {
+            match.wipe()
             Wiper.wipeEverything(Graph.app)
             return UnlockResult.Wiped
         }
-        Graph.openDecoySession(Graph.vault.decoyKey(pin))
-        return UnlockResult.Ok
+        return try {
+            Graph.openDecoySession(match, since)
+            UnlockResult.Ok
+        } catch (e: UnlockInterrupted) {
+            UnlockResult.Interrupted
+        }
     }
 
-    /** After the biometric or screen-lock prompt, which calls back on the UI thread. */
-    suspend fun unlockWithMasterKey(mk: ByteArray) = withContext(Dispatchers.IO) {
-        Graph.prefs.failedAttempts = 0
-        afterUnlock(Graph.openSession(mk))
-        Wiper.recordPresence()
+    /**
+     * After the biometric or screen-lock prompt, which calls back on the UI thread. [since] is [Graph.lockEpoch] from when
+     * the prompt was shown. Only a real key gets here, so it resets the failure count like any real unlock.
+     */
+    suspend fun unlockWithMasterKey(mk: ByteArray, since: Long): UnlockResult = withContext(Dispatchers.IO) {
+        Attempt.forgive(Graph.prefs)
+        opened { afterUnlock(Graph.openSession(mk, since)) }
     }
 
-    /** Catch-up work once the DB is open: locked inbox, expiry sweep, outbox, mailbox pool. */
+    /**
+     * Re-authentication inside an open session ("Confirm it's you"). It counts exactly like the lock screen: each wrong
+     * answer is a failed attempt, and the erase happens at the same limit. A decoy session checks its own secret (the
+     * duress PIN) against its own counter and limit, never the real ones, so it can't be used to test guesses at the real
+     * secret, and it behaves like a real session would.
+     */
+    suspend fun reauthenticate(s: Session, secret: CharArray): UnlockResult = withContext(Dispatchers.Default) {
+        try {
+            attemptMutex.withLock {
+                // The session's own counter: a decoy's never touches the real one.
+                val attempt = Attempt(s.prefs)
+                val ok = try {
+                    s.secrets.checkSecret(secret)
+                } catch (e: Exception) {
+                    attempt.undo()
+                    return@withLock UnlockResult.DeviceLocked
+                }
+                if (ok) {
+                    attempt.right()
+                    UnlockResult.Ok
+                } else {
+                    wrongAttempt(attempt)
+                }
+            }
+        } finally {
+            secret.fill('\u0000')
+        }
+    }
+
+    /** Catch-up work once the DB is open: locked inbox, expiry sweep, outbox, mailbox pool. Stops if the session locks. */
     fun afterUnlock(s: Session) {
         // A decoy session never touches real data or the server.
         if (s.decoy) {
             return
         }
-        Graph.scope.launchSafe {
+        s.scope.launchSafe {
             // Deletes the last session didn't get to shred (MessageVault): first, before anything else is written.
             runCatching { Shredder.runPending(s) }
             LockedInbox.drain(s)

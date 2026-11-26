@@ -31,7 +31,8 @@ object Shredder {
     fun schedule(s: Session) {
         synchronized(this) {
             batch?.cancel()
-            batch = Graph.scope.launchSafe {
+            // The session's own work: it stops when the session closes, and a wipe or lock never leaves it running.
+            batch = s.scope.launchSafe {
                 delay(BATCH_MS)
                 runPending(s)
             }

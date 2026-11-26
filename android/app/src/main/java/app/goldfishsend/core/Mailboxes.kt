@@ -91,6 +91,19 @@ object Mailboxes {
     /** Progress of the mailbox being created right now, or null. */
     val progress: StateFlow<Progress?> = _progress
 
+    /**
+     * The session closed (its scope cancels any creation). Clears the spinner and progress at once, so nothing of the
+     * real profile's work shows in whatever opens next.
+     */
+    fun ended() {
+        synchronized(fillLock) {
+            fill?.cancel()
+            fill = null
+        }
+        _busy.value = false
+        _progress.value = null
+    }
+
     fun endpoint(s: Session): PushEndpointData? =
         s.repo.kvString("push_endpoint")?.let { ProtoJson.decodeFromString(PushEndpointData.serializer(), it) }
 
@@ -267,11 +280,11 @@ object Mailboxes {
 
 
     /**
-     * Starts filling the pool to [POOL_TARGET] (unless it's already being filled) in the app's scope, so it carries on
-     * whoever stops waiting for it, and returns that job. Mailboxes are made one at a time.
+     * Starts filling the pool to [POOL_TARGET] (unless it's already being filled) in the session's scope, so it carries
+     * on whoever stops waiting for it (but not past a lock), and returns that job. Mailboxes are made one at a time.
      */
     private fun startFill(s: Session): Deferred<Boolean> = synchronized(fillLock) {
-        fill?.takeIf { it.isActive } ?: Graph.scope.async {
+        fill?.takeIf { it.isActive } ?: s.scope.async {
             try {
                 fillPool(s)
             } finally {

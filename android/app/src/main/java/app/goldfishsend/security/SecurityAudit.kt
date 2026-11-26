@@ -109,9 +109,14 @@ object SecurityAudit {
         else -> Severity.CRITICAL
     }
 
-    fun run(ctx: Context, unverifiedContacts: Long?): AuditReport {
+    /**
+     * [prefs] are the open profile's settings: a decoy session's report reads the decoy's own, so it agrees with the
+     * decoy's Settings and says nothing about the real profile's.
+     */
+    fun run(ctx: Context, unverifiedContacts: Long?, prefs: app.goldfishsend.core.Prefs = Graph.prefs, decoy: Boolean = false): AuditReport {
         val out = mutableListOf<Finding>()
-        val prefs = Graph.prefs
+        // Push registration is the device's, whichever profile is open.
+        val device = Graph.prefs
 
         // --- OS patch level ---
         val patch = runCatching { LocalDate.parse(Build.VERSION.SECURITY_PATCH) }.getOrNull()
@@ -153,11 +158,11 @@ object SecurityAudit {
         }
 
         // --- Push distributor ---
-        val dist = PushHub.current(ctx)
-        val host = prefs.pushHost.orEmpty()
+        val dist = (if (decoy) prefs.decoyPushDistributor else null) ?: PushHub.current(ctx)
+        val host = device.pushHost.orEmpty()
         val googleHost = host.endsWith("googleapis.com") || host.contains("fcm") || host.endsWith("google.com")
         when {
-            prefs.pushStatus != "ok" -> out += Finding(
+            device.pushStatus != "ok" -> out += Finding(
                 "push", Severity.CRITICAL, "Notifications aren't set up",
                 "Without a push service you won't receive messages.", Fix.CHANGE_PUSH, "Set up",
             )
@@ -297,7 +302,7 @@ object SecurityAudit {
         }
 
         // --- Fingerprint unlock ---
-        if (prefs.biometricUnlock && Graph.vault.hasBiometric) {
+        if (prefs.biometricUnlock && (decoy || Graph.vault.hasBiometric)) {
             out += Finding(
                 "biometric", Severity.INFO, "Fingerprint unlock is on",
                 "It's convenient, but someone can force your finger onto the sensor. In some places the law treats a fingerprint " +

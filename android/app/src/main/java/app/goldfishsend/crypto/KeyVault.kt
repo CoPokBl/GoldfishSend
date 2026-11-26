@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
+import app.goldfishsend.core.DuressAction
 import app.goldfishsend.proto.Aead
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Rand
@@ -23,10 +24,12 @@ import org.bouncycastle.crypto.params.Argon2Parameters
 /**
  * Key hierarchy (android/README.md, "Security notes"):
  *
- *   [optional passphrase] --Argon2id--> KEK --AES-GCM--> inner(MK)
+ *   [optional passphrase] --HMAC with Keystore "gf_pin"--> --Argon2id--> KEK --AES-GCM--> inner(MK)
  *   Android Keystore "gf_device" (StrongBox if present, unlocked-device-required) --AES-GCM--> outer(inner or MK)
  *
- * MK (master key, 32 bytes) only lives in RAM while the app is unlocked. The DB key and other keys are derived from it.
+ * The "gf_pin" HMAC ([secretKek]) means every guess at the secret needs this phone's Keystore, even for someone who got
+ * one decryption of the outer wrap. MK (master key, 32 bytes) only lives in RAM while the app is unlocked. The DB key
+ * and other keys are derived from it.
  * A second Keystore key ("gf_msg_<random>", a new one for every root) wraps the message root key, so wiping on reboot
  * only needs that alias deleted.
  * The optional "gf_bio" key is biometric-bound and holds a second copy of MK for fingerprint/face unlock.
@@ -110,7 +113,7 @@ class KeyVault(private val context: Context) {
     fun unlockWithPassphrase(passphrase: CharArray): ByteArray? {
         val inner = keystoreOpen(deviceAlias, B64.dec(prefs.getString(P_WRAPPED, null)!!))
         val salt = B64.dec(prefs.getString(P_SALT, null)!!)
-        val kek = argon2(passphrase, salt)
+        val kek = secretKek(passphrase, salt)
         return try {
             Aead.open(kek, inner, AAD_MK)
         } catch (e: AEADBadTagException) {
@@ -121,47 +124,139 @@ class KeyVault(private val context: Context) {
         }
     }
 
+    /**
+     * The key-encryption key for the app secret (and the duress PIN): `argon2(HMAC_gf_pin(secret), salt)`. "gf_pin" is a
+     * non-exportable Keystore HMAC key (StrongBox if present, unlocked-device-required), so the secret never reaches
+     * Argon2 as typed. Without it, one decryption of the device wrap (malware or a forensic tool with code execution on
+     * an unlocked phone, or an extracted device key) would hand over a blob whose PIN could be cracked anywhere, at any
+     * speed, with no erase counter in the way. With it, every single guess needs this phone's Keystore again.
+     * Throws if the key is unavailable (the phone is locked).
+     */
+    fun secretKek(secret: CharArray, salt: ByteArray): ByteArray {
+        val bytes = utf8(secret)
+        val pre = try {
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(keyStore.getKey(ALIAS_PIN, null) as SecretKey)
+            mac.doFinal(bytes)
+        } finally {
+            bytes.wipe()
+        }
+        try {
+            return argon2(pre, salt)
+        } finally {
+            pre.wipe()
+        }
+    }
+
+    private fun ensurePinKey() {
+        if (keyStore.containsAlias(ALIAS_PIN)) {
+            return
+        }
+        val strongBox = context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
+        fun spec(sb: Boolean) = KeyGenParameterSpec.Builder(ALIAS_PIN, KeyProperties.PURPOSE_SIGN)
+            .setDigests(KeyProperties.DIGEST_SHA256)
+            .setUnlockedDeviceRequired(true)
+            .apply { if (sb) setIsStrongBoxBacked(true) }
+            .build()
+        val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, ANDROID_KEYSTORE)
+        if (strongBox) {
+            try {
+                gen.init(spec(true))
+                gen.generateKey()
+                return
+            } catch (e: Exception) {
+                // Fall back to the TEE, as for the device key.
+            }
+        }
+        gen.init(spec(false))
+        gen.generateKey()
+    }
+
     // --- duress PIN and hidden-chats PIN ---
     //
     // Both slots always hold data of the same shape. When a feature is off, the slot contains random bytes that no PIN
     // opens, so the files on disk don't reveal whether a duress PIN or hidden chats exist. Whether they're on is
-    // recorded only inside the encrypted database (see Repo kv "duress_on"/"hidden_on").
+    // recorded only inside the encrypted database (see Repo kv "duress_on"/"hidden_on"), and what the duress PIN does is
+    // sealed under the device key ([duressAction]), so no plain preference records either.
 
     /**
-     * The duress PIN is a *verifier only*. Its slot holds `deviceKey(AEAD(argon2(pin, salt), MARKER))`, where MARKER is a
-     * fixed constant that has nothing to do with the master key. Nothing reachable from the duress PIN can unwrap MK, the
-     * message root, the inbox key or any other real-data key: a coerced duress PIN reveals nothing. What it does open
-     * (Prefs.duressAction) is an erase, or a separate decoy profile keyed by [decoyKey].
+     * What a matching duress PIN opened: the decoy profile's database key, and [salt] and [secretTag]
+     * (`HMAC(secretKek(pin, salt), label)`, see [decoySecretTag]), which let the decoy session recognise the duress PIN again
+     * as its own app secret without asking the real vault. The caller wipes it.
      */
-    fun isDuress(pin: CharArray): Boolean {
-        val blob = prefs.getString(P_DURESS, null)?.let { B64.dec(it) } ?: return false
-        val salt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) } ?: return false
-        val kek = argon2(pin, salt)
+    class DuressMatch(val decoyKey: ByteArray, val salt: ByteArray, val secretTag: ByteArray) {
+        fun wipe() {
+            decoyKey.wipe()
+            secretTag.wipe()
+        }
+    }
+
+    /**
+     * The duress slot holds `deviceKey(AEAD(secretKek(pin, salt), MARKER ‖ decoyKey))`. MARKER is a fixed constant and
+     * decoyKey is random, made when the duress PIN is set: neither has anything to do with the master key, so nothing
+     * reachable from the duress PIN can unwrap MK, the message root, the inbox key or any other real-data key. Because
+     * the decoy profile's key lives inside the device-key wrap, the decoy database can't be attacked off the phone
+     * either: every guess needs the Keystore, as for the real secret. Returns null for any other PIN (always after the
+     * same single Argon2 run). Throws only if the device key is unavailable.
+     */
+    fun openDuress(pin: CharArray): DuressMatch? {
+        val blob = prefs.getString(P_DURESS, null)?.let { B64.dec(it) }
+        val salt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) } ?: Rand.bytes(16)
+        val kek = secretKek(pin, salt)
+        if (blob == null) {
+            kek.wipe()
+            return null
+        }
         return try {
             val inner = keystoreOpen(deviceAlias, blob)
             try {
-                MessageDigest.isEqual(Aead.open(kek, inner, AAD_DURESS), DURESS_MARKER)
+                val pt = Aead.open(kek, inner, AAD_DURESS)
+                try {
+                    if (pt.size != DURESS_PAYLOAD || !MessageDigest.isEqual(pt.copyOfRange(0, 32), DURESS_MARKER)) {
+                        null
+                    } else {
+                        DuressMatch(pt.copyOfRange(32, 64), salt.copyOf(), decoySecretTag(kek))
+                    }
+                } finally {
+                    pt.wipe()
+                }
             } finally {
                 inner.wipe()
             }
-        } catch (e: Exception) {
-            false
+        } catch (e: AEADBadTagException) {
+            null
+        } catch (e: IllegalArgumentException) {
+            null
         } finally {
             kek.wipe()
         }
     }
 
-    /** Sets the duress PIN, or (null) replaces it with an unopenable decoy slot of the same shape. */
+    /** Convenience for checks that only need a yes or no. */
+    fun isDuress(pin: CharArray): Boolean = runCatching { openDuress(pin) }.getOrNull()?.also { it.wipe() } != null
+
+    /**
+     * Sets the duress PIN with a fresh decoy profile key, or (null) replaces it with an unopenable slot of the same
+     * shape. Either way any existing decoy profile can no longer be opened, so its file is deleted too: a stale decoy
+     * would only tell someone that a duress PIN was once used.
+     */
     fun setDuress(pin: CharArray?) {
         val salt = Rand.bytes(16)
         val inner = if (pin != null) {
-            val kek = argon2(pin, salt)
-            Aead.seal(kek, DURESS_MARKER, AAD_DURESS).also { kek.wipe() }
+            val kek = secretKek(pin, salt)
+            val decoyKey = Rand.bytes(32)
+            val payload = DURESS_MARKER + decoyKey
+            Aead.seal(kek, payload, AAD_DURESS).also {
+                kek.wipe()
+                decoyKey.wipe()
+                payload.wipe()
+            }
         } else {
-            Aead.seal(Rand.bytes(32), Rand.bytes(32), AAD_DURESS)
+            Aead.seal(Rand.bytes(32), Rand.bytes(DURESS_PAYLOAD), AAD_DURESS)
         }
         sealDuressSlot(inner, salt)
         inner.wipe()
+        app.goldfishsend.db.Db.deleteFiles(context, app.goldfishsend.db.Db.DECOY_NAME)
     }
 
     private fun sealDuressSlot(inner: ByteArray, salt: ByteArray) {
@@ -169,20 +264,30 @@ class KeyVault(private val context: Context) {
         prefs.edit().putString(P_DURESS, B64.enc(blob)).putString(P_DURESS_SALT, B64.enc(salt)).commit()
     }
 
-    /**
-     * The decoy profile's database key: independent of the real data, derived only from the duress PIN and its own salt
-     * (`HMAC(argon2(pin, decoySalt), "gf/decoy-db")`). Only call it after [isDuress] returned true.
-     */
-    fun decoyKey(pin: CharArray): ByteArray {
-        val salt = prefs.getString(P_DECOY_SALT, null)?.let { B64.dec(it) } ?: Rand.bytes(16).also {
-            prefs.edit().putString(P_DECOY_SALT, B64.enc(it)).commit()
+    /** What the duress PIN does. Sealed under the device key, so a copy of the files doesn't say whether a decoy exists. */
+    var duressAction: DuressAction
+        get() = cachedAction ?: readDuressAction().also { cachedAction = it }
+        set(v) {
+            sealDuressAction(byteArrayOf(v.ordinal.toByte()) + Rand.bytes(15))
         }
-        val k = argon2(pin, salt)
-        return try {
-            app.goldfishsend.proto.Hash.hmacSha256(k, "gf/decoy-db".toByteArray())
-        } finally {
-            k.wipe()
-        }
+
+    /** Settings read it on every redraw: one Keystore call per process (or per change) is enough. */
+    @Volatile
+    private var cachedAction: DuressAction? = null
+
+    private fun readDuressAction(): DuressAction {
+        val blob = prefs.getString(P_DURESS_ACTION, null)?.let { B64.dec(it) } ?: return DuressAction.WIPE_ALL
+        val v = runCatching { keystoreOpen(deviceAlias, blob) }.getOrNull() ?: return DuressAction.WIPE_ALL
+        val i = v.firstOrNull()?.toInt() ?: 0
+        v.wipe()
+        return DuressAction.entries.getOrElse(i) { DuressAction.WIPE_ALL }
+    }
+
+    private fun sealDuressAction(plain: ByteArray) {
+        val blob = if (keyStore.containsAlias(deviceAlias)) keystoreSeal(deviceAlias, plain) else Rand.bytes(plain.size + 28)
+        prefs.edit().putString(P_DURESS_ACTION, B64.enc(blob)).commit()
+        cachedAction = null
+        plain.wipe()
     }
 
     /** Hidden-chats PIN: a plain Argon2id check (the app is already unlocked when it's entered). */
@@ -202,13 +307,13 @@ class KeyVault(private val context: Context) {
         h.wipe()
     }
 
-    /** Fills both slots with decoy data, if they're empty (setup, upgrade). */
+    /** Fills the slots with decoy data, if they're empty (setup, upgrade). */
     fun ensureDecoySlots() {
         if (!prefs.contains(P_DURESS) || !prefs.contains(P_DURESS_SALT)) {
             setDuress(null)
         }
-        if (!prefs.contains(P_DECOY_SALT)) {
-            prefs.edit().putString(P_DECOY_SALT, B64.enc(Rand.bytes(16))).commit()
+        if (!prefs.contains(P_DURESS_ACTION)) {
+            duressAction = DuressAction.WIPE_ALL
         }
         if (!prefs.contains(P_HIDDEN) || !prefs.contains(P_HIDDEN_SALT)) {
             setHiddenPin(null)
@@ -319,7 +424,8 @@ class KeyVault(private val context: Context) {
                 edit.putString(P_NEXT_ALIAS, alias)
                 if (target is Target.Secret) {
                     val salt = Rand.bytes(16)
-                    val kek = argon2(target.secret, salt)
+                    ensurePinKey()
+                    val kek = secretKek(target.secret, salt)
                     val inner = Aead.seal(kek, newMk, AAD_MK)
                     edit.putString(P_NEXT_WRAPPED, B64.enc(keystoreSeal(alias, inner)))
                         .putString(P_NEXT_METHOD, if (target.isPin) NEXT_PIN else NEXT_PASSPHRASE)
@@ -363,6 +469,7 @@ class KeyVault(private val context: Context) {
         val newAlias = prefs.getString(P_NEXT_ALIAS, null)
         val duressInner = runCatching { keystoreOpen(oldAlias, B64.dec(prefs.getString(P_DURESS, null)!!)) }.getOrNull()
         val duressSalt = prefs.getString(P_DURESS_SALT, null)?.let { B64.dec(it) }
+        val action = runCatching { keystoreOpen(oldAlias, B64.dec(prefs.getString(P_DURESS_ACTION, null)!!)) }.getOrNull()
         val edit = prefs.edit()
             .putString(P_WRAPPED, wrapped)
             .putBoolean(P_SCREENLOCK, method == NEXT_SCREENLOCK)
@@ -393,6 +500,7 @@ class KeyVault(private val context: Context) {
             setDuress(null)
         }
         duressInner?.wipe()
+        sealDuressAction(action ?: (byteArrayOf(DuressAction.WIPE_ALL.ordinal.toByte()) + Rand.bytes(15)))
     }
 
     /** Discards a staged rotation (the rekey never happened). */
@@ -514,7 +622,7 @@ class KeyVault(private val context: Context) {
     /** Destroys every key: everything encrypted becomes unrecoverable. */
     fun destroyAll() {
         val extra = listOfNotNull(prefs.getString(P_DEVICE_ALIAS, null), prefs.getString(P_NEXT_ALIAS, null))
-        for (alias in listOf(ALIAS_DEVICE, ALIAS_BIO, ALIAS_SYSLOCK) + extra) {
+        for (alias in listOf(ALIAS_DEVICE, ALIAS_BIO, ALIAS_SYSLOCK, ALIAS_PIN) + extra) {
             runCatching { keyStore.deleteEntry(alias) }
         }
         destroyMessageKey()
@@ -525,6 +633,7 @@ class KeyVault(private val context: Context) {
             }
         }
         prefs.edit().clear().commit()
+        cachedAction = null
     }
 
     // --- internals ---
@@ -542,7 +651,8 @@ class KeyVault(private val context: Context) {
         } else {
             edit.putString(P_SECRET_KIND, if (isPin) KIND_PIN else KIND_PASSPHRASE)
             val salt = Rand.bytes(16)
-            val kek = argon2(passphrase, salt)
+            ensurePinKey()
+            val kek = secretKek(passphrase, salt)
             val inner = Aead.seal(kek, mk, AAD_MK)
             edit.putString(P_WRAPPED, B64.enc(keystoreSeal(deviceAlias, inner)))
                 .putBoolean(P_HAS_PASS, true)
@@ -630,6 +740,7 @@ class KeyVault(private val context: Context) {
         private const val ALIAS_MSG = "gf_msg"
         private const val ALIAS_BIO = "gf_bio"
         private const val ALIAS_SYSLOCK = "gf_syslock"
+        private const val ALIAS_PIN = "gf_pin"
         private const val P_SCREENLOCK = "screenlock"
         private const val P_SECRET_KIND = "secret_kind"
         private const val KIND_PIN = "pin"
@@ -642,11 +753,17 @@ class KeyVault(private val context: Context) {
         private const val P_DURESS_SALT = "duress_salt"
         private const val P_HIDDEN = "hidden_pin"
         private const val P_HIDDEN_SALT = "hidden_salt"
-        private val AAD_DURESS = "gf/duress/v2".toByteArray()
-        private const val P_DECOY_SALT = "decoy_salt"
+        private val AAD_DURESS = "gf/duress/v3".toByteArray()
+        private const val P_DURESS_ACTION = "duress_cfg"
 
-        /** What the duress verifier encrypts. A constant: it proves the PIN, and unlocks nothing. */
-        private val DURESS_MARKER = "gf/duress-verifier/v2/0000000000".toByteArray().copyOf(32)
+        /** What the duress slot encrypts first. A constant: it proves the PIN, and unlocks nothing real. */
+        private val DURESS_MARKER = "gf/duress-verifier/v3/0000000000".toByteArray().copyOf(32)
+
+        /** MARKER ‖ decoy database key. */
+        private const val DURESS_PAYLOAD = 64
+
+        /** The decoy session's own check of the duress PIN: `HMAC(secretKek(pin, duressSalt), label)`. */
+        fun decoySecretTag(kek: ByteArray): ByteArray = app.goldfishsend.proto.Hash.hmacSha256(kek, "gf/decoy-secret/v1".toByteArray())
         private const val P_STRONGBOX = "strongbox"
         private const val P_DEVICE_ALIAS = "device_alias"
         private const val P_NEXT_WRAPPED = "next_wrapped"
@@ -663,6 +780,15 @@ class KeyVault(private val context: Context) {
 
         /** Argon2id, m = 64 MiB, t = 3, p = 1. */
         fun argon2(passphrase: CharArray, salt: ByteArray): ByteArray {
+            val bytes = utf8(passphrase)
+            try {
+                return argon2(bytes, salt)
+            } finally {
+                bytes.wipe()
+            }
+        }
+
+        fun argon2(input: ByteArray, salt: ByteArray): ByteArray {
             val params = Argon2Parameters.Builder(Argon2Parameters.ARGON2_id)
                 .withVersion(Argon2Parameters.ARGON2_VERSION_13)
                 .withMemoryAsKB(64 * 1024)
@@ -673,19 +799,19 @@ class KeyVault(private val context: Context) {
             val gen = Argon2BytesGenerator()
             gen.init(params)
             val out = ByteArray(32)
-            // Encode to UTF-8 ourselves so the input copy can be wiped (BouncyCastle's CharArray overload leaves one behind).
-            val buf = java.nio.charset.StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(passphrase))
+            gen.generateBytes(input, out)
+            return out
+        }
+
+        /** Encoded to UTF-8 by hand so the copy can be wiped (BouncyCastle's CharArray overload leaves one behind). */
+        private fun utf8(chars: CharArray): ByteArray {
+            val buf = java.nio.charset.StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(chars))
             val bytes = ByteArray(buf.remaining())
             buf.get(bytes)
             if (buf.hasArray()) {
                 java.util.Arrays.fill(buf.array(), 0.toByte())
             }
-            try {
-                gen.generateBytes(bytes, out)
-            } finally {
-                bytes.wipe()
-            }
-            return out
+            return bytes
         }
     }
 }

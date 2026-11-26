@@ -43,6 +43,7 @@ import androidx.compose.ui.window.DialogProperties
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.NetPrefs
 import app.goldfishsend.core.PinMismatch
+import app.goldfishsend.core.Session
 import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.NetStack
 import app.goldfishsend.security.ClipboardGuard
@@ -55,12 +56,82 @@ import androidx.compose.foundation.layout.size
 import app.goldfishsend.ui.components.Spinner
 import app.goldfishsend.ui.components.SwitchRow
 
-/** One-line summary for the Settings row. */
-fun connectionSummary(): String = when (NetPrefs.proxyMode) {
-    ProxyMode.DIRECT -> "Direct connection"
-    ProxyMode.EMBEDDED_TOR -> "Built-in Tor"
-    ProxyMode.ORBOT -> "Tor through Orbot"
-} + if (NetPrefs.pinServers) " · TLS keys pinned" else ""
+/**
+ * What the Connection screen shows and changes. The real profile (and onboarding) uses the device's network settings. A
+ * decoy session has its own copy, kept in its own settings: switching there looks the same, but the real connection mode,
+ * pins and Tor stay exactly as they were, and the real profile's pinned servers (which say who it talks to) never show.
+ */
+private interface ConnectionSettings {
+    var mode: ProxyMode
+    var pinServers: Boolean
+
+    fun pins(): Map<String, Set<String>>
+
+    fun blockedKeys(hostKey: String): Set<String>
+
+    fun forget(hostKey: String)
+}
+
+private class DeviceConnection(private val ctx: android.content.Context) : ConnectionSettings {
+    override var mode: ProxyMode
+        get() = NetPrefs.proxyMode
+        set(m) {
+            NetPrefs.proxyMode = m
+            NetStack.apply(ctx)
+            Graph.resetHttp()
+        }
+
+    override var pinServers: Boolean
+        get() = NetPrefs.pinServers
+        set(v) {
+            NetPrefs.pinServers = v
+            Graph.resetHttp()
+        }
+
+    override fun pins() = NetPrefs.allPins()
+
+    override fun blockedKeys(hostKey: String) = NetPrefs.blockedKeys(hostKey)
+
+    override fun forget(hostKey: String) {
+        NetPrefs.forgetPins(hostKey)
+        Graph.resetHttp()
+    }
+}
+
+/** The decoy never connects anywhere, so it never records a pin. */
+private class DecoyConnection(private val p: app.goldfishsend.core.Prefs) : ConnectionSettings {
+    override var mode: ProxyMode
+        get() = p.decoyProxyMode?.let { runCatching { ProxyMode.valueOf(it) }.getOrNull() } ?: ProxyMode.DIRECT
+        set(m) {
+            p.decoyProxyMode = m.name
+        }
+
+    override var pinServers: Boolean
+        get() = p.decoyPinServers
+        set(v) {
+            p.decoyPinServers = v
+        }
+
+    override fun pins() = emptyMap<String, Set<String>>()
+
+    override fun blockedKeys(hostKey: String) = emptySet<String>()
+
+    override fun forget(hostKey: String) = Unit
+}
+
+private fun connection(ctx: android.content.Context, s: Session?): ConnectionSettings =
+    if (s?.decoy == true) DecoyConnection(s.prefs) else DeviceConnection(ctx)
+
+/** One-line summary for the Settings row (and onboarding, with no session yet). */
+@Composable
+fun connectionSummary(s: Session? = null): String {
+    val c = connection(LocalContext.current, s)
+    return when (c.mode) {
+        ProxyMode.DIRECT -> "Direct connection"
+        ProxyMode.EMBEDDED_TOR -> "Built-in Tor"
+        ProxyMode.ORBOT -> "Tor through Orbot"
+    } + if (c.pinServers) " · TLS keys pinned" else ""
+}
 
 private fun modeTitle(m: ProxyMode) = when (m) {
     ProxyMode.DIRECT -> "Direct"
@@ -76,14 +147,20 @@ private fun modeDetail(m: ProxyMode) = when (m) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NetworkSettingsDialog(onDismiss: () -> Unit) {
+fun NetworkSettingsDialog(s: Session? = null, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
+    val conn = remember(s) { connection(ctx, s) }
     val netVersion by NetPrefs.version.collectAsState()
-    val tor by TorManager.state.collectAsState()
+    val p = s?.prefs ?: Graph.prefs
+    val prefsVersion by p.version.collectAsState()
+    val realTor by TorManager.state.collectAsState()
+    // A decoy that chose built-in Tor can only show a running Tor if the device runs it anyway; it never starts one.
+    val tor = if (s?.decoy == true && NetPrefs.proxyMode != ProxyMode.EMBEDDED_TOR) TorManager.State.Failed(null) else realTor
     var forget by remember { mutableStateOf<String?>(null) }
     var trust by remember { mutableStateOf<Pair<String, String>?>(null) }
-    // Reading the version recomposes on every change.
+    // Reading the versions recomposes on every change.
     @Suppress("UNUSED_EXPRESSION") netVersion
+    @Suppress("UNUSED_EXPRESSION") prefsVersion
 
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Scaffold(
@@ -107,17 +184,15 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .selectable(selected = NetPrefs.proxyMode == m, role = Role.RadioButton) {
-                                if (NetPrefs.proxyMode != m) {
-                                    NetPrefs.proxyMode = m
-                                    NetStack.apply(ctx)
-                                    Graph.resetHttp()
+                            .selectable(selected = conn.mode == m, role = Role.RadioButton) {
+                                if (conn.mode != m) {
+                                    conn.mode = m
                                 }
                             }
                             .padding(horizontal = 24.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        RadioButton(selected = NetPrefs.proxyMode == m, onClick = null)
+                        RadioButton(selected = conn.mode == m, onClick = null)
                         Spacer(Modifier.width(16.dp))
                         Column {
                             Text(modeTitle(m), style = MaterialTheme.typography.bodyLarge)
@@ -125,7 +200,7 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                         }
                     }
                 }
-                if (NetPrefs.proxyMode == ProxyMode.EMBEDDED_TOR) {
+                if (conn.mode == ProxyMode.EMBEDDED_TOR) {
                     val status = when (val t = tor) {
                         is TorManager.State.Ready -> "Connected through Tor."
                         TorManager.State.Starting -> "Connecting to Tor… Nothing is sent until Tor is ready."
@@ -135,7 +210,7 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                     val connecting = tor == TorManager.State.Starting || tor == TorManager.State.Off
                     SettingRow("Tor status", status, Icons.Rounded.VpnLock, trailing = if (connecting) ({ Spinner(Modifier.size(20.dp)) }) else null)
                 }
-                if (NetPrefs.proxyMode != ProxyMode.DIRECT) {
+                if (conn.mode != ProxyMode.DIRECT) {
                     Text(
                         "Tor covers your connections to GoldfishSend servers. Notifications still arrive through your push " +
                             "service (for example ntfy), which can see when you get a message but never what it says.",
@@ -146,11 +221,9 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                 }
 
                 SectionHeader("Server identity")
-                val prefsVersion by Graph.prefs.version.collectAsState()
-                @Suppress("UNUSED_EXPRESSION") prefsVersion
-                val own = Graph.prefs.serverKey
+                val own = p.serverKey
                 Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp)) {
-                    Text(runCatching { java.net.URI(Graph.prefs.serverUrl).host }.getOrNull() ?: Graph.prefs.serverUrl, style = MaterialTheme.typography.bodyLarge)
+                    Text(runCatching { java.net.URI(p.serverUrl).host }.getOrNull() ?: p.serverUrl, style = MaterialTheme.typography.bodyLarge)
                     Text(
                         own?.let { Gateway.displayFingerprint(it) } ?: "Recorded the first time the app connects.",
                         style = MaterialTheme.typography.bodySmall,
@@ -175,13 +248,12 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                     "An extra layer on top of the identity check: also remember each server's TLS certificate key and refuse to " +
                         "connect if it changes. You'll be asked what to do whenever a server renews its certificate with a new key.",
                     Icons.Rounded.Key,
-                    NetPrefs.pinServers,
+                    conn.pinServers,
                 ) {
-                    NetPrefs.pinServers = it
-                    Graph.resetHttp()
+                    conn.pinServers = it
                 }
-                val pins = NetPrefs.allPins()
-                if (NetPrefs.pinServers && pins.isEmpty()) {
+                val pins = conn.pins()
+                if (conn.pinServers && pins.isEmpty()) {
                     Text(
                         "Keys are recorded the next time the app connects to each server.",
                         style = MaterialTheme.typography.bodySmall,
@@ -200,7 +272,7 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                        val blocked = NetPrefs.blockedKeys(hostKey)
+                        val blocked = conn.blockedKeys(hostKey)
                         for (b in blocked) {
                             Spacer(Modifier.height(4.dp))
                             Text(
@@ -233,8 +305,7 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
             text = { Text("The next connection to ${hostKey.removeSuffix(":443")} will record whatever key it presents.") },
             confirmButton = {
                 TextButton(onClick = {
-                    NetPrefs.forgetPins(hostKey)
-                    Graph.resetHttp()
+                    conn.forget(hostKey)
                     forget = null
                 }) { Text("Forget") }
             },
@@ -244,9 +315,16 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
     trust?.let { (hostKey, pin) -> ConfirmTrustDialog(hostKey, pin) { trust = null } }
 }
 
-/** Shown over the whole app as soon as a pinned server presents a different key. */
+/**
+ * Shown over the whole app as soon as a pinned server presents a different key. Not in a decoy session: the pins are the
+ * real profile's (and so is the decision), so the question waits for the real profile.
+ */
 @Composable
 fun PinMismatchDialog() {
+    val session by Graph.session.collectAsState()
+    if (session?.decoy == true) {
+        return
+    }
     val m by NetPrefs.mismatch.collectAsState()
     var confirm by remember { mutableStateOf<PinMismatch?>(null) }
     m?.let { mismatch ->

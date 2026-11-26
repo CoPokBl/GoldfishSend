@@ -1,5 +1,8 @@
 package app.goldfishsend
 
+import app.goldfishsend.core.DecoyPrefs
+import app.goldfishsend.core.KvStore
+import app.goldfishsend.core.MapPreferences
 import app.goldfishsend.core.PanicResponse
 import app.goldfishsend.crypto.MessageVault
 import app.goldfishsend.net.ApiException
@@ -131,15 +134,25 @@ class ClipboardClearTest {
 class PanicConnectTest {
     @Test
     fun aDecoyNeverShowsTheRealResponse() {
-        for (r in PanicResponse.entries) {
-            assertEquals(PanicResponse.LOCK, PanicResponderActivity.preselect(r, decoy = true))
-        }
+        // The dialog reads the open session's prefs; a decoy's start without the real panic settings.
+        val real = MapPreferences(mapOf("panic_response" to PanicResponse.WIPE_EVERYTHING.name, "panic_trigger" to "org.example.ripple")) { }
+        val decoy = DecoyPrefs.open(object : KvStore {
+            val m = HashMap<String, ByteArray>()
+
+            override fun get(k: String): ByteArray? = m[k]
+
+            override fun put(k: String, v: ByteArray?) {
+                if (v == null) m.remove(k) else m[k] = v
+            }
+        }) { DecoyPrefs.mirror(real.all, emptyMap()) }
+        assertEquals(PanicResponse.LOCK, PanicResponderActivity.preselect(decoy.panicResponse))
+        assertNull(decoy.panicTrigger)
     }
 
     @Test
     fun theRealSessionStartsFromTheCurrentResponse() {
-        assertEquals(PanicResponse.WIPE_EVERYTHING, PanicResponderActivity.preselect(PanicResponse.WIPE_EVERYTHING, decoy = false))
-        assertEquals(PanicResponse.LOCK, PanicResponderActivity.preselect(PanicResponse.OFF, decoy = false))
+        assertEquals(PanicResponse.WIPE_EVERYTHING, PanicResponderActivity.preselect(PanicResponse.WIPE_EVERYTHING))
+        assertEquals(PanicResponse.LOCK, PanicResponderActivity.preselect(PanicResponse.OFF))
     }
 }
 

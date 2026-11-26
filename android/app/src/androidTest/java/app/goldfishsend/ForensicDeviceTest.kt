@@ -503,7 +503,7 @@ class ForensicDeviceTest {
 
         // --- The duress PIN: a verifier only. Nothing derived from it opens the real data.
         assertNull(Graph.vault.unlockWithPassphrase(duress.toCharArray()))
-        val decoyKey = Graph.vault.decoyKey(duress.toCharArray())
+        val decoyKey = Graph.vault.openDuress(duress.toCharArray())!!.decoyKey
         val decoyDbKey = Forensics.dbKey(decoyKey)
         assertFalse(decoyDbKey.contentEquals(dbKey))
         try {
@@ -519,7 +519,7 @@ class ForensicDeviceTest {
             // expected
         }
         // Its decoy profile is a separate database that holds none of the real data.
-        Graph.prefs.duressAction = DuressAction.DECOY
+        Graph.vault.duressAction = DuressAction.DECOY
         assertEquals(UnlockResult.Ok, AppLock.unlock(duress.toCharArray()))
         val decoy = Graph.session.value!!
         assertTrue(decoy.decoy)
@@ -532,7 +532,7 @@ class ForensicDeviceTest {
         inspect(mapOf(decoyFile to decoyDbKey), listOf(bobName, daveName, carolName), listOf(Triple(decoyFile, decoyDbKey, decoyName)))
 
         // --- Duress erase (the same path as panic wipe and too many wrong PINs): nothing at all is left.
-        Graph.prefs.duressAction = DuressAction.WIPE_ALL
+        Graph.vault.duressAction = DuressAction.WIPE_ALL
         assertEquals(UnlockResult.Wiped, AppLock.unlock(duress.toCharArray()))
         runCatching { WorkManager.getInstance(ctx).cancelAllWork().result.get() }
         Thread.sleep(500)

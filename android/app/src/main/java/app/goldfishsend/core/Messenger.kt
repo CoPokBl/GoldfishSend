@@ -323,7 +323,7 @@ object Messenger {
     internal fun notify(s: Session, cid: Long, text: String?) {
         val c = s.repo.contact(cid)
         if (c?.hidden == true) {
-            if (Graph.prefs.notifyHiddenChats && !s.decoy) {
+            if (!s.decoy && s.repo.kvString(app.goldfishsend.security.AppLock.KV_NOTIFY_HIDDEN) == "1") {
                 Notifier.newMessage(Graph.app, null, null)
             }
             return

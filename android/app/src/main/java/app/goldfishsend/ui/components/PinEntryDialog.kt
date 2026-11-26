@@ -109,7 +109,7 @@ fun PinEntryDialog(
                 )
                 Spacer(Modifier.height(16.dp))
                 PinPad(
-                    pin, onSubmit = ::submit, scrambled = Graph.prefs.scramblePinPad, minLength = minLength,
+                    pin, onSubmit = ::submit, scrambled = Graph.uiPrefs.scramblePinPad, minLength = minLength,
                     busyText = if (working) (if (checking) "Checking…" else busyText) else null,
                 )
             }

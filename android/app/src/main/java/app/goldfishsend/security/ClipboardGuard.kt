@@ -15,6 +15,7 @@ import androidx.work.Worker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import app.goldfishsend.core.Graph
+import app.goldfishsend.core.Prefs
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Rand
 import java.util.concurrent.TimeUnit
@@ -62,7 +63,7 @@ object ClipboardGuard {
         cm.setPrimaryClip(clip)
         handler.removeCallbacksAndMessages(null)
         pending = mark
-        val secs = Graph.prefs.clipboardClearSecs
+        val secs = Graph.uiPrefs.clipboardClearSecs
         if (secs > 0) {
             handler.postDelayed({ clear(app, mark) }, secs * 1000L)
             // Survives the process. It only holds the random mark, never anything of the text.
@@ -76,10 +77,13 @@ object ClipboardGuard {
         }
     }
 
-    /** The app just locked, or a new process started (which starts locked): clear our copy if the user asked for that. */
-    fun onLock(ctx: Context) {
+    /**
+     * The app just locked, or a new process started (which starts locked): clear our copy if the user asked for that in
+     * [prefs], the settings of the session that just closed (a decoy's own), or the real ones at process start.
+     */
+    fun onLock(ctx: Context, prefs: Prefs = Graph.prefs) {
         val mark = pending ?: return
-        if (Graph.prefs.clipboardClearOnLock) {
+        if (prefs.clipboardClearOnLock) {
             clear(ctx, mark)
         }
     }

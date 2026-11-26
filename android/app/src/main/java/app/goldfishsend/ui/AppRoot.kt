@@ -105,9 +105,10 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
     }
     app.goldfishsend.ui.components.BusyDialog(adding, "Adding contact…")
     // Group create and join run on after their screen is gone (Actions), so their failures are shown here, wherever the
-    // user is. Collected only while the app is on screen, so one that fails in the background shows on return.
+    // user is. Collected only while the app is on screen, so one that fails in the background shows on return. Only this
+    // session's own: nothing a locked session started may show in the next one.
     val failures by Actions.failures.collectAsStateWithLifecycle()
-    val failure = failures.firstOrNull()
+    val failure = failures.firstOrNull { it.owner === s.scope }
     LaunchedEffect(failure) {
         val f = failure ?: return@LaunchedEffect
         snackbar.showSnackbar(f.message, withDismissAction = true)

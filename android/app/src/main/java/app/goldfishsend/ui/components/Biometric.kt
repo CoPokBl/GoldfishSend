@@ -40,6 +40,32 @@ fun promptBiometric(
 }
 
 /**
+ * The same sheet as [promptBiometric], with no key behind it. For a decoy session, which must look like the real thing
+ * but must never create, replace or use the real biometric key.
+ */
+fun promptBiometricOnly(activity: FragmentActivity, title: String, onSuccess: () -> Unit, onError: (String?) -> Unit = {}) {
+    val prompt = BiometricPrompt(
+        activity,
+        ContextCompat.getMainExecutor(activity),
+        object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                onSuccess()
+            }
+
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                onError(if (errorCode == BiometricPrompt.ERROR_USER_CANCELED || errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON) null else errString.toString())
+            }
+        },
+    )
+    val info = BiometricPrompt.PromptInfo.Builder()
+        .setTitle(title)
+        .setNegativeButtonText("Use passphrase")
+        .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        .build()
+    prompt.authenticate(info)
+}
+
+/**
  * The system's own unlock sheet: phone PIN, pattern, password or strong biometric, bound to [cipher]. GoldfishSend never
  * sees the credential. Needs Android 11+ (a CryptoObject together with DEVICE_CREDENTIAL).
  */
