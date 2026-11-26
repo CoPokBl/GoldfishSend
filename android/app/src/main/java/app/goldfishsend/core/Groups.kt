@@ -638,12 +638,11 @@ object Groups {
                 s.signal.removeSignedPreKey(b.signedPreKeyId)
                 s.signal.removeKyberPreKey(b.kyberPreKeyId)
             }
+            // Deleted on the server until it confirms, not just once: the others must stop reaching us.
             val boxes = s.repo.mailboxesForContact(cid)
-            for (b in boxes) {
-                s.repo.deleteMailboxRow(b.id)
-            }
+            s.repo.doomMailboxes(boxes, Graph.prefs.serverUrl, Graph.prefs.serverKey)
             if (boxes.isNotEmpty()) {
-                Graph.scope.launchSafe { Mailboxes.deleteRemote(boxes.map(Mailboxes::item)) }
+                Graph.scope.launchSafe { Mailboxes.deleteDoomed(s) }
             }
         }
 

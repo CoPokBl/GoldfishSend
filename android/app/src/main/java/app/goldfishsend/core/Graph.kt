@@ -79,7 +79,13 @@ class Session(
         mk = newMk
     }
 
+    /** Set once [close] starts: work still running for this session (a locked-inbox drain) stops instead of failing on. */
+    @Volatile
+    var closed = false
+        private set
+
     fun close() {
+        closed = true
         // Stop the work first: whatever is still running then finds the job cancelled, not a closed database.
         scope.cancel()
         db.close()
@@ -405,6 +411,8 @@ object Graph {
      * is called doesn't open afterwards ([lockEpoch]).
      */
     fun lock() {
+        // The invite on screen belongs to this profile only (a wipe or a decoy may follow in this same process).
+        Invites.forgetCachedQr()
         val s = synchronized(sessionLock) {
             lockEpoch++
             _session.value.also { _session.value = null }

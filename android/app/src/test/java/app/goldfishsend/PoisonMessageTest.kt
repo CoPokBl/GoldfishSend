@@ -7,7 +7,6 @@ import app.goldfishsend.group.GroupModel
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Rand
 import app.goldfishsend.proto.Role
-import java.io.File
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -28,27 +27,20 @@ class PoisonMessageTest {
         ReceiveGuard.onDrop = null
     }
 
-    private fun item(dir: File, name: String, body: String, age: Long): File =
-        File(dir, "$name.0.bin").apply {
-            writeBytes(byteArrayOf(LockedInbox.KIND_PUSH) + body.toByteArray())
-            setLastModified(1_000_000L + age)
-        }
-
     /**
      * Before: an Error (here a stack overflow) escaped the drain loop, so nothing queued behind it was ever processed, and the
      * item was never counted, so every unlock hit it again. A native crash did the same.
      */
     @Test
     fun aPoisonItemInTheLockedInboxIsSkippedThenDropped() = runBlocking {
-        val dir = tmp.newFolder("inbox")
-        item(dir, "a", "first", 1)
-        item(dir, "b", "poison", 2)
-        item(dir, "c", "after", 3)
+        val inbox = TestInbox.slots(tmp.newFolder("inbox"))
+        for (m in listOf("first", "poison", "after")) {
+            TestInbox.put(inbox, m)
+        }
         val handled = mutableListOf<String>()
         val before = ReceiveGuard.dropped
         repeat(4) {
-            LockedInbox.drainDir(dir, { it }) { _, body ->
-                val text = String(body)
+            TestInbox.drain(inbox) { text ->
                 if (text == "poison") {
                     throw StackOverflowError()
                 }
@@ -57,7 +49,7 @@ class PoisonMessageTest {
         }
         // The others went through once; the poison item was tried three times, then dropped and counted.
         assertEquals(listOf("first", "after"), handled)
-        assertTrue(dir.listFiles().isNullOrEmpty())
+        assertTrue(inbox.isEmpty())
         assertEquals(before + 1, ReceiveGuard.dropped)
     }
 
@@ -65,18 +57,22 @@ class PoisonMessageTest {
     @Test
     fun anItemThatKillsTheProcessIsNotRetriedForever() = runBlocking {
         val dir = tmp.newFolder("inbox")
-        item(dir, "a", "crash", 1)
-        item(dir, "b", "after", 2)
+        val key = TestIndexKey()
+        TestInbox.slots(dir, key = key).also {
+            TestInbox.put(it, "crash")
+            TestInbox.put(it, "after")
+        }
         val handled = mutableListOf<String>()
         var crashes = 0
         repeat(5) {
             try {
-                LockedInbox.drainDir(dir, { it }) { _, body ->
-                    if (String(body) == "crash") {
+                // A fresh instance each time, as after a restart: what was counted is on disk.
+                TestInbox.drain(TestInbox.slots(dir, key = key)) { text ->
+                    if (text == "crash") {
                         crashes++
                         throw CancellationException("process died")
                     }
-                    handled += String(body)
+                    handled += text
                 }
             } catch (e: CancellationException) {
                 // The "restart".
@@ -84,15 +80,15 @@ class PoisonMessageTest {
         }
         assertEquals(3, crashes)
         assertEquals(listOf("after"), handled)
-        assertTrue(dir.listFiles().isNullOrEmpty())
+        assertTrue(TestInbox.slots(dir, key = key).isEmpty())
     }
 
     @Test
     fun anUnreadableItemIsDeleted() = runBlocking {
-        val dir = tmp.newFolder("inbox")
-        item(dir, "a", "x", 1)
-        LockedInbox.drainDir(dir, { throw IllegalStateException("sealed to an old key") }) { _, _ -> error("not opened") }
-        assertTrue(dir.listFiles().isNullOrEmpty())
+        val inbox = TestInbox.slots(tmp.newFolder("inbox"))
+        TestInbox.put(inbox, "x")
+        LockedInbox.drainSlots(inbox, { false }, { throw IllegalStateException("sealed to an old key") }) { _, _ -> error("not opened") }
+        assertTrue(inbox.isEmpty())
     }
 
     @Test

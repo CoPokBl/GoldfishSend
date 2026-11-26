@@ -42,8 +42,16 @@ object Invites {
         return cur
     }
 
+    /** The QR invite on screen, with the session (profile) it belongs to. */
+    private class Cached(val session: Session, val created: Created)
+
     @Volatile
-    private var cachedQr: Created? = null
+    private var cachedQr: Cached? = null
+
+    /** Forgets the cached QR invite: on lock, wipe and server switch, so it can never be shown for another profile. */
+    fun forgetCachedQr() {
+        cachedQr = null
+    }
 
     /** Creates an invite backed by a ready mailbox. It's instant when the background pool is warm. */
     suspend fun create(s: Session, purpose: Int): Created {
@@ -52,9 +60,14 @@ object Invites {
             throw InviteException("Still getting things ready. This only takes a moment the first time.")
         }
         if (purpose == Mailbox.PURPOSE_QR) {
-            cachedQr?.let { c ->
-                // Re-show the same still-valid QR code instead of burning a new mailbox each time the screen opens.
-                if (c.expiresAt - System.currentTimeMillis() > 60_000 && s.repo.mailbox(c.mailboxId)?.contactId == null) {
+            cachedQr?.let { cached ->
+                // Re-show the same still-valid QR code instead of burning a new mailbox each time the screen opens. Only
+                // in the session that made it, for our current server, and while its mailbox is still an unused invite.
+                val c = cached.created
+                val mb = if (cached.session === s) s.repo.mailbox(c.mailboxId) else null
+                if (c.expiresAt - System.currentTimeMillis() > 60_000 && c.link.server == Graph.prefs.serverUrl &&
+                    mb != null && mb.contactId == null && mb.inviteUsed && mb.inviteSpkId != null
+                ) {
                     return c
                 }
             }
@@ -124,7 +137,7 @@ object Invites {
         Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
         val created = Created(InviteLink(Graph.prefs.serverUrl, serverKey, id, key), mb.id, expiresAt)
         if (purpose == Mailbox.PURPOSE_QR) {
-            cachedQr = created
+            cachedQr = Cached(s, created)
         }
         return created
     }

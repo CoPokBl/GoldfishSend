@@ -9,6 +9,8 @@ import app.goldfishsend.net.MailboxItem
 import app.goldfishsend.net.PowChallenge
 import app.goldfishsend.net.PowSolution
 import app.goldfishsend.net.RotateRequest
+import app.goldfishsend.net.ServerApi
+import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.MailboxCrypto
 import app.goldfishsend.proto.Pow
@@ -63,6 +65,9 @@ object Mailboxes {
 
     /** The server's max message TTL (14 days) plus a day of margin. */
     private const val DRAIN_MS = 15 * 86_400_000L
+
+    /** A mailbox nobody refreshes is gone from the server after its lifetime (90 days by default); a day of margin. */
+    private const val DOOMED_KEEP_MS = 91 * 86_400_000L
 
     private val waiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val rotateMutex = Mutex()
@@ -614,15 +619,14 @@ object Mailboxes {
     }
 
     /**
-     * Deletes mailboxes on our server. One that's already gone counts as deleted: the server refuses a whole batch (404)
-     * if it doesn't know one mailbox in it, for example after a delete whose response was lost, so such a batch is
-     * deleted one by one instead. Otherwise the local rows would never go, and would block refreshes too.
+     * Deletes [items] on the server. The server answers 404 for a whole batch if any one of them is unknown, so one that's
+     * already gone (expired, or deleted by a call whose answer was lost) can't hold up the rest: the batch is then sent
+     * item by item, and an unknown one counts as deleted.
      */
-    suspend fun deleteRemote(items: List<MailboxItem>) {
+    suspend fun deleteRemote(items: List<MailboxItem>, api: ServerApi = Graph.api()) {
         if (items.isEmpty()) {
             return
         }
-        val api = Graph.api()
         for (batch in items.chunked(100)) {
             try {
                 api.delete(batch)
@@ -630,14 +634,40 @@ object Mailboxes {
                 if (e.status != 404) {
                     throw e
                 }
-                for (i in batch) {
+                for (one in batch.takeIf { it.size > 1 }.orEmpty()) {
                     try {
-                        api.delete(listOf(i))
-                    } catch (e2: ApiException) {
-                        if (e2.status != 404) {
-                            throw e2
+                        api.delete(listOf(one))
+                    } catch (e1: ApiException) {
+                        if (e1.status != 404) {
+                            throw e1
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /**
+     * Deletes on the server the mailboxes of chats that are gone ([app.goldfishsend.db.Repo.doomMailboxes]). Each stays
+     * recorded until its server confirms, and this runs again with every maintenance pass. One on a server we no longer
+     * use is deleted there, but only if we know that server's fingerprint (otherwise the secrets would go to whoever
+     * answers). Past the server's mailbox lifetime they're gone there anyway, and are forgotten.
+     */
+    suspend fun deleteDoomed(s: Session) {
+        if (s.decoy) {
+            return
+        }
+        s.repo.forgetDoomedBefore(System.currentTimeMillis() - DOOMED_KEEP_MS)
+        for ((where, boxes) in s.repo.doomedMailboxes().groupBy { it.server to it.serverKey }) {
+            val (server, key) = where
+            val api = when {
+                server == Graph.prefs.serverUrl -> Graph.api()
+                key != null -> Graph.api(server, ServerPin(key))
+                else -> continue
+            }
+            runCatching { deleteRemote(boxes.map { MailboxItem(B64.enc(it.sendSecret), B64.enc(it.ownerSecret)) }, api) }.onSuccess {
+                for (b in boxes) {
+                    s.repo.forgetDoomed(b.sendSecret)
                 }
             }
         }
@@ -667,6 +697,7 @@ object Mailboxes {
         for (m in s.repo.staleCreating(now - 15 * 60_000L)) {
             s.repo.deleteMailboxRow(m.id)
         }
+        runCatching { deleteDoomed(s) }
         // A rotation never verified (the push was lost, came after the server's deadline, or verify failed): start again,
         // unless one is still within its verification window.
         val pending = s.repo.rotationsPendingSince()

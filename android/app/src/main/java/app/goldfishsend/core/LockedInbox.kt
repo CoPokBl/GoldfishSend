@@ -1,8 +1,10 @@
 package app.goldfishsend.core
 
+import app.goldfishsend.crypto.InboxIndexKey
 import app.goldfishsend.proto.B64
-import app.goldfishsend.proto.Rand
+import app.goldfishsend.proto.PushEnvelope
 import java.io.File
+import java.nio.ByteBuffer
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -11,44 +13,70 @@ import org.signal.libsignal.protocol.ecc.ECPublicKey
 
 /**
  * Pushes that arrive while the app is locked can't touch the encrypted DB. They're sealed (HPKE through libsignal) to the
- * inbox public key and written to disk. The private key lives inside the DB, so they open only after unlock.
+ * inbox public key and kept on disk. The private key lives inside the DB, so they open only after unlock.
  *
- * The inbox is bounded (count and bytes), so a flood can't fill storage. File names are random (no receive times), and
- * items whose processing fails are kept for a few retries instead of being lost.
+ * They're kept in one preallocated file of fixed-size slots ([InboxSlots]), padded to the same size before sealing,
+ * under an index sealed with a Keystore key ([InboxIndexKey]). So a copy of the files shows neither how many pushes
+ * arrived, nor when, nor how big they were. The inbox is bounded and fair per mailbox: one sender can't fill it and
+ * push out everyone else. An item whose processing fails is kept for a few retries instead of being lost; an item the
+ * drain never got to (the app locked again under it) loses no retry.
  */
 object LockedInbox {
     const val KIND_PUSH: Byte = 1
     const val KIND_ENDPOINT: Byte = 2
     private const val INFO = "gf/inbox/v1"
-    const val MAX_FILES = 500
-    const val MAX_BYTES = 8L * 1024 * 1024
+    const val SLOTS = 512
+
+    /** The largest item: a Web Push payload is at most 4096 bytes, and an endpoint change much less. */
+    const val MAX_ITEM = 4096
     private const val MAX_RETRIES = 3
+
+    /** Endpoint changes share one slot (only the newest matters) under a tag no mailbox has. */
+    private val ENDPOINT_TAG = ByteArray(InboxSlots.TAG) { 0xFF.toByte() }
+
+    /** Anything that isn't a push envelope (so the drain drops it) shares one tag too. */
+    private val OTHER_TAG = ByteArray(InboxSlots.TAG)
+
     private val mutex = Mutex()
 
-    private fun dir(): File = File(Graph.app.noBackupFilesDir, "inbox").apply { mkdirs() }
+    @Volatile
+    private var slots: InboxSlots? = null
 
-    /** Seals and stores one item. Returns false if the inbox is full (or no key exists yet). */
-    fun put(kind: Byte, data: ByteArray): Boolean {
-        val pub = Graph.prefs.inboxPublicKey ?: return false
-        val sealed = ECPublicKey(B64.dec(pub)).seal(byteArrayOf(kind) + data, INFO, ByteArray(0))
-        val existing = dir().listFiles().orEmpty()
-        if (existing.size >= MAX_FILES || existing.sumOf { it.length() } + sealed.size > MAX_BYTES) {
-            return false
+    private fun store(): InboxSlots = slots ?: synchronized(this) {
+        slots ?: run {
+            // The sealed size of a full slot (the HPKE overhead doesn't depend on the key).
+            val size = ECKeyPair.generate().publicKey.seal(ByteArray(3 + MAX_ITEM), INFO, ByteArray(0)).size
+            InboxSlots(File(File(Graph.app.noBackupFilesDir, "inbox"), "slots.bin"), InboxIndexKey(), SLOTS, size).also { slots = it }
         }
-        File(dir(), "${B64.enc(Rand.bytes(12))}.0.bin").writeBytes(sealed)
-        return true
+    }
+
+    /** Seals and stores one item. False if it can't be kept (the inbox is full of this sender's, or no key exists yet). */
+    fun put(kind: Byte, data: ByteArray): Boolean = try {
+        val pub = Graph.prefs.inboxPublicKey
+        val packed = pack(kind, data, MAX_ITEM)
+        if (pub == null || packed == null) {
+            false
+        } else {
+            val tag = if (kind == KIND_ENDPOINT) ENDPOINT_TAG else PushEnvelope.parse(data)?.tag ?: OTHER_TAG
+            store().put(tag, ECPublicKey(B64.dec(pub)).seal(packed, INFO, ByteArray(0)), replace = kind == KIND_ENDPOINT)
+        }
+    } catch (e: Exception) {
+        false
     }
 
     val isEmpty: Boolean
-        get() = dir().listFiles().isNullOrEmpty()
+        get() = store().isEmpty()
 
     /** Opens and processes everything queued while locked, oldest first. */
     suspend fun drain(s: Session) = mutex.withLock {
-        if (dir().listFiles().isNullOrEmpty()) {
+        val store = store()
+        // Made while unlocked, so the file's creation doesn't date the first push that arrives while locked.
+        store.prepare()
+        if (store.isEmpty()) {
             return@withLock
         }
         val priv = Graph.inboxPrivateKey(s)
-        drainDir(dir(), { priv.open(it, INFO, ByteArray(0)) }) { kind, body ->
+        drainSlots(store, { s.closed }, { priv.open(it, INFO, ByteArray(0)) }) { kind, body ->
             when (kind) {
                 KIND_PUSH -> Messenger.handle(s, body)
                 KIND_ENDPOINT -> Mailboxes.onNewEndpoint(
@@ -60,50 +88,81 @@ object LockedInbox {
     }
 
     /**
-     * Processes the items in [dir], oldest first. Each attempt is counted in the file name before the item is processed,
-     * so an item that keeps failing, or that kills the process (a native crash, out of memory), is tried at most
-     * [MAX_RETRIES] times in all instead of on every unlock, and never holds up the items behind it.
+     * Processes the items in [store], oldest first, until none are left: pushes parked while this runs (in the moment
+     * before the session was visible) are picked up too. Each attempt is counted before the item is processed, so one
+     * that keeps failing, or that kills the process (a native crash, out of memory), is tried at most [MAX_RETRIES] times
+     * in all instead of on every unlock, and never holds up the items behind it. Once [closed] (the app locked), it
+     * stops: what's left keeps its retries, and so does the item under way, which may have failed only because the
+     * database closed under it (the receive path drops what fails without saying so).
      */
-    internal suspend fun drainDir(dir: File, open: (ByteArray) -> ByteArray?, handle: suspend (Byte, ByteArray) -> Unit) {
-        val files = dir.listFiles()?.sortedBy { it.lastModified() } ?: return
-        for (f in files) {
-            val pt = try {
-                open(f.readBytes())
-            } catch (e: Exception) {
-                null
+    internal suspend fun drainSlots(
+        store: InboxSlots,
+        closed: () -> Boolean,
+        open: (ByteArray) -> ByteArray?,
+        handle: suspend (Byte, ByteArray) -> Unit,
+    ) {
+        val tried = HashSet<Long>()
+        while (true) {
+            val todo = store.entries().filter { it.seq !in tried }
+            if (todo.isEmpty()) {
+                return
             }
-            if (pt == null || pt.isEmpty()) {
-                // Sealed to an older key (rotated after a reboot wipe) or corrupt: it can never be opened.
-                f.delete()
-                continue
-            }
-            val claimed = claim(f) ?: continue
-            try {
-                handle(pt[0], pt.copyOfRange(1, pt.size))
-                claimed.delete()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                // Kept (already counted) for the next drain.
-                ReceiveGuard.log?.invoke("locked inbox item failed: ${e.javaClass.simpleName}")
+            for (e in todo) {
+                if (closed()) {
+                    return
+                }
+                tried += e.seq
+                val sealed = store.claim(e, MAX_RETRIES) ?: continue
+                val item = try {
+                    open(sealed)?.let(::unpack)
+                } catch (x: Exception) {
+                    null
+                }
+                if (item == null) {
+                    // Sealed to an older key (rotated after a reboot wipe) or corrupt: it can never be opened.
+                    store.free(e)
+                    continue
+                }
+                try {
+                    handle(item.first, item.second)
+                } catch (x: CancellationException) {
+                    throw x
+                } catch (x: Throwable) {
+                    if (closed()) {
+                        store.unclaim(e)
+                        return
+                    }
+                    // Kept (already counted) for the next drain.
+                    ReceiveGuard.log?.invoke("locked inbox item failed: ${x.javaClass.simpleName}")
+                    continue
+                }
+                if (closed()) {
+                    store.unclaim(e)
+                    return
+                }
+                store.free(e)
             }
         }
     }
 
-    /** Counts an attempt: renames the item to its next try, or deletes it once it has had [MAX_RETRIES]. */
-    private fun claim(f: File): File? {
-        val parts = f.name.split('.')
-        val tries = parts.getOrNull(1)?.toIntOrNull() ?: MAX_RETRIES
-        if (tries >= MAX_RETRIES) {
-            f.delete()
-            ReceiveGuard.drop("locked inbox", RetriesExhausted())
+    /** kind, length, data, zeros up to [max]: every item seals to the same size. Null if [data] is too big. */
+    internal fun pack(kind: Byte, data: ByteArray, max: Int): ByteArray? {
+        if (data.size > max) {
             return null
         }
-        val next = File(f.parentFile, "${parts[0]}.${tries + 1}.bin")
-        return if (f.renameTo(next)) next else f
+        return ByteBuffer.allocate(3 + max).put(kind).putShort(data.size.toShort()).put(data).array()
     }
 
-    private class RetriesExhausted : Exception()
+    internal fun unpack(p: ByteArray): Pair<Byte, ByteArray>? {
+        if (p.size < 3) {
+            return null
+        }
+        val len = ((p[1].toInt() and 0xff) shl 8) or (p[2].toInt() and 0xff)
+        if (len > p.size - 3) {
+            return null
+        }
+        return p[0] to p.copyOfRange(3, 3 + len)
+    }
 
     /** Creates a fresh key pair. The old private key is overwritten in the DB (secure_delete zeroes the freed page). */
     fun rotateKeys(s: Session) {
@@ -112,7 +171,9 @@ object LockedInbox {
         Graph.prefs.inboxPublicKey = B64.enc(kp.publicKey.serialize())
     }
 
+    /** Deletes the file and destroys the index key. */
     fun clear() {
-        dir().deleteRecursively()
+        store().clear()
+        File(Graph.app.noBackupFilesDir, "inbox").deleteRecursively()
     }
 }

@@ -1,10 +1,13 @@
 package app.goldfishsend.core
 
 import android.util.Log
+import app.goldfishsend.crypto.BoundPrekeys
+import app.goldfishsend.crypto.IdentityCheck
 import app.goldfishsend.db.Mailbox
 import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.OutboxKind
+import app.goldfishsend.db.RESEND_WINDOW_MS
 import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.proto.B64
@@ -38,15 +41,20 @@ object Messenger {
 
     private const val MAX_TIMER = 28 * 86400L
 
+    /** The longest a message held behind a changed safety number is kept: as long as the server keeps one. */
+    private const val HELD_MAX_MS = 14 * 86_400_000L
+
     // ---------- receive ----------
 
     /** Entry point for every decrypted UnifiedPush payload. */
     suspend fun onPushPayload(bytes: ByteArray) {
         val s = Graph.realSession ?: Graph.tryAutoUnlock()
         if (s == null) {
-            LockedInbox.put(LockedInbox.KIND_PUSH, bytes)
-            // Kept for the next real unlock. No notification while a decoy profile is on screen: it would give it away.
-            if (PushEnvelope.parse(bytes) is PushEnvelope.Message && Graph.session.value?.decoy != true) {
+            // Kept for the next real unlock. No notification for one the inbox refused (it's gone), while a decoy profile
+            // is on screen (it would give it away), or if the user chose silence while locked: the chat can't be told
+            // apart yet, so that's the only way to keep hidden chats silent then too.
+            val kept = LockedInbox.put(LockedInbox.KIND_PUSH, bytes)
+            if (kept && PushEnvelope.parse(bytes) is PushEnvelope.Message && Graph.session.value?.decoy != true && !Graph.prefs.quietWhileLocked) {
                 Notifier.newMessage(Graph.app, null, null)
             }
             return
@@ -119,19 +127,25 @@ object Messenger {
             outServer = null,
             outSecret = null,
         )
-        val cipher = SessionCipher(s.signal, LOCAL, remote(cid))
         val padded = if (blob.type == E2eBlob.PREKEY) {
             val m = PreKeySignalMessage(blob.body)
+            // A session may only start from the prekeys this chat's own invite advertised (none, for a chat we started by
+            // scanning). So a hello re-tagged onto an existing chat's mailbox, or one built from our group cards'
+            // last-resort prekeys, can't take the chat over.
+            val store = chatStore(s, if (newContact) listOf(mb) else s.repo.mailboxesForContact(cid))
             if (!newContact && !s.signal.isTrustedIdentity(remote(cid), m.identityKey, IdentityKeyStore.Direction.RECEIVING)) {
+                // Only an authentic message counts as an identity change: it's checked in a scratch store first, so a
+                // forged one is dropped here without recording anything.
+                IdentityCheck.authenticate(store, LOCAL, remote(cid), m)
                 throw IdentityChanged(cid, m.identityKey.serialize())
             }
-            val pt = cipher.decrypt(m)
+            val pt = SessionCipher(store, LOCAL, remote(cid)).decrypt(m)
             if (newContact) {
                 s.repo.setContactIdentity(cid, m.identityKey.serialize())
             }
             pt
         } else {
-            cipher.decrypt(SignalMessage(blob.body))
+            SessionCipher(s.signal, LOCAL, remote(cid)).decrypt(SignalMessage(blob.body))
         }
         val content = Content.decode(Padding.unpad(padded))
         if (newContact) {
@@ -141,6 +155,14 @@ object Messenger {
         }
         s.repo.setReceivedAny(cid)
         Decrypted(cid, content, newContact)
+    }
+
+    /** The store a 1:1 PreKey message is decrypted with: it lends only the prekeys that [boxes] advertised in invites. */
+    private fun chatStore(s: Session, boxes: List<Mailbox>): BoundPrekeys {
+        val signed = boxes.mapNotNull { it.inviteSpkId }.toSet()
+        // Never a group card's last-resort prekey, even if a key id were ever reused.
+        val kyber = boxes.mapNotNull { it.inviteKyberId }.filterNot { s.signal.isLastResort(it) }.toSet()
+        return BoundPrekeys(s.signal, signed, kyber)
     }
 
     private suspend fun dispatch(s: Session, d: Decrypted) {
@@ -266,25 +288,17 @@ object Messenger {
     // ---------- send ----------
 
     /**
-     * A contact's identity key changed (reinstall, new phone, or someone impersonating them). Verified contacts (and,
-     * if the user opted in, every contact) are paused: their messages are held and nothing is sent until the user
-     * reviews the change. Otherwise, as in Signal, the new key is accepted with a visible notice.
+     * A contact's identity key changed, and a message under the new key decrypted (reinstall, new phone, or someone
+     * impersonating them). The change is never accepted by itself, verified contact or not: their messages are held
+     * and nothing is sent until the user reviews it. Someone who really reinstalled can't reach a 1:1 mailbox again
+     * anyway (they lost its secret and our prekeys), so an automatic switch would only ever serve an impostor.
      */
-    private suspend fun onIdentityChanged(s: Session, e: IdentityChanged, tag: ByteArray, raw: ByteArray) {
+    private fun onIdentityChanged(s: Session, e: IdentityChanged, tag: ByteArray, raw: ByteArray) {
         val contact = s.repo.contact(e.contactId) ?: return
-        val hold = contact.verified || Graph.prefs.holdAllKeyChanges || contact.pendingIdentity != null
-        if (!hold) {
-            s.lock.withLock {
-                s.db.tx {
-                    s.signal.saveIdentity(remote(contact.id), IdentityKey(e.newKey))
-                    s.repo.acceptPendingIdentity(contact.id, e.newKey)
-                }
-            }
-            systemMessage(s, contact.id, "${contact.name}'s safety number changed. Compare it again to make sure it's really them.")
-            receive(s, tag, raw)
-            return
-        }
-        s.repo.holdIncoming(contact.id, tag, raw)
+        val now = System.currentTimeMillis()
+        // Held messages disappear on the chat's timer like any other, and are never kept longer than the server would.
+        val keep = if (contact.timerSecs > 0) minOf(contact.timerSecs * 1000, HELD_MAX_MS) else HELD_MAX_MS
+        s.repo.holdIncoming(contact.id, e.newKey, tag, raw, now + keep)
         if (contact.pendingIdentity == null || !contact.pendingIdentity.contentEquals(e.newKey)) {
             s.repo.setPendingIdentity(contact.id, e.newKey)
             systemMessage(
@@ -293,20 +307,30 @@ object Messenger {
             )
             notify(s, contact.id, "Safety number changed")
         }
+        Sweeper.schedule(s)
         s.db.notifyChanged()
     }
 
-    /** The user reviewed and accepted a changed safety number. Delivers the held messages and resumes sending. */
-    suspend fun acceptIdentityChange(s: Session, cid: Long) {
-        val contact = s.repo.contact(cid) ?: return
-        val key = contact.pendingIdentity ?: return
-        s.lock.withLock {
+    /**
+     * The user compared [reviewed] (the new safety number on screen) and accepted it. Does nothing, and returns false, if
+     * the pending key has changed since. Delivers only the held messages that came with [reviewed], drops any others,
+     * and resumes sending.
+     */
+    suspend fun acceptIdentityChange(s: Session, cid: Long, reviewed: ByteArray): Boolean {
+        val contact = s.repo.contact(cid) ?: return false
+        val accepted = s.lock.withLock {
             s.db.tx {
-                s.signal.saveIdentity(remote(cid), IdentityKey(key))
-                s.repo.acceptPendingIdentity(cid, key)
+                s.repo.acceptPendingIdentity(cid, reviewed).also { ok ->
+                    if (ok) {
+                        s.signal.saveIdentity(remote(cid), IdentityKey(reviewed))
+                    }
+                }
             }
         }
-        val held = s.repo.heldIncoming(cid)
+        if (!accepted) {
+            return false
+        }
+        val held = s.repo.heldIncoming(cid, reviewed, System.currentTimeMillis())
         s.repo.clearHeldIncoming(cid)
         systemMessage(s, cid, "You accepted ${contact.name}'s new safety number.")
         for ((tag, blob) in held) {
@@ -314,11 +338,27 @@ object Messenger {
         }
         s.db.notifyChanged()
         Outbox.kick()
+        return true
+    }
+
+    /**
+     * The user rejected the new safety number [reviewed]: the messages that came with it are discarded and the chat
+     * carries on with the key it had. False if the pending key has changed since.
+     */
+    fun rejectIdentityChange(s: Session, cid: Long, reviewed: ByteArray): Boolean {
+        val contact = s.repo.contact(cid) ?: return false
+        if (!s.repo.rejectPendingIdentity(cid, reviewed)) {
+            return false
+        }
+        systemMessage(s, cid, "You kept ${contact.name}'s previous safety number. Messages from the new one were discarded.")
+        s.db.notifyChanged()
+        Outbox.kick()
+        return true
     }
 
     /**
      * Hidden chats post nothing, unless the user allowed it and this isn't a decoy session. Even then the notification
-     * is generic, with no name and no text.
+     * is generic, with no name and no text. (While locked, the chat isn't known yet: see [onPushPayload].)
      */
     internal fun notify(s: Session, cid: Long, text: String?) {
         val c = s.repo.contact(cid)
@@ -365,10 +405,14 @@ object Messenger {
         }
     }
 
-    /** Re-sends messages that never got a delivery receipt (the push server may have dropped them). */
+    /**
+     * Re-sends messages that never got a delivery receipt (the push server may have dropped them), for up to
+     * [RESEND_WINDOW_MS] after sending: the recipient remembers what it removed for longer than that, so a re-send never
+     * brings back a message they viewed once, deleted or let expire.
+     */
     fun resendUnreceipted(s: Session) {
-        val cutoff = System.currentTimeMillis() - 6 * 3600_000L
-        for (m in s.repo.unreceipted(cutoff, 3)) {
+        val now = System.currentTimeMillis()
+        for (m in s.repo.unreceipted(now - 6 * 3600_000L, now - RESEND_WINDOW_MS, 3)) {
             val c = s.repo.contact(m.contactId) ?: continue
             // Groups don't send delivery receipts (docs/groups.md), so "no receipt" means nothing there.
             if (c.isGroup) {
@@ -471,7 +515,11 @@ object Messenger {
         Notifier.cancel(Graph.app)
     }
 
-    /** Deletes a contact everywhere: our inbound mailbox on the server (best effort), then local state. */
+    /**
+     * Deletes a contact everywhere: local state at once, and our inbound mailboxes on the server. Those are recorded as
+     * doomed in the same transaction and retried until the server confirms ([Mailboxes.deleteDoomed]), so being offline
+     * or rate-limited now doesn't leave a blocked contact able to write to us.
+     */
     suspend fun deleteContact(s: Session, cid: Long) {
         val members = if (s.repo.contact(cid)?.isGroup == true) {
             // Leave first (best effort), so the others stop sending to us, and try to get the goodbyes out.
@@ -481,9 +529,11 @@ object Messenger {
         } else {
             emptySet()
         }
-        // All of them, including mailboxes replaced by rotation that are still draining.
-        val boxes = s.repo.mailboxesForContact(cid)
-        s.repo.deleteContact(cid)
+        s.db.tx {
+            // All of them, including mailboxes replaced by rotation that are still draining.
+            s.repo.doomMailboxes(s.repo.mailboxesForContact(cid), Graph.prefs.serverUrl, Graph.prefs.serverKey)
+            s.repo.deleteContact(cid)
+        }
         if (members.isNotEmpty()) {
             s.lock.withLock { Groups.forgetSessions(s, members) }
         }
@@ -491,9 +541,7 @@ object Messenger {
         runCatching { Shredder.runPending(s) }
         s.db.notifyChanged()
         Notifier.cancel(Graph.app)
-        if (boxes.isNotEmpty()) {
-            runCatching { Mailboxes.deleteRemote(boxes.map(Mailboxes::item)) }
-        }
+        Mailboxes.deleteDoomed(s)
     }
 }
 

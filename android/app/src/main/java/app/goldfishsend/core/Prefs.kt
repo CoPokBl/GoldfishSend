@@ -311,12 +311,13 @@ class Prefs(private val sp: SharedPreferences) {
         set(v) = setStr("panic_trigger", v)
 
     /**
-     * Pause any contact whose safety number changes until the user reviews it. Verified contacts are always paused.
-     * Off by default for unverified contacts, matching Signal: the change is accepted with a visible notice.
+     * No notification for pushes that arrive while the app is locked. Until unlock the chat can't be told apart (the
+     * mailbox tags are in the encrypted DB), so this is the only way to keep hidden chats silent while locked. Off by
+     * default: it silences every chat. A plain setting that anyone may use, so its value says nothing about hidden chats.
      */
-    var holdAllKeyChanges: Boolean
-        get() = bool("hold_all_key_changes", false)
-        set(v) = setBool("hold_all_key_changes", v)
+    var quietWhileLocked: Boolean
+        get() = bool("quiet_while_locked", false)
+        set(v) = setBool("quiet_while_locked", v)
 
     /** Overwrite freed app memory after locking. On by default: the only cost is a brief CPU spike. */
     var wipeMemoryOnLock: Boolean
