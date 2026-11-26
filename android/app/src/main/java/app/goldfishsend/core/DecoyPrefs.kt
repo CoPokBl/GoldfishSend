@@ -25,8 +25,8 @@ interface KvStore {
  *
  * They're kept inside the decoy's encrypted database (kv [KEY]), not in a preference file, so nothing on disk says that a
  * decoy exists. A new decoy starts with defaults, except for the settings someone at the lock screen can already see or
- * feel (theme, keypad, auto-lock, the attempts-left warning, fingerprint unlock, connection mode): those start as the
- * real profile's, so opening the decoy doesn't visibly change anything.
+ * feel (theme, keypad, auto-lock, the attempts-left warning, fingerprint unlock, connection mode, silence while locked):
+ * those start as the real profile's, so opening the decoy doesn't visibly change anything.
  */
 object DecoyPrefs {
     const val KEY = "decoy_prefs"
@@ -34,7 +34,7 @@ object DecoyPrefs {
     /** gf_prefs keys copied into a new decoy. Everything else (wipe triggers, panic app, timers…) starts at its default. */
     val MIRRORED = setOf(
         "theme", "amoled", "dynamic_color", "flag_secure", "scramble_pin", "lock_timeout", "lock_screen_off", "max_failed",
-        "wipe_memory_on_lock", "server_url", "server_key", "server_key_tofu",
+        "wipe_memory_on_lock", "server_url", "server_key", "server_key_tofu", "quiet_while_locked",
     )
 
     /**
