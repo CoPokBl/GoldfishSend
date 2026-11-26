@@ -66,111 +66,80 @@ public sealed class MailboxRepository {
             $"SELECT {Columns} FROM mailboxes WHERE id = @id", new { id }, cancellationToken: ct));
     }
 
-    public async Task<IReadOnlyList<MailboxRow>> GetManyAsync(IReadOnlyList<byte[]> ids, CancellationToken ct = default) {
-        if (ids.Count == 0) {
-            return [];
-        }
-        await using var conn = await _db.OpenAsync(ct);
-        var rows = await conn.QueryAsync<MailboxRow>(new CommandDefinition(
-            $"SELECT {Columns} FROM mailboxes WHERE id IN @ids", new { ids }, cancellationToken: ct));
-        return rows.AsList();
-    }
-
     public async Task DeleteAsync(byte[] id, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM mailboxes WHERE id = @id", new { id }, cancellationToken: ct));
     }
 
-    /// <summary>Deletes the mailboxes and every message held for them.</summary>
-    public async Task DeleteManyAsync(IReadOnlyList<byte[]> ids, CancellationToken ct = default) {
-        if (ids.Count == 0) {
-            return;
-        }
+    /// <summary>Deletes the mailbox and every message held for it.</summary>
+    public async Task DeleteWithMessagesAsync(byte[] id, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
-        await conn.ExecuteAsync(new CommandDefinition("DELETE FROM pending_messages WHERE mailbox_id IN @ids", new { ids }, tx, cancellationToken: ct));
-        await conn.ExecuteAsync(new CommandDefinition("DELETE FROM mailboxes WHERE id IN @ids", new { ids }, tx, cancellationToken: ct));
+        await conn.ExecuteAsync(new CommandDefinition("DELETE FROM pending_messages WHERE mailbox_id = @id", new { id }, tx, cancellationToken: ct));
+        await conn.ExecuteAsync(new CommandDefinition("DELETE FROM mailboxes WHERE id = @id", new { id }, tx, cancellationToken: ct));
         await tx.CommitAsync(ct);
     }
 
-    /// <summary>
-    /// Stages a new endpoint for verification. Only active or endpoint-gone mailboxes can rotate.
-    /// Each mailbox gets its own code hash and deadline, so a database snapshot taken during a batch rotation
-    /// doesn't show which mailboxes belong together.
-    /// </summary>
-    /// <returns>The number of mailboxes staged.</returns>
-    public async Task<int> BeginRotationAsync(
-        IReadOnlyList<(byte[] Id, byte[] PendingEndpoint, byte[] VerifyHash, DateTime VerifyExpiresAt)> items,
-        CancellationToken ct = default) {
+    /// <summary>Stages a new endpoint for verification. Only active or endpoint-gone mailboxes can rotate.</summary>
+    /// <returns><c>false</c> if the mailbox can't rotate (gone, or still pending creation).</returns>
+    public async Task<bool> BeginRotationAsync(
+        byte[] id, byte[] pendingEndpoint, byte[] verifyHash, DateTime verifyExpiresAt, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
-        await using var tx = await conn.BeginTransactionAsync(ct);
-        var staged = 0;
-        foreach (var (id, pending, verifyHash, verifyExpiresAt) in items) {
-            staged += await conn.ExecuteAsync(new CommandDefinition("""
-                UPDATE mailboxes
-                SET pending_endpoint = @pending, verify_hash = @verifyHash, verify_attempts = 0, verify_expires_at = @verifyExpiresAt
-                WHERE id = @id AND state <> @pendingState
-                """,
-                new { id, pending, verifyHash, verifyExpiresAt, pendingState = (byte)MailboxState.PendingVerification }, tx, cancellationToken: ct));
-        }
-        if (staged != items.Count) {
-            await tx.RollbackAsync(ct);
-            return staged;
-        }
-        await tx.CommitAsync(ct);
-        return staged;
+        return await conn.ExecuteAsync(new CommandDefinition("""
+            UPDATE mailboxes
+            SET pending_endpoint = @pendingEndpoint, verify_hash = @verifyHash, verify_attempts = 0, verify_expires_at = @verifyExpiresAt
+            WHERE id = @id AND state <> @pendingState
+            """,
+            new { id, pendingEndpoint, verifyHash, verifyExpiresAt, pendingState = (byte)MailboxState.PendingVerification },
+            cancellationToken: ct)) == 1;
     }
 
-    public async Task CancelRotationAsync(IReadOnlyList<byte[]> ids, CancellationToken ct = default) {
+    public async Task CancelRotationAsync(byte[] id, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
-        // Never touch mailboxes still pending creation: clearing their deadline would exempt them from purging.
+        // Never touch a mailbox still pending creation: clearing its deadline would exempt it from purging.
         await conn.ExecuteAsync(new CommandDefinition("""
             UPDATE mailboxes SET pending_endpoint = NULL, verify_hash = NULL, verify_attempts = 0, verify_expires_at = NULL
-            WHERE id IN @ids AND state <> @pendingState
-            """, new { ids, pendingState = (byte)MailboxState.PendingVerification }, cancellationToken: ct));
+            WHERE id = @id AND state <> @pendingState
+            """, new { id, pendingState = (byte)MailboxState.PendingVerification }, cancellationToken: ct));
     }
 
-    /// <summary>Atomically spends one verification attempt per mailbox, but only while each is under <paramref name="max"/>.</summary>
-    /// <returns>The number of mailboxes that still had an attempt left.</returns>
-    public async Task<int> ConsumeVerifyAttemptAsync(IReadOnlyList<byte[]> ids, int max, CancellationToken ct = default) {
+    /// <summary>Atomically spends one verification attempt, but only while the mailbox is under <paramref name="max"/>.</summary>
+    /// <returns><c>false</c> if it had no attempt left (or nothing to verify).</returns>
+    public async Task<bool> ConsumeVerifyAttemptAsync(byte[] id, int max, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         return await conn.ExecuteAsync(new CommandDefinition("""
             UPDATE mailboxes SET verify_attempts = verify_attempts + 1
-            WHERE id IN @ids AND verify_hash IS NOT NULL AND verify_attempts < @max AND verify_expires_at >= UTC_TIMESTAMP()
-            """, new { ids, max }, cancellationToken: ct));
+            WHERE id = @id AND verify_hash IS NOT NULL AND verify_attempts < @max AND verify_expires_at >= UTC_TIMESTAMP()
+            """, new { id, max }, cancellationToken: ct)) == 1;
     }
 
     /// <summary>
     /// Completes verification in one transaction. Any pending endpoint is promoted, the mailbox becomes active,
     /// its expiry is refreshed, and its held messages are scheduled for immediate delivery.
-    /// Each update is conditional on the code hash that was verified still being the stored one, so a
-    /// rotation that commits in between can't be promoted unverified. If any mailbox fails the condition,
-    /// nothing changes.
+    /// The update is conditional on the code hash that was verified still being the stored one, so a
+    /// rotation that commits in between can't be promoted unverified.
     /// </summary>
     public async Task<bool> CompleteVerificationAsync(
-        IReadOnlyList<(byte[] Id, byte[] VerifyHash)> items, int maxAttempts, DateOnly expiresAt, CancellationToken ct = default) {
+        byte[] id, byte[] verifyHash, int maxAttempts, DateOnly expiresAt, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
-        foreach (var (id, verifyHash) in items) {
-            var updated = await conn.ExecuteAsync(new CommandDefinition("""
-                UPDATE mailboxes
-                SET sealed_endpoint = COALESCE(pending_endpoint, sealed_endpoint),
-                    pending_endpoint = NULL, verify_hash = NULL, verify_attempts = 0, verify_expires_at = NULL,
-                    state = @active, expires_at = GREATEST(expires_at, @expiresAt), reprobe_at = NULL, reprobe_count = 0
-                WHERE id = @id AND verify_hash = @verifyHash AND verify_expires_at >= UTC_TIMESTAMP() AND verify_attempts <= @maxAttempts
-                """,
-                new { id, verifyHash, maxAttempts, active = (byte)MailboxState.Active, expiresAt = expiresAt.ToDateTime(TimeOnly.MinValue) },
-                tx, cancellationToken: ct));
-            if (updated != 1) {
-                await tx.RollbackAsync(ct);
-                return false;
-            }
+        var updated = await conn.ExecuteAsync(new CommandDefinition("""
+            UPDATE mailboxes
+            SET sealed_endpoint = COALESCE(pending_endpoint, sealed_endpoint),
+                pending_endpoint = NULL, verify_hash = NULL, verify_attempts = 0, verify_expires_at = NULL,
+                state = @active, expires_at = GREATEST(expires_at, @expiresAt), reprobe_at = NULL, reprobe_count = 0
+            WHERE id = @id AND verify_hash = @verifyHash AND verify_expires_at >= UTC_TIMESTAMP() AND verify_attempts <= @maxAttempts
+            """,
+            new { id, verifyHash, maxAttempts, active = (byte)MailboxState.Active, expiresAt = expiresAt.ToDateTime(TimeOnly.MinValue) },
+            tx, cancellationToken: ct));
+        if (updated != 1) {
+            await tx.RollbackAsync(ct);
+            return false;
         }
-        var ids = items.Select(i => i.Id).ToArray();
         // Rows parked by an attempt that's still running miss this, but that attempt rechecks the mailbox after parking.
         await conn.ExecuteAsync(new CommandDefinition(
-            $"UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id IN @ids AND {PendingMessageRepository.Unclaimed}",
-            new { ids }, tx, cancellationToken: ct));
+            $"UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id = @id AND {PendingMessageRepository.Unclaimed}",
+            new { id }, tx, cancellationToken: ct));
         await tx.CommitAsync(ct);
         return true;
     }
@@ -232,11 +201,11 @@ public sealed class MailboxRepository {
             new { id, cap }, cancellationToken: ct));
     }
 
-    public async Task RefreshAsync(IReadOnlyList<byte[]> ids, DateOnly expiresAt, CancellationToken ct = default) {
+    public async Task RefreshAsync(byte[] id, DateOnly expiresAt, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         await conn.ExecuteAsync(new CommandDefinition(
-            "UPDATE mailboxes SET expires_at = GREATEST(expires_at, @expiresAt) WHERE id IN @ids",
-            new { ids, expiresAt = expiresAt.ToDateTime(TimeOnly.MinValue) }, cancellationToken: ct));
+            "UPDATE mailboxes SET expires_at = GREATEST(expires_at, @expiresAt) WHERE id = @id",
+            new { id, expiresAt = expiresAt.ToDateTime(TimeOnly.MinValue) }, cancellationToken: ct));
     }
 
     /// <summary>Removes expired and never-verified mailboxes and abandons stale endpoint rotations.</summary>

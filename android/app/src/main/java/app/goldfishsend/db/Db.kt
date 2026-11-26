@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 8
+    const val VERSION = 9
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -229,9 +229,42 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 9) {
+                for (s in V9) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /**
+     * A UnifiedPush registration per mailbox, and owner requests sent one mailbox at a time, spread out. Mailboxes made
+     * before shared one endpoint and can't be used any more (nothing was released: a fresh install is expected).
+     */
+    internal val V9 = listOf(
+        "DELETE FROM kv WHERE k IN ('push_endpoint', 'rotation_needed', 'endpoint_gone_at')",
+        // Our UnifiedPush instances. Every mailbox has its own, so its endpoint and Web Push keys are its own, and the
+        // mailboxes of different contacts and groups carry nothing in common the server could link them by. `used`: a
+        // mailbox was created on it (the server has seen its endpoint), so once that mailbox is gone the instance is
+        // unregistered, never reused. Until then it's a spare, registered ahead for the next mailbox. `endpoint`: JSON
+        // PushEndpointData, null until the distributor sends one. `gone_at`: when the server last said its endpoint was
+        // gone (re-registered at most every 6 hours).
+        """CREATE TABLE push_instances (
+            name TEXT PRIMARY KEY,
+            endpoint TEXT,
+            used INTEGER NOT NULL DEFAULT 0,
+            gone_at INTEGER,
+            created_at INTEGER NOT NULL
+        )""",
+        "ALTER TABLE mailboxes ADD COLUMN push_instance TEXT",
+        // When to refresh the mailbox on the server, and when to point it at its instance's new endpoint. Each is picked
+        // at random, so the server never sees two of our mailboxes in one request or one burst ([app.goldfishsend.core.OwnerOps]).
+        "ALTER TABLE mailboxes ADD COLUMN refresh_at INTEGER",
+        "ALTER TABLE mailboxes ADD COLUMN rotate_at INTEGER",
+        // When to delete it on the server, spread out the same way.
+        "ALTER TABLE doomed_mailboxes ADD COLUMN delete_at INTEGER NOT NULL DEFAULT 0",
+    )
 
     /** Held messages sealed like message bodies, tombstones for removed messages, and mailboxes still to delete. */
     internal val V8 = listOf(

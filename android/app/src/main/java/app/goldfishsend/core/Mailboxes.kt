@@ -2,26 +2,25 @@ package app.goldfishsend.core
 
 import android.util.Log
 import app.goldfishsend.db.Mailbox
+import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.db.setRotateNeeded
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.CreateMailboxRequest
 import app.goldfishsend.net.MailboxItem
 import app.goldfishsend.net.PowChallenge
 import app.goldfishsend.net.PowSolution
-import app.goldfishsend.net.RotateRequest
-import app.goldfishsend.net.ServerApi
-import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.MailboxCrypto
 import app.goldfishsend.proto.Pow
-import app.goldfishsend.proto.ProtoJson
-import java.time.LocalDate
+import app.goldfishsend.proto.Rand
+import app.goldfishsend.push.PushHub
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,27 +37,35 @@ import kotlinx.serialization.Serializable
 data class PushEndpointData(val url: String, val p256dh: String, val auth: String)
 
 /**
- * Inbound mailbox lifecycle: create (PoW + verification push), pool for instant invites, rotate on endpoint change,
- * refresh before expiry, and delete.
+ * Inbound mailbox lifecycle: create (PoW + verification push), pool for instant invites, move to a new endpoint, refresh
+ * before expiry, and delete.
  *
  * Creating a mailbox costs a proof of work on our own server (several seconds on a phone, much more on a busy network),
  * so a pool of [POOL_TARGET] verified mailboxes is kept ready, filled one at a time in the app's scope. Whoever needs a
  * mailbox takes one from the pool, or waits for the fill to deliver the next: leaving the screen doesn't waste the work.
+ *
+ * Every mailbox has a UnifiedPush instance of its own ([PushHub]), so its own endpoint, and the server can't link the
+ * mailboxes of different contacts or groups by endpoint. For the same reason the owner requests (refresh, rotation,
+ * delete) carry one mailbox each and go out one at a time, spread over time ([OwnerOps]).
  */
 object Mailboxes {
     private const val TAG = "Mailboxes"
 
     /**
      * Ready mailboxes kept in the pool. Three cover the usual bursts (add a contact, start a group, show a code) without a
-     * wait. Each is one more row on the server per user (a few hundred bytes, and a proof of work once).
+     * wait. Each is one more row on the server per user (a few hundred bytes, and a proof of work once), and one more
+     * registration with the push app.
      */
     const val POOL_TARGET = 3
     private const val VERIFY_TIMEOUT_MS = 120_000L
     private const val ROTATIONS_PER_PASS = 3
     private const val BUSY_RETRIES = 4
 
-    /** Longer than the server keeps a staged endpoint waiting for its verification (10 minutes by default, plus jitter). */
+    /** Longer than the server keeps a staged endpoint waiting for its verification (10 to 20 minutes by default). */
     private const val ROTATION_VERIFY_WINDOW_MS = 30 * 60_000L
+
+    /** The server says an endpoint is gone: that instance is registered again at most this often. */
+    private const val ENDPOINT_GONE_EVERY_MS = 6 * 3600_000L
 
     /** Before the first measurement: a guess at Argon2 calls per second (a mid-range phone at 16 MiB, 4 threads). */
     private const val DEFAULT_CALLS_PER_SECOND = 25.0
@@ -66,10 +73,9 @@ object Mailboxes {
     /** The server's max message TTL (14 days) plus a day of margin. */
     private const val DRAIN_MS = 15 * 86_400_000L
 
-    /** A mailbox nobody refreshes is gone from the server after its lifetime (90 days by default); a day of margin. */
-    private const val DOOMED_KEEP_MS = 91 * 86_400_000L
-
     private val waiters = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+
+    /** Serialises verifications with the bookkeeping of rotations that are still outstanding. */
     private val rotateMutex = Mutex()
 
     private val fillLock = Any()
@@ -112,14 +118,24 @@ object Mailboxes {
         _progress.value = null
     }
 
-    fun endpoint(s: Session): PushEndpointData? =
-        s.repo.kvString("push_endpoint")?.let { ProtoJson.decodeFromString(PushEndpointData.serializer(), it) }
+    /** Stops the pool fill and waits until it has (the server is about to change). */
+    suspend fun stopFill() {
+        val job = synchronized(fillLock) {
+            fill.also { fill = null }
+        }
+        job?.cancelAndJoin()
+    }
 
     fun item(m: Mailbox) = MailboxItem(B64.enc(m.sendSecret), B64.enc(m.ownerSecret))
 
+    /** The endpoint [m]'s instance has now, or null if it has none yet. */
+    fun endpointOf(s: Session, m: Mailbox): PushEndpointData? =
+        m.pushInstance?.let { s.repo.pushInstance(it) }?.endpoint?.let(PushHub::decode)
+
     /**
-     * Creates and verifies one mailbox on our server, for the pool. Returns null if push isn't ready yet, or the
-     * verification push didn't arrive in time.
+     * Creates and verifies one mailbox on our server, for the pool, on an instance of its own. Returns null if push isn't
+     * ready (no push app, or it refused or didn't answer a new registration), or the verification push didn't arrive in
+     * time.
      *
      * The proof of work has no time limit ([Pow.Lane.OWN_MAILBOX]): it fetches fresh challenges as they near expiry, and
      * only stops if cancelled. The local row is only written once it's solved, so cleanup of abandoned creations can't
@@ -129,7 +145,8 @@ object Mailboxes {
         if (s.decoy) {
             return null
         }
-        val ep = endpoint(s) ?: return null
+        // Registered before the proof of work, so a push app that refuses another registration costs no work.
+        val (instance, ep) = PushHub.fresh(s) ?: return null
         val send = MailboxCrypto.newSecret()
         val owner = MailboxCrypto.newSecret()
         val tag = MailboxCrypto.tag(send)
@@ -155,7 +172,9 @@ object Mailboxes {
                     auth = ep.auth,
                 )
                 if (id == null) {
-                    id = s.repo.insertMailbox(purpose, send, owner, tag)
+                    // From here on the instance is this mailbox's alone: if the creation fails it's unregistered, never
+                    // given to another mailbox, since the server may have seen its endpoint.
+                    id = s.repo.insertMailbox(purpose, send, owner, tag, instance)
                 }
                 try {
                     submit(api, request)
@@ -186,9 +205,15 @@ object Mailboxes {
             keep = true
             return null
         } finally {
-            // Failed or cancelled before the server took it: the local row goes (unless the push already activated it).
+            // Failed or cancelled before the server took it: the local row goes (unless the push already activated it),
+            // and its instance with it.
             if (!keep) {
-                id?.let { if (s.repo.mailbox(it)?.state != Mailbox.STATE_ACTIVE) s.repo.deleteMailboxRow(it) }
+                id?.let {
+                    if (s.repo.mailbox(it)?.state != Mailbox.STATE_ACTIVE) {
+                        s.repo.deleteMailboxRow(it)
+                        PushHub.sweep(s)
+                    }
+                }
             }
             waiters.remove(key)
             _busy.value = false
@@ -256,39 +281,34 @@ object Mailboxes {
         }
     }
 
-    /** Handles a verification push (type 0x02): a new mailbox or a rotation batch. */
+    /**
+     * Handles a verification push (type 0x02): for a new mailbox, or for one that was pointed at a new endpoint. The
+     * verify request carries just that mailbox, like every owner request.
+     */
     suspend fun onVerification(s: Session, tag: ByteArray, code: ByteArray) {
-        val api = Graph.api()
         val rotation = s.repo.rotation(tag)
         if (rotation != null) {
-            val boxes = rotation.mapNotNull { s.repo.mailbox(it) }
-            if (boxes.isNotEmpty()) {
-                val r = api.verify(boxes.map(::item), code)
+            val api = Graph.ownerApi()
+            for (b in rotation.mapNotNull { s.repo.mailbox(it) }) {
+                val r = api.verify(item(b), code)
+                s.repo.setMailboxState(b.id, Mailbox.STATE_ACTIVE, r.expiresAt, OwnerSchedule.refreshAt(r.expiresAt, System.currentTimeMillis(), Rand::double))
                 if (r.endpointGone) {
-                    onEndpointGone(s)
-                }
-                for (b in boxes) {
-                    s.repo.setMailboxState(b.id, Mailbox.STATE_ACTIVE, r.expiresAt)
+                    onEndpointGone(s, b)
                 }
             }
             s.repo.deleteRotation(tag)
-            // Under the rotation lock: while rotateAll is still sending later batches, none pending doesn't mean done.
-            rotateMutex.withLock {
-                if (s.repo.rotationsPendingSince() == null && s.repo.kvString("rotation_needed") == "1") {
-                    rotationDone(s)
-                }
-            }
+            checkRotationsDone(s)
             return
         }
         val mb = s.repo.mailboxByTag(tag) ?: return
         if (mb.state == Mailbox.STATE_ACTIVE) {
             return
         }
-        val r = api.verify(listOf(item(mb)), code)
+        val r = Graph.api().verify(item(mb), code)
+        s.repo.setMailboxState(mb.id, Mailbox.STATE_ACTIVE, r.expiresAt, OwnerSchedule.refreshAt(r.expiresAt, System.currentTimeMillis(), Rand::double))
         if (r.endpointGone) {
-            onEndpointGone(s)
+            onEndpointGone(s, mb)
         }
-        s.repo.setMailboxState(mb.id, Mailbox.STATE_ACTIVE, r.expiresAt)
         waiters[B64.enc(tag)]?.complete(Unit)
     }
 
@@ -382,105 +402,108 @@ object Mailboxes {
         return s.repo.mailbox(mb.id)
     }
 
-    suspend fun onNewEndpoint(s: Session, data: PushEndpointData) {
+
+    /**
+     * [instance] has a new endpoint, or its first. It's stored, and a mailbox on it that the server knows is pointed at
+     * the new one a few minutes later ([OwnerOps]), on its own: a push app that changes every endpoint at once (another
+     * push app was chosen, or its server moved) doesn't make us send them to the server together.
+     */
+    suspend fun onNewEndpoint(s: Session, instance: String, data: PushEndpointData) {
         if (s.decoy) {
             return
         }
-        val old = endpoint(s)
-        s.repo.kvPutString("push_endpoint", ProtoJson.encodeToString(PushEndpointData.serializer(), data))
+        val inst = s.repo.pushInstance(instance)
+        if (inst == null) {
+            // Not one of ours (any more): its mailbox is gone. Nothing should reach us through it.
+            PushHub.dropStray(instance)
+            return
+        }
+        val old = inst.endpoint?.let(PushHub::decode)
+        s.repo.setInstanceEndpoint(instance, PushHub.encode(data))
         Graph.prefs.pushStatus = "ok"
         val host = runCatching { java.net.URI(data.url).host }.getOrNull()
         Graph.prefs.pushHost = host
+        PushHub.endpointStored(instance, data)
         if (old != null && old != data) {
-            s.repo.kvPutString("rotation_needed", "1")
+            val now = System.currentTimeMillis()
+            val boxes = s.repo.mailboxesOnInstance(instance).filter { it.state == Mailbox.STATE_ACTIVE }
+            for (m in boxes) {
+                s.repo.setRotateAt(m.id, now + OwnerSchedule.rotateDelay(Rand::double))
+            }
             val oldHost = runCatching { java.net.URI(old.url).host }.getOrNull()
-            if (oldHost != null && oldHost != host && Graph.prefs.pushHostUnconfirmed == null) {
+            if (boxes.isNotEmpty() && oldHost != null && oldHost != host && Graph.prefs.pushHostUnconfirmed == null) {
                 // Until the server confirms the new endpoint, it still wakes us through the old push service.
                 Graph.prefs.pushHostUnconfirmed = oldHost
             }
-            rotateAll(s)
+            OwnerOps.kick(s)
         }
-        ensurePool(s)
-    }
-
-    /** Points every mailbox at the current endpoint. Each batch of 100 is confirmed by one verification push. */
-    suspend fun rotateAll(s: Session) = rotateMutex.withLock {
-        if (s.decoy) {
-            return@withLock
-        }
-        val ep = endpoint(s) ?: return@withLock
-        // Unverified mailboxes would be purged by the server anyway.
-        for (m in s.repo.allMailboxes().filter { it.state != Mailbox.STATE_ACTIVE }) {
-            s.repo.deleteMailboxRow(m.id)
-        }
-        // Only verified mailboxes can rotate (the server returns 404 for pending ones).
-        val boxes = s.repo.activeMailboxes()
-        s.repo.clearRotations()
-        val api = Graph.api()
-        for (batch in boxes.chunked(100)) {
-            try {
-                s.repo.addRotation(batch.first().tag, batch.map { it.id })
-                api.rotate(RotateRequest(batch.map(::item), ep.url, ep.p256dh, ep.auth))
-            } catch (e: ApiException) {
-                if (e.status != 404) {
-                    // 429 (rotation budget) or network: rotation_needed stays set, and maintenance retries later.
-                    throw e
-                }
-                // Some mailbox in the batch is unknown to the server (expired or purged). Rotate one by one and replace the gone ones.
-                s.repo.deleteRotation(batch.first().tag)
-                for (m in batch) {
-                    try {
-                        s.repo.addRotation(m.tag, listOf(m.id))
-                        api.rotate(RotateRequest(listOf(item(m)), ep.url, ep.p256dh, ep.auth))
-                    } catch (e2: ApiException) {
-                        s.repo.deleteRotation(m.tag)
-                        if (e2.status != 404) {
-                            throw e2
-                        }
-                        replaceGone(s, m)
-                    }
-                }
-            }
-        }
-        // The server only stages the new endpoint until its verification push is answered. rotation_needed stays set until
-        // every batch is verified ([onVerification]), so a push that's lost or comes too late is retried by [cleanup].
-        if (s.repo.rotationsPendingSince() == null) {
-            rotationDone(s)
+        if (!inst.used) {
+            // A spare's endpoint (at setup, the first one): the pool can be filled now.
+            kickPool(s)
         }
     }
 
-    /** Every mailbox is confirmed on the current endpoint. */
-    private fun rotationDone(s: Session) {
-        s.repo.kvPutString("rotation_needed", null)
+    /** Every mailbox is confirmed on its instance's current endpoint. */
+    private fun rotationDone() {
         Graph.prefs.pushHostUnconfirmed = null
     }
 
+    /** Once no mailbox is still moving to a new endpoint, the old push service no longer wakes us. */
+    internal suspend fun checkRotationsDone(s: Session) = rotateMutex.withLock {
+        if (!s.repo.rotationsOutstanding()) {
+            rotationDone()
+        }
+    }
+
     /**
-     * The server no longer knows this mailbox. Pool mailboxes are just dropped. For a contact's mailbox, create a fresh one
-     * and tell the contact through the E2E `mailbox` message, so they keep reaching us.
+     * The server no longer knows [m] (it answered 404). A pool mailbox, or one already replaced and draining, is just
+     * dropped. A group inbox is replaced in a new card. For a contact's mailbox, a fresh one is bound and announced
+     * through the E2E `mailbox` message, and the gone one dropped, in one transaction: if no fresh one can be had right
+     * now, the contact keeps the old row and this is tried again later, so a contact is never left without a mailbox.
      */
-    private suspend fun replaceGone(s: Session, m: Mailbox) {
-        s.repo.deleteMailboxRow(m.id)
+    internal suspend fun replaceGone(s: Session, m: Mailbox) {
+        val cid = m.contactId
         // One already replaced (draining after a rotation) needs nothing new: the contact or group has a newer one.
-        if (m.replacedAt != null) {
+        if (cid == null || m.replacedAt != null) {
+            s.repo.deleteMailboxRow(m.id)
+            PushHub.sweep(s)
             return
         }
-        val cid = m.contactId ?: return
+        val later = System.currentTimeMillis() + OwnerSchedule.retryDelay(Rand::double)
+        // Nothing more goes to the server about it until it's replaced (or the next try).
+        s.repo.setRotateAt(m.id, null)
+        s.repo.setRefreshAt(m.id, later)
         if (m.purpose == Mailbox.PURPOSE_GROUP) {
-            // A group inbox: a new one goes out to the members in a new card.
+            // The rotation retires it once the new inbox is in the card, and it's deleted after draining.
             s.repo.setRotateNeeded(cid, true)
-            Graph.scope.launchSafe { Groups.rotatePending(s) }
+            s.scope.launchSafe { Groups.rotatePending(s) }
             return
         }
-        val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
-        s.repo.bindMailbox(fresh.id, cid)
-        Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
+        val serverKey = try {
+            Graph.ownServerKey()
+        } catch (e: ApiException) {
+            return
+        }
+        val fresh = try {
+            take(s, Mailbox.PURPOSE_CONTACT)
+        } catch (e: ApiException) {
+            null
+        } ?: return
+        val announce = app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), serverKey)
+        s.db.tx {
+            s.repo.bindMailbox(fresh.id, cid)
+            s.repo.enqueue(cid, null, OutboxKind.CONTENT, announce.encode())
+            s.repo.deleteMailboxRow(m.id)
+        }
+        Outbox.kick()
+        PushHub.sweep(s)
     }
 
     /**
      * Mailbox rotation (Prefs.mailboxRotationDays). Each contact periodically gets a fresh inbound mailbox, announced through
-     * the E2E `mailbox` message, so the server can't watch one mailbox's traffic for long. The old mailbox keeps working
-     * until the contact is seen using the new one (see [onMessageOnMailbox]), then for one more max-TTL so in-flight messages
+     * the E2E `mailbox` message, so the server can't watch one mailbox's traffic for long. The fresh one has an instance
+     * (so an endpoint) of its own, so the server can't link it to the old one either. The old mailbox keeps working until
+     * the contact is seen using the new one (see [onMessageOnMailbox]), then for one more max-TTL so in-flight messages
      * still arrive. Only then is it deleted. A few contacts rotate per pass, which spreads the proof-of-work cost.
      */
     suspend fun rotateContacts(s: Session) {
@@ -488,11 +511,14 @@ object Mailboxes {
             return
         }
         val now = System.currentTimeMillis()
-        for (m in s.repo.drainedMailboxes(now)) {
-            runCatching { deleteRemote(listOf(item(m))) }.onSuccess { s.repo.deleteMailboxRow(m.id) }
+        val drained = s.repo.drainedMailboxes(now)
+        if (drained.isNotEmpty()) {
+            // Deleted on the server one at a time, spread out like every owner request.
+            s.repo.doomMailboxes(drained, Graph.prefs.serverUrl, Graph.prefs.serverKey)
+            OwnerOps.kick(s)
         }
         val days = Graph.prefs.mailboxRotationDays
-        if (days <= 0 || endpoint(s) == null) {
+        if (days <= 0) {
             return
         }
         val due = s.repo.contactsDueForRotation(now - days * 86_400_000L)
@@ -554,155 +580,60 @@ object Mailboxes {
     }
 
     /**
-     * The server says it can't reach our push endpoint any more (protocol.md `endpointGone`). Ask the distributor for a
-     * fresh registration, then point every mailbox at the current endpoint again. If the endpoint didn't change, the
-     * rotation's verification push makes the server probe it again. At most once every 6 hours, so a server that keeps
+     * The server says it can't reach [m]'s endpoint any more (protocol.md `endpointGone`). Its instance is registered with
+     * the distributor again, and its mailbox pointed at the endpoint again: if the endpoint didn't change, the rotation's
+     * verification push makes the server probe it again. At most once every 6 hours per instance, so a server that keeps
      * saying so can't make us loop.
      */
-    private fun onEndpointGone(s: Session) {
+    internal fun onEndpointGone(s: Session, m: Mailbox) {
+        val name = m.pushInstance ?: return
+        val inst = s.repo.pushInstance(name) ?: return
         val now = System.currentTimeMillis()
-        val last = s.repo.kvString("endpoint_gone_at")?.toLongOrNull() ?: 0L
-        if (now - last < 6 * 3600_000L) {
+        if (now - (inst.goneAt ?: 0L) < ENDPOINT_GONE_EVERY_MS) {
             return
         }
-        s.repo.kvPutString("endpoint_gone_at", now.toString())
-        s.repo.kvPutString("rotation_needed", "1")
-        Graph.scope.launchSafe {
-            runCatching { app.goldfishsend.push.PushHub.register(Graph.app) }
-            runCatching { rotateAll(s) }
+        s.repo.setInstanceGoneAt(name, now)
+        for (b in s.repo.mailboxesOnInstance(name).filter { it.state == Mailbox.STATE_ACTIVE }) {
+            s.repo.setRotateAt(b.id, now + OwnerSchedule.rotateDelay(Rand::double))
+        }
+        s.scope.launchSafe {
+            runCatching { PushHub.reregister(name) }
+            OwnerOps.kick(s)
         }
     }
 
     /**
-     * Extends any mailbox expiring within 60 days. The server refuses a whole batch (404) if it doesn't know one mailbox in
-     * it, so that batch is refreshed one by one and the gone ones are replaced: otherwise one lost mailbox would keep every
-     * other one in its batch (and all later batches) from being refreshed until they all expire.
+     * Removes mailboxes from unused, expired invites and abandoned creations, and sends again rotations that were never
+     * verified.
      */
-    suspend fun refreshAll(s: Session) {
-        if (s.decoy) {
-            return
-        }
-        val soon = LocalDate.now().plusDays(60).toString()
-        val due = s.repo.activeMailboxes().filter { it.expiresAt == null || it.expiresAt < soon }
-        val api = Graph.api()
-        for (batch in due.chunked(100)) {
-            val r = try {
-                api.refresh(batch.map(::item))
-            } catch (e: ApiException) {
-                if (e.status != 404) {
-                    throw e
-                }
-                for (m in batch) {
-                    val one = try {
-                        api.refresh(listOf(item(m)))
-                    } catch (e2: ApiException) {
-                        if (e2.status != 404) {
-                            throw e2
-                        }
-                        replaceGone(s, m)
-                        continue
-                    }
-                    if (one.endpointGone) {
-                        onEndpointGone(s)
-                    }
-                    s.repo.setMailboxExpiry(m.id, one.expiresAt)
-                }
-                continue
-            }
-            if (r.endpointGone) {
-                onEndpointGone(s)
-            }
-            for (b in batch) {
-                s.repo.setMailboxExpiry(b.id, r.expiresAt)
-            }
-        }
-    }
-
-    /**
-     * Deletes [items] on the server. The server answers 404 for a whole batch if any one of them is unknown, so one that's
-     * already gone (expired, or deleted by a call whose answer was lost) can't hold up the rest: the batch is then sent
-     * item by item, and an unknown one counts as deleted.
-     */
-    suspend fun deleteRemote(items: List<MailboxItem>, api: ServerApi = Graph.api()) {
-        if (items.isEmpty()) {
-            return
-        }
-        for (batch in items.chunked(100)) {
-            try {
-                api.delete(batch)
-            } catch (e: ApiException) {
-                if (e.status != 404) {
-                    throw e
-                }
-                for (one in batch.takeIf { it.size > 1 }.orEmpty()) {
-                    try {
-                        api.delete(listOf(one))
-                    } catch (e1: ApiException) {
-                        if (e1.status != 404) {
-                            throw e1
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Deletes on the server the mailboxes of chats that are gone ([app.goldfishsend.db.Repo.doomMailboxes]). Each stays
-     * recorded until its server confirms, and this runs again with every maintenance pass. One on a server we no longer
-     * use is deleted there, but only if we know that server's fingerprint (otherwise the secrets would go to whoever
-     * answers). Past the server's mailbox lifetime they're gone there anyway, and are forgotten.
-     */
-    suspend fun deleteDoomed(s: Session) {
-        if (s.decoy) {
-            return
-        }
-        s.repo.forgetDoomedBefore(System.currentTimeMillis() - DOOMED_KEEP_MS)
-        for ((where, boxes) in s.repo.doomedMailboxes().groupBy { it.server to it.serverKey }) {
-            val (server, key) = where
-            val api = when {
-                server == Graph.prefs.serverUrl -> Graph.api()
-                key != null -> Graph.api(server, ServerPin(key))
-                else -> continue
-            }
-            runCatching { deleteRemote(boxes.map { MailboxItem(B64.enc(it.sendSecret), B64.enc(it.ownerSecret)) }, api) }.onSuccess {
-                for (b in boxes) {
-                    s.repo.forgetDoomed(b.sendSecret)
-                }
-            }
-        }
-    }
-
-    /** Removes mailboxes from unused, expired invites and abandoned creations. */
     suspend fun cleanup(s: Session) {
         if (s.decoy) {
             return
         }
         val now = System.currentTimeMillis()
         val abandoned = s.repo.abandonedInviteMailboxes(now - 3600_000L)
-        // The invite can never be used now, so its one-time prekeys go too (forward secrecy).
         s.lock.withLock {
             s.db.tx {
+                // The invite can never be used now, so its one-time prekeys go too (forward secrecy).
                 for (m in abandoned) {
                     m.inviteSpkId?.let { s.signal.removeSignedPreKey(it) }
                     m.inviteKyberId?.let { s.signal.removeKyberPreKey(it) }
                 }
-            }
-        }
-        runCatching { deleteRemote(abandoned.map(::item)) }.onSuccess {
-            for (m in abandoned) {
-                s.repo.deleteMailboxRow(m.id)
+                // Deleted on the server one at a time, spread out like every owner request.
+                s.repo.doomMailboxes(abandoned, Graph.prefs.serverUrl, Graph.prefs.serverKey)
             }
         }
         for (m in s.repo.staleCreating(now - 15 * 60_000L)) {
             s.repo.deleteMailboxRow(m.id)
         }
-        runCatching { deleteDoomed(s) }
-        // A rotation never verified (the push was lost, came after the server's deadline, or verify failed): start again,
-        // unless one is still within its verification window.
-        val pending = s.repo.rotationsPendingSince()
-        if (s.repo.kvString("rotation_needed") == "1" && (pending == null || pending < now - ROTATION_VERIFY_WINDOW_MS)) {
-            runCatching { rotateAll(s) }
+        // A rotation never verified (the push was lost, came after the server's deadline, or verify failed): sent again,
+        // once it's past its verification window.
+        for ((tag, ids) in s.repo.staleRotations(now - ROTATION_VERIFY_WINDOW_MS)) {
+            s.repo.deleteRotation(tag)
+            for (id in ids) {
+                s.repo.setRotateAt(id, now + OwnerSchedule.rotateDelay(Rand::double))
+            }
         }
+        OwnerOps.kick(s)
     }
 }

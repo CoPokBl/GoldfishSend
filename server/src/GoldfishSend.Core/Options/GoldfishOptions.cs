@@ -80,9 +80,18 @@ public sealed class MessageOptions {
 
 public sealed class MailboxOptions {
     public int LifetimeDays { get; set; } = 90;
+    /// <summary>
+    /// Each mailbox's expiry, at creation and on every refresh, is up to this many days short of
+    /// <see cref="LifetimeDays"/>, picked at random. Mailboxes created or refreshed on the same day then don't share an
+    /// expiry date, so a database dump can't group them by it.
+    /// </summary>
+    public int ExpiryJitterDays { get; set; } = 7;
+    /// <summary>
+    /// How long a new mailbox or rotation waits for its verification, at least. Each mailbox's deadline gets up to as
+    /// long again at random, so a dump taken during rotations doesn't show which were started together.
+    /// </summary>
     public int VerificationMinutes { get; set; } = 10;
     public int MaxVerifyAttempts { get; set; } = 5;
-    public int MaxBatch { get; set; } = 100;
 }
 
 /// <summary>

@@ -214,6 +214,22 @@ object Graph {
     /** Some other server (a contact's, or one being checked before switching), with an explicit [pin]. */
     fun api(server: String, pin: ServerPin): ServerApi = ServerApi(server, httpClient(), pin, live = liveness())
 
+    /**
+     * Like [api], for owner requests ([OwnerOps]): each on a connection of its own, closed afterwards, so the server
+     * can't tie requests about different mailboxes together by the connection they came on.
+     */
+    fun ownerApi(): ServerApi {
+        val url = prefs.serverUrl
+        return ServerApi(url, unpooled(), ownPin(url), live = liveness())
+    }
+
+    /** [ownerApi] for a server we no longer use (deleting what's left there), pinned to [pin]. */
+    fun ownerApi(server: String, pin: ServerPin): ServerApi = ServerApi(server, unpooled(), pin, live = liveness())
+
+    /** The shared client (same route, interceptors and dispatcher, so [stopBackground] reaches it), without keep-alive. */
+    private fun unpooled(): OkHttpClient =
+        httpClient().newBuilder().connectionPool(okhttp3.ConnectionPool(0, 1, java.util.concurrent.TimeUnit.SECONDS)).build()
+
     /** Our own server's fingerprint, fetching it (trust on first use) if it isn't known yet. */
     suspend fun ownServerKey(): String = prefs.serverKey ?: api().identity()
 

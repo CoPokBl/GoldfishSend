@@ -422,7 +422,7 @@ private fun FinishStep(name: String, passphrase: String, back: () -> Unit) {
                 }
             }
             status = "Connecting notifications…"
-            PushHub.register(ctx)
+            PushHub.register(ctx, Graph.realSession ?: error("no session"))
             // Wait briefly for the push app to hand us an endpoint. It's fine if it's slow, because setup continues in the background.
             for (i in 0 until 40) {
                 if (Graph.prefs.pushStatus == "ok" || Graph.prefs.pushStatus == "failed") {

@@ -151,11 +151,12 @@ object Wiper {
             GlobalScope.launch {
                 try {
                     withTimeoutOrNull(15_000) {
-                        runCatching {
-                            val api = Graph.api(server, app.goldfishsend.net.ServerPin(serverKey))
-                            for (batch in remote.chunked(100)) {
-                                api.delete(batch)
-                            }
+                        // One mailbox per request, each on its own connection, as every owner request goes. There's no
+                        // time left to spread them out, so the server sees them arrive together: it learns which
+                        // mailboxes were ours only as they stop existing.
+                        val api = Graph.ownerApi(server, app.goldfishsend.net.ServerPin(serverKey))
+                        for (item in remote) {
+                            runCatching { api.delete(item) }
                         }
                     }
                 } finally {

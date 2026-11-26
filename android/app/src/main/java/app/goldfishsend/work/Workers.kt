@@ -14,6 +14,7 @@ import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Mailboxes
 import app.goldfishsend.core.Messenger
 import app.goldfishsend.core.Outbox
+import app.goldfishsend.core.OwnerOps
 import app.goldfishsend.core.Sweeper
 import app.goldfishsend.core.launchSafe
 import app.goldfishsend.security.Wiper
@@ -34,8 +35,20 @@ class OutboxWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 }
 
 /**
- * Periodic housekeeping: the inactivity wipe (works while locked), plus expiry sweep, mailbox refresh,
- * pool top-up, cleanup and re-sending unreceipted messages when unlocked.
+ * Sends the next owner request (refresh, rotation or delete of one mailbox) when it's due, and schedules itself for the
+ * one after ([OwnerOps]). Locked with a passphrase, it does nothing: the unlock schedules it again.
+ */
+class OwnerOpsWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result {
+        val s = Graph.realSession ?: Graph.tryAutoUnlock() ?: return Result.success()
+        OwnerOps.runDue(s)
+        return Result.success()
+    }
+}
+
+/**
+ * Periodic housekeeping: the inactivity wipe (works while locked), plus expiry sweep, mailbox cleanup (which schedules
+ * the mailbox refreshes, see [OwnerOpsWorker]), pool top-up and re-sending unreceipted messages when unlocked.
  */
 class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
@@ -46,8 +59,8 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         runCatching { Sweeper.sweepLocked() }
         val s = Graph.realSession ?: Graph.tryAutoUnlock() ?: return Result.success()
         runCatching { Sweeper.sweep(s) }
+        // Also schedules the refreshes, rotations and deletes that are due ([OwnerOps]), one mailbox at a time.
         runCatching { Mailboxes.cleanup(s) }
-        runCatching { Mailboxes.refreshAll(s) }
         runCatching { Mailboxes.ensurePool(s) }
         runCatching { Mailboxes.rotateContacts(s) }
         runCatching { app.goldfishsend.core.Groups.maintain(s) }

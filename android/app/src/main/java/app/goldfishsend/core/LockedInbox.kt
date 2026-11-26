@@ -27,15 +27,43 @@ object LockedInbox {
     private const val INFO = "gf/inbox/v1"
     const val SLOTS = 512
 
-    /** The largest item: a Web Push payload is at most 4096 bytes, and an endpoint change much less. */
+    /**
+     * The largest item: a push is at most 3993 bytes of Web Push plaintext plus its instance name ([withInstance]), and an
+     * endpoint change much less.
+     */
     const val MAX_ITEM = 4096
     private const val MAX_RETRIES = 3
 
-    /** Endpoint changes share one slot (only the newest matters) under a tag no mailbox has. */
-    private val ENDPOINT_TAG = ByteArray(InboxSlots.TAG) { 0xFF.toByte() }
+    /** The longest instance name kept with a push (ours are 17 characters, see PushHub.newInstanceName). */
+    private const val MAX_INSTANCE = 64
 
     /** Anything that isn't a push envelope (so the drain drops it) shares one tag too. */
     private val OTHER_TAG = ByteArray(InboxSlots.TAG)
+
+    /**
+     * Each instance's endpoint changes share one slot (only the newest matters), under a tag derived from its name that no
+     * mailbox has (mailbox tags are hashes of secrets the name has nothing to do with).
+     */
+    internal fun endpointTag(instance: String): ByteArray =
+        app.goldfishsend.proto.Hash.sha256("gf/inbox/endpoint".toByteArray(), instance.toByteArray()).copyOf(InboxSlots.TAG)
+
+    /** A push and the instance it arrived on: the receive path only accepts a push for the mailbox on that instance. */
+    internal fun withInstance(instance: String, push: ByteArray): ByteArray? {
+        val name = instance.toByteArray()
+        if (name.isEmpty() || name.size > MAX_INSTANCE) {
+            return null
+        }
+        return byteArrayOf(name.size.toByte()) + name + push
+    }
+
+    /** The inverse of [withInstance], or null if [body] isn't one. */
+    internal fun splitInstance(body: ByteArray): Pair<String, ByteArray>? {
+        val n = body.firstOrNull()?.toInt()?.and(0xff) ?: return null
+        if (n == 0 || n > MAX_INSTANCE || body.size < 1 + n) {
+            return null
+        }
+        return String(body, 1, n, Charsets.UTF_8) to body.copyOfRange(1 + n, body.size)
+    }
 
     private val mutex = Mutex()
 
@@ -50,15 +78,23 @@ object LockedInbox {
         }
     }
 
-    /** Seals and stores one item. False if it can't be kept (the inbox is full of this sender's, or no key exists yet). */
-    fun put(kind: Byte, data: ByteArray): Boolean = try {
+    /** Keeps a push that arrived on [instance]. False if it can't be kept (the inbox is full of this sender's, or no key exists yet). */
+    fun putPush(instance: String, push: ByteArray): Boolean {
+        val data = withInstance(instance, push) ?: return false
+        return put(KIND_PUSH, data, PushEnvelope.parse(push)?.tag ?: OTHER_TAG, replace = false)
+    }
+
+    /** Keeps [instance]'s new endpoint (JSON InstanceEndpoint), replacing any older one of the same instance. */
+    fun putEndpoint(instance: String, data: ByteArray): Boolean = put(KIND_ENDPOINT, data, endpointTag(instance), replace = true)
+
+    /** Seals and stores one item. */
+    private fun put(kind: Byte, data: ByteArray, tag: ByteArray, replace: Boolean): Boolean = try {
         val pub = Graph.prefs.inboxPublicKey
         val packed = pack(kind, data, MAX_ITEM)
         if (pub == null || packed == null) {
             false
         } else {
-            val tag = if (kind == KIND_ENDPOINT) ENDPOINT_TAG else PushEnvelope.parse(data)?.tag ?: OTHER_TAG
-            store().put(tag, ECPublicKey(B64.dec(pub)).seal(packed, INFO, ByteArray(0)), replace = kind == KIND_ENDPOINT)
+            store().put(tag, ECPublicKey(B64.dec(pub)).seal(packed, INFO, ByteArray(0)), replace = replace)
         }
     } catch (e: Exception) {
         false
@@ -78,11 +114,13 @@ object LockedInbox {
         val priv = Graph.inboxPrivateKey(s)
         drainSlots(store, { s.closed }, { priv.open(it, INFO, ByteArray(0)) }) { kind, body ->
             when (kind) {
-                KIND_PUSH -> Messenger.handle(s, body)
-                KIND_ENDPOINT -> Mailboxes.onNewEndpoint(
-                    s,
-                    app.goldfishsend.proto.ProtoJson.decodeFromString(PushEndpointData.serializer(), body.toString(Charsets.UTF_8)),
-                )
+                KIND_PUSH -> splitInstance(body)?.let { (instance, push) -> Messenger.handle(s, push, instance) }
+                KIND_ENDPOINT -> {
+                    val e = app.goldfishsend.proto.ProtoJson.decodeFromString(
+                        app.goldfishsend.push.InstanceEndpoint.serializer(), body.toString(Charsets.UTF_8),
+                    )
+                    Mailboxes.onNewEndpoint(s, e.instance, e.endpoint)
+                }
             }
         }
     }

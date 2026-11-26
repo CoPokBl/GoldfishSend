@@ -678,7 +678,8 @@ object Groups {
             val boxes = s.repo.mailboxesForContact(cid)
             s.repo.doomMailboxes(boxes, Graph.prefs.serverUrl, Graph.prefs.serverKey)
             if (boxes.isNotEmpty()) {
-                Graph.scope.launchSafe { Mailboxes.deleteDoomed(s) }
+                // After this transaction: their push instances are unregistered, and the deletes scheduled.
+                s.scope.launchSafe { OwnerOps.kick(s) }
             }
         }
 

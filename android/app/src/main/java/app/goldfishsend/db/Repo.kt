@@ -1,5 +1,6 @@
 package app.goldfishsend.db
 
+import app.goldfishsend.core.OwnerSchedule
 import app.goldfishsend.proto.Sanitize
 import android.database.Cursor
 import app.goldfishsend.crypto.MessageVault
@@ -54,6 +55,12 @@ data class Mailbox(
     val inviteKyberId: Int? = null,
     /** A group inbox's hint key (docs/groups.md, "Blob"). Null for 1:1 mailboxes. */
     val hintKey: ByteArray? = null,
+    /** The UnifiedPush instance whose endpoint wakes this mailbox. Every mailbox has its own ([PushInstance]). */
+    val pushInstance: String? = null,
+    /** When to refresh it on the server next (picked at random, see [app.goldfishsend.core.OwnerOps]). */
+    val refreshAt: Long? = null,
+    /** When to point it at its instance's new endpoint, or null if the server has the current one. */
+    val rotateAt: Long? = null,
 ) {
     companion object {
         const val PURPOSE_QR = 0
@@ -80,8 +87,24 @@ object MsgKind {
     const val SYSTEM = 1
 }
 
-/** One of our mailboxes whose chat is gone, still to delete on [server] (pinned to [serverKey]). */
-class DoomedMailbox(val sendSecret: ByteArray, val ownerSecret: ByteArray, val server: String, val serverKey: String?, val createdAt: Long)
+/**
+ * One of our mailboxes whose chat is gone, still to delete on [server] (pinned to [serverKey]), not before [deleteAt]
+ * (picked at random, so the deletes of several mailboxes don't arrive together and link them).
+ */
+class DoomedMailbox(
+    val sendSecret: ByteArray,
+    val ownerSecret: ByteArray,
+    val server: String,
+    val serverKey: String?,
+    val createdAt: Long,
+    val deleteAt: Long = 0,
+)
+
+/**
+ * One of our UnifiedPush instances ([app.goldfishsend.push.PushHub]). [endpoint] (JSON PushEndpointData) is null until
+ * the distributor sends one. [used]: a mailbox was created on it, so it's never handed to another.
+ */
+class PushInstance(val name: String, val endpoint: String?, val used: Boolean, val goneAt: Long?)
 
 data class Message(
     val id: String,
@@ -771,11 +794,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
         inviteSpkId = if (c.isNull(13)) null else c.getInt(13),
         inviteKyberId = if (c.isNull(14)) null else c.getInt(14),
         hintKey = if (c.isNull(15)) null else c.getBlob(15),
+        pushInstance = if (c.isNull(16)) null else c.getString(16),
+        refreshAt = if (c.isNull(17)) null else c.getLong(17),
+        rotateAt = if (c.isNull(18)) null else c.getLong(18),
     )
 
     private val mbCols =
         "id, contact_id, purpose, send_secret, owner_secret, tag, state, expires_at, created_at, invite_used, invite_expires_at, " +
-            "replaced_at, drain_until, invite_spk_id, invite_kyber_id, hint_key"
+            "replaced_at, drain_until, invite_spk_id, invite_kyber_id, hint_key, push_instance, refresh_at, rotate_at"
 
     /** Binds a claimed mailbox to a group as its inbox, with its hint key. */
     fun bindGroupInbox(id: Long, groupCid: Long, hintKey: ByteArray) = db.exec(
@@ -832,20 +858,61 @@ class Repo(val db: Db, private val vault: MessageVault) {
         "SELECT COUNT(*) FROM mailboxes WHERE contact_id IS NULL AND invite_used = 0 AND state != ?", Mailbox.STATE_ACTIVE,
     )
 
-    fun insertMailbox(purpose: Int, sendSecret: ByteArray, ownerSecret: ByteArray, tag: ByteArray): Long = db.insert(
-        "INSERT INTO mailboxes (purpose, send_secret, owner_secret, tag, state, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        purpose, sendSecret, ownerSecret, tag, Mailbox.STATE_CREATING, System.currentTimeMillis(),
-    )
+    /** A new mailbox on [instance], which belongs to it alone from now on (marked used in the same transaction). */
+    fun insertMailbox(purpose: Int, sendSecret: ByteArray, ownerSecret: ByteArray, tag: ByteArray, instance: String): Long = db.tx {
+        db.exec("UPDATE push_instances SET used = 1 WHERE name = ?", instance)
+        db.insert(
+            "INSERT INTO mailboxes (purpose, send_secret, owner_secret, tag, state, created_at, push_instance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            purpose, sendSecret, ownerSecret, tag, Mailbox.STATE_CREATING, System.currentTimeMillis(), instance,
+        )
+    }
 
-    fun setMailboxState(id: Long, state: Int, expiresAt: String? = null) {
+    /** With [expiresAt], also sets when to refresh it next ([refreshAt]). */
+    fun setMailboxState(id: Long, state: Int, expiresAt: String? = null, refreshAt: Long? = null) {
         if (expiresAt != null) {
-            db.exec("UPDATE mailboxes SET state = ?, expires_at = ? WHERE id = ?", state, expiresAt, id)
+            db.exec("UPDATE mailboxes SET state = ?, expires_at = ?, refresh_at = ? WHERE id = ?", state, expiresAt, refreshAt, id)
         } else {
             db.exec("UPDATE mailboxes SET state = ? WHERE id = ?", state, id)
         }
     }
 
-    fun setMailboxExpiry(id: Long, expiresAt: String) = db.exec("UPDATE mailboxes SET expires_at = ? WHERE id = ?", expiresAt, id)
+    fun setMailboxExpiry(id: Long, expiresAt: String, refreshAt: Long) =
+        db.exec("UPDATE mailboxes SET expires_at = ?, refresh_at = ? WHERE id = ?", expiresAt, refreshAt, id)
+
+    /** Tries the refresh again later: it failed for a reason that may pass. */
+    fun setRefreshAt(id: Long, at: Long) = db.exec("UPDATE mailboxes SET refresh_at = ? WHERE id = ?", at, id)
+
+    /** Schedules (or with null, cancels) pointing the mailbox at its instance's current endpoint. */
+    fun setRotateAt(id: Long, at: Long?) = db.exec("UPDATE mailboxes SET rotate_at = ? WHERE id = ?", at, id)
+
+    /** The mailboxes on [instance] (normally one, briefly none or two while one is created or replaced). */
+    fun mailboxesOnInstance(instance: String): List<Mailbox> =
+        db.query("SELECT $mbCols FROM mailboxes WHERE push_instance = ?", instance, map = ::mailbox)
+
+    /** The active mailbox whose refresh is due first, if one is due by [now]. */
+    fun nextRefresh(now: Long): Mailbox? = db.queryOne(
+        "SELECT $mbCols FROM mailboxes WHERE state = ? AND COALESCE(refresh_at, 0) <= ? ORDER BY COALESCE(refresh_at, 0) LIMIT 1",
+        Mailbox.STATE_ACTIVE, now, map = ::mailbox,
+    )
+
+    /** The active mailbox whose rotation is due first, if one is due by [now]. */
+    fun nextRotation(now: Long): Mailbox? = db.queryOne(
+        "SELECT $mbCols FROM mailboxes WHERE state = ? AND rotate_at IS NOT NULL AND rotate_at <= ? ORDER BY rotate_at LIMIT 1",
+        Mailbox.STATE_ACTIVE, now, map = ::mailbox,
+    )
+
+    /** The earliest time a refresh, rotation or delete is due, or null if none is waiting. */
+    fun nextOwnerOpAt(): Long? = db.queryOne(
+        """SELECT MIN(t) FROM (
+             SELECT COALESCE(refresh_at, 0) AS t FROM mailboxes WHERE state = ?
+             UNION ALL SELECT rotate_at FROM mailboxes WHERE state = ? AND rotate_at IS NOT NULL
+             UNION ALL SELECT delete_at FROM doomed_mailboxes)""",
+        Mailbox.STATE_ACTIVE, Mailbox.STATE_ACTIVE,
+    ) { c -> if (c.isNull(0)) null else c.getLong(0) }
+
+    /** True while a mailbox still has to be pointed at a new endpoint, or that is still waiting to be verified. */
+    fun rotationsOutstanding(): Boolean =
+        db.long("SELECT COUNT(*) FROM mailboxes WHERE rotate_at IS NOT NULL") > 0 || rotationsPendingSince() != null
 
     fun bindMailbox(id: Long, contactId: Long) =
         db.exec("UPDATE mailboxes SET contact_id = ?, invite_used = 1, created_at = ? WHERE id = ?", contactId, System.currentTimeMillis(), id)
@@ -896,16 +963,28 @@ class Repo(val db: Db, private val vault: MessageVault) {
         val now = System.currentTimeMillis()
         for (b in boxes) {
             db.exec(
-                "INSERT OR REPLACE INTO doomed_mailboxes (send_secret, owner_secret, server, server_key, created_at) VALUES (?, ?, ?, ?, ?)",
-                b.sendSecret, b.ownerSecret, server, serverKey, now,
+                "INSERT OR REPLACE INTO doomed_mailboxes (send_secret, owner_secret, server, server_key, created_at, delete_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                b.sendSecret, b.ownerSecret, server, serverKey, now, now + OwnerSchedule.deleteDelay(Rand::double),
             )
             db.exec("DELETE FROM mailboxes WHERE id = ?", b.id)
         }
     }
 
-    fun doomedMailboxes(): List<DoomedMailbox> = db.query(
-        "SELECT send_secret, owner_secret, server, server_key, created_at FROM doomed_mailboxes ORDER BY created_at",
-    ) { DoomedMailbox(it.getBlob(0), it.getBlob(1), it.getString(2), if (it.isNull(3)) null else it.getString(3), it.getLong(4)) }
+    private fun doomed(c: Cursor) =
+        DoomedMailbox(c.getBlob(0), c.getBlob(1), c.getString(2), if (c.isNull(3)) null else c.getString(3), c.getLong(4), c.getLong(5))
+
+    private val doomedCols = "send_secret, owner_secret, server, server_key, created_at, delete_at"
+
+    fun doomedMailboxes(): List<DoomedMailbox> =
+        db.query("SELECT $doomedCols FROM doomed_mailboxes ORDER BY created_at", map = ::doomed)
+
+    /** The doomed mailbox whose delete is due first, if one is due by [now]. */
+    fun nextDoomed(now: Long): DoomedMailbox? =
+        db.queryOne("SELECT $doomedCols FROM doomed_mailboxes WHERE delete_at <= ? ORDER BY delete_at LIMIT 1", now, map = ::doomed)
+
+    fun setDeleteAt(sendSecret: ByteArray, at: Long) =
+        db.exec("UPDATE doomed_mailboxes SET delete_at = ? WHERE send_secret = ?", at, sendSecret)
 
     /** The server confirmed (or it can't hold the mailbox any more). */
     fun forgetDoomed(sendSecret: ByteArray) = db.exec("DELETE FROM doomed_mailboxes WHERE send_secret = ?", sendSecret)
@@ -940,6 +1019,51 @@ class Repo(val db: Db, private val vault: MessageVault) {
     /** When the newest rotation still waiting for its verification push was sent, or null if none is waiting. */
     fun rotationsPendingSince(): Long? =
         db.queryOne("SELECT MAX(created_at) FROM rotations") { c -> if (c.isNull(0)) null else c.getLong(0) }
+
+    /** Rotations sent before [before] and never verified, by tag: the mailboxes they were for. */
+    fun staleRotations(before: Long): List<Pair<ByteArray, List<Long>>> = db.query(
+        "SELECT tag, mailbox_ids FROM rotations WHERE created_at < ?", before,
+    ) { c -> c.getBlob(0) to c.getString(1).split(',').filter { it.isNotEmpty() }.map { it.toLong() } }
+
+    // --- push instances ---
+
+    private fun instance(c: Cursor) =
+        PushInstance(c.getString(0), if (c.isNull(1)) null else c.getString(1), c.getInt(2) != 0, if (c.isNull(3)) null else c.getLong(3))
+
+    private val instCols = "name, endpoint, used, gone_at"
+
+    fun pushInstance(name: String): PushInstance? =
+        db.queryOne("SELECT $instCols FROM push_instances WHERE name = ?", name, map = ::instance)
+
+    fun pushInstances(): List<PushInstance> = db.query("SELECT $instCols FROM push_instances ORDER BY created_at", map = ::instance)
+
+    /** A spare: registered (or being registered), but no mailbox was ever created on it. */
+    fun spareInstance(): PushInstance? =
+        db.queryOne("SELECT $instCols FROM push_instances WHERE used = 0 ORDER BY created_at LIMIT 1", map = ::instance)
+
+    fun addPushInstance(name: String) =
+        db.exec("INSERT INTO push_instances (name, created_at) VALUES (?, ?)", name, System.currentTimeMillis())
+
+    fun setInstanceEndpoint(name: String, endpoint: String?) =
+        db.exec("UPDATE push_instances SET endpoint = ? WHERE name = ?", endpoint, name)
+
+    fun setInstanceGoneAt(name: String, at: Long) = db.exec("UPDATE push_instances SET gone_at = ? WHERE name = ?", at, name)
+
+    /** Forgets the instances whose mailbox is gone, and returns their names to unregister. Spares stay. */
+    fun takeOrphanInstances(): List<String> = takeInstances("used = 1")
+
+    /** Forgets every instance no mailbox is on, spares included, and returns their names to unregister. */
+    fun takeInstancesWithoutMailbox(): List<String> = takeInstances("1 = 1")
+
+    private fun takeInstances(where: String): List<String> = db.tx {
+        val names = db.query(
+            "SELECT name FROM push_instances i WHERE $where AND NOT EXISTS (SELECT 1 FROM mailboxes m WHERE m.push_instance = i.name)",
+        ) { it.getString(0) }
+        for (n in names) {
+            db.exec("DELETE FROM push_instances WHERE name = ?", n)
+        }
+        names
+    }
 
     // --- outbox ---
 

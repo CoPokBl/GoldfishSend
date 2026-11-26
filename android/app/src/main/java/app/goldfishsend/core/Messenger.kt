@@ -46,24 +46,31 @@ object Messenger {
 
     // ---------- receive ----------
 
-    /** Entry point for every decrypted UnifiedPush payload. */
-    suspend fun onPushPayload(bytes: ByteArray) {
+    /** Entry point for every decrypted UnifiedPush payload, with the UnifiedPush [instance] it arrived on. */
+    suspend fun onPushPayload(bytes: ByteArray, instance: String) {
         val s = Graph.realSession ?: Graph.tryAutoUnlock()
         if (s == null) {
             // Kept for the next real unlock. No notification for one the inbox refused (it's gone), while a decoy profile
             // is on screen (it would give it away), or if the user chose silence while locked: the chat can't be told
             // apart yet, so that's the only way to keep hidden chats silent then too.
-            val kept = LockedInbox.put(LockedInbox.KIND_PUSH, bytes)
+            val kept = LockedInbox.putPush(instance, bytes)
             if (kept && PushEnvelope.parse(bytes) is PushEnvelope.Message && Graph.session.value?.decoy != true && !Graph.prefs.quietWhileLocked) {
                 Notifier.newMessage(Graph.app, null, null)
             }
             return
         }
-        handle(s, bytes)
+        handle(s, bytes, instance)
     }
 
-    suspend fun handle(s: Session, bytes: ByteArray) {
-        when (val env = PushEnvelope.parse(bytes) ?: return) {
+    suspend fun handle(s: Session, bytes: ByteArray, instance: String) {
+        val env = PushEnvelope.parse(bytes) ?: return
+        // Each mailbox is woken only through its own instance's endpoint. A push for another mailbox is dropped without a
+        // reply, so the server can't learn which endpoints belong to one person by sending one mailbox's push (a
+        // verification code, say) to another mailbox's endpoint and watching who answers.
+        if (s.repo.mailboxByTag(env.tag)?.pushInstance != instance) {
+            return
+        }
+        when (env) {
             is PushEnvelope.Verification -> Mailboxes.onVerification(s, env.tag, env.code)
             is PushEnvelope.Message -> receive(s, env.tag, env.blob)
         }
@@ -517,7 +524,7 @@ object Messenger {
 
     /**
      * Deletes a contact everywhere: local state at once, and our inbound mailboxes on the server. Those are recorded as
-     * doomed in the same transaction and retried until the server confirms ([Mailboxes.deleteDoomed]), so being offline
+     * doomed in the same transaction and retried until the server confirms ([OwnerOps]), so being offline
      * or rate-limited now doesn't leave a blocked contact able to write to us.
      */
     suspend fun deleteContact(s: Session, cid: Long) {
@@ -541,7 +548,8 @@ object Messenger {
         runCatching { Shredder.runPending(s) }
         s.db.notifyChanged()
         Notifier.cancel(Graph.app)
-        Mailboxes.deleteDoomed(s)
+        // Their push instances are unregistered now; the deletes go to the server one by one, a few minutes apart.
+        OwnerOps.kick(s)
     }
 }
 

@@ -591,7 +591,9 @@ fun PushPickerDialog(s: Session, onDismiss: () -> Unit) {
                                     s.prefs.decoyPushDistributor = d.packageName
                                 } else {
                                     PushHub.select(ctx, d.packageName)
-                                    Graph.scope.launchSafe { PushHub.register(ctx) }
+                                    // Every instance again with the new push app. Each mailbox then moves to its new
+                                    // endpoint on its own, a few minutes apart (Mailboxes.onNewEndpoint).
+                                    Graph.scope.launchSafe { PushHub.register(ctx, s) }
                                 }
                                 onDismiss()
                             }) {
@@ -605,6 +607,13 @@ fun PushPickerDialog(s: Session, onDismiss: () -> Unit) {
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
+
+/**
+ * Why the server can't be changed while there are chats: every contact and group reaches us through a mailbox on this
+ * server, and mailboxes can't live on two servers at once, so switching would cut them off without telling them.
+ */
+private const val SERVER_IN_USE =
+    "Your contacts and groups reach you through this server, and they can't be moved to another one. To switch servers, delete your chats first."
 
 @Composable
 private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
@@ -621,10 +630,7 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
         text = {
             Column {
                 if (hasContacts == true) {
-                    Text(
-                        "Your existing contacts reach you through this server. To switch, remove your contacts first.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    Text(SERVER_IN_USE, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     Text("Advanced: only change this if you run your own GoldfishSend server.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(12.dp))
@@ -674,20 +680,37 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                         }
                         return@run
                     }
-                    withContext(Dispatchers.IO) {
+                    val switched = withContext(Dispatchers.IO) {
+                        // Nothing more is made on the old server: a mailbox finishing now would be taken for one on the new.
+                        app.goldfishsend.core.Mailboxes.stopFill()
                         // Drop our mailboxes on the old server; new ones are created on the new server. They're deleted
-                        // there too (retried until it confirms), and an outstanding invite's prekeys go with them.
-                        s.lock.withLock {
+                        // there too (retried until it confirms), and an outstanding invite's prekeys go with them. Checked
+                        // again here, under the lock a new contact is made under: a chat's mailbox is never dropped, since
+                        // its contact or group would lose the way to reach us without being told.
+                        val ok = s.lock.withLock {
                             s.db.tx {
+                                if (s.repo.contacts().isNotEmpty()) {
+                                    return@tx false
+                                }
                                 val boxes = s.repo.allMailboxes()
                                 for (m in boxes.filter { it.contactId == null }) {
                                     m.inviteSpkId?.let { s.signal.removeSignedPreKey(it) }
                                     m.inviteKyberId?.let { s.signal.removeKyberPreKey(it) }
                                 }
                                 s.repo.doomMailboxes(boxes, Graph.prefs.serverUrl, Graph.prefs.serverKey)
+                                true
                             }
                         }
-                        app.goldfishsend.core.Invites.forgetCachedQr()
+                        if (ok) {
+                            app.goldfishsend.core.Invites.forgetCachedQr()
+                            // Registered with the old server's push key: new mailboxes get instances made for the new one.
+                            PushHub.dropUnused(s)
+                        }
+                        ok
+                    }
+                    if (!switched) {
+                        error = SERVER_IN_USE
+                        return@run
                     }
                     Graph.prefs.serverUrl = target
                     val tofu = learned
@@ -698,8 +721,8 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                         Graph.prefs.serverKey = fp
                     }
                     Graph.prefs.serverKeyChanged = null
-                    Graph.scope.launchSafe { PushHub.register(ctx) }
-                    Graph.scope.launchSafe { app.goldfishsend.core.Mailboxes.deleteDoomed(s) }
+                    Graph.scope.launchSafe { PushHub.register(ctx, s) }
+                    Graph.scope.launchSafe { app.goldfishsend.core.OwnerOps.kick(s) }
                     onDismiss()
                 }
             }) { Text("Save") }

@@ -67,20 +67,24 @@ data class CreateMailboxRequest(
     val auth: String,
 )
 
+/**
+ * One mailbox's credentials. Every owner request (verify, rotate, refresh, delete) carries exactly one: a request with
+ * several would show the server that they belong to the same person.
+ */
 @Serializable
 data class MailboxItem(val sendSecret: String, val ownerSecret: String)
 
 @Serializable
-data class VerifyRequest(val items: List<MailboxItem>, val code: String)
+data class VerifyRequest(val sendSecret: String, val ownerSecret: String, val code: String)
 
 @Serializable
-data class RotateRequest(val items: List<MailboxItem>, val endpoint: String, val p256dh: String, val auth: String)
+data class RotateRequest(val sendSecret: String, val ownerSecret: String, val endpoint: String, val p256dh: String, val auth: String)
 
 @Serializable
-data class ItemsRequest(val items: List<MailboxItem>)
+data class OwnerRequest(val sendSecret: String, val ownerSecret: String)
 
 /**
- * [endpointGone]: the server can no longer deliver to the push endpoint it has for these mailboxes. The client should
+ * [endpointGone]: the server can no longer deliver to the push endpoint it has for this mailbox. The client should
  * re-register with its distributor (or re-run endpoint verification so the server probes again). Absent means false.
  */
 @Serializable
@@ -312,18 +316,26 @@ class ServerApi(
         postJson<Unit>("v1/mailboxes", Json.encodeToString(CreateMailboxRequest.serializer(), req), null)
     }
 
-    suspend fun verify(items: List<MailboxItem>, code: ByteArray): ExpiresResponse =
-        postJson("v1/mailboxes/verify", Json.encodeToString(VerifyRequest.serializer(), VerifyRequest(items, B64.enc(code))), ExpiresResponse.serializer())
+    suspend fun verify(item: MailboxItem, code: ByteArray): ExpiresResponse = postJson(
+        "v1/mailboxes/verify",
+        Json.encodeToString(VerifyRequest.serializer(), VerifyRequest(item.sendSecret, item.ownerSecret, B64.enc(code))),
+        ExpiresResponse.serializer(),
+    )
 
-    suspend fun rotate(req: RotateRequest) {
+    /** Points the mailbox at a new endpoint ([url], [p256dh], [auth]); confirmed by a verification push sent there. */
+    suspend fun rotate(item: MailboxItem, url: String, p256dh: String, auth: String) {
+        val req = RotateRequest(item.sendSecret, item.ownerSecret, url, p256dh, auth)
         send<Unit>("v1/mailboxes/endpoint", "PUT", Json.encodeToString(RotateRequest.serializer(), req), null)
     }
 
-    suspend fun refresh(items: List<MailboxItem>): ExpiresResponse =
-        postJson("v1/mailboxes/refresh", Json.encodeToString(ItemsRequest.serializer(), ItemsRequest(items)), ExpiresResponse.serializer())
+    suspend fun refresh(item: MailboxItem): ExpiresResponse = postJson(
+        "v1/mailboxes/refresh",
+        Json.encodeToString(OwnerRequest.serializer(), OwnerRequest(item.sendSecret, item.ownerSecret)),
+        ExpiresResponse.serializer(),
+    )
 
-    suspend fun delete(items: List<MailboxItem>) {
-        postJson<Unit>("v1/mailboxes/delete", Json.encodeToString(ItemsRequest.serializer(), ItemsRequest(items)), null)
+    suspend fun delete(item: MailboxItem) {
+        postJson<Unit>("v1/mailboxes/delete", Json.encodeToString(OwnerRequest.serializer(), OwnerRequest(item.sendSecret, item.ownerSecret)), null)
     }
 
     /**

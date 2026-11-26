@@ -24,6 +24,9 @@ object Rand {
     fun int(bound: Int): Int = rng.nextInt(bound)
 
     fun long(): Long = rng.nextLong()
+
+    /** Uniform in [0, 1). */
+    fun double(): Double = rng.nextDouble()
 }
 
 object Hash {

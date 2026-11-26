@@ -62,14 +62,31 @@ public sealed class MailboxService {
         _secret = secret;
     }
 
-    private DateOnly NewExpiry() => DateOnly.FromDateTime(DateTime.UtcNow).AddDays(_options.Mailboxes.LifetimeDays);
+    private DateOnly NewExpiry() => Expiry(DateOnly.FromDateTime(DateTime.UtcNow), _options.Mailboxes, RandomNumberGenerator.GetInt32);
 
-    /// <summary>The verification deadline, with up to a minute of jitter so batch members don't share a timestamp.</summary>
-    private DateTime VerifyDeadline() {
-        return DateTime.UtcNow.AddMinutes(_options.Mailboxes.VerificationMinutes).AddSeconds(RandomNumberGenerator.GetInt32(0, 60));
+    private DateTime VerifyDeadline() => Deadline(DateTime.UtcNow, _options.Mailboxes, RandomNumberGenerator.GetInt32);
+
+    /// <summary>
+    /// A mailbox's expiry: <see cref="MailboxOptions.LifetimeDays"/> from <paramref name="today"/>, less a random 0 to
+    /// <see cref="MailboxOptions.ExpiryJitterDays"/> days (never below one day). <paramref name="roll"/> is
+    /// <c>RandomNumberGenerator.GetInt32(from, to)</c>, exclusive upper bound.
+    /// </summary>
+    internal static DateOnly Expiry(DateOnly today, MailboxOptions options, Func<int, int, int> roll) {
+        var lifetime = Math.Max(1, options.LifetimeDays);
+        var jitter = Math.Clamp(options.ExpiryJitterDays, 0, lifetime - 1);
+        return today.AddDays(lifetime - roll(0, jitter + 1));
     }
 
-    /// <summary>Per-mailbox code hash: <c>SHA256(code ‖ mailboxId)</c>. One code shared by a batch still gives every row a different value.</summary>
+    /// <summary>
+    /// The verification deadline: <see cref="MailboxOptions.VerificationMinutes"/> from <paramref name="now"/>, plus a
+    /// random 0 to as long again, to the second.
+    /// </summary>
+    internal static DateTime Deadline(DateTime now, MailboxOptions options, Func<int, int, int> roll) {
+        var seconds = Math.Max(1, options.VerificationMinutes) * 60;
+        return now.AddSeconds(seconds + roll(0, seconds));
+    }
+
+    /// <summary>Per-mailbox code hash: <c>SHA256(code ‖ mailboxId)</c>, so equal codes never show as equal rows.</summary>
     internal static byte[] VerifyHash(ReadOnlySpan<byte> code, ReadOnlySpan<byte> mailboxId) {
         Span<byte> buffer = stackalloc byte[code.Length + mailboxId.Length];
         code.CopyTo(buffer);
