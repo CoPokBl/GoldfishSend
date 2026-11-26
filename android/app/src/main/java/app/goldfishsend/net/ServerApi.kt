@@ -214,6 +214,11 @@ class ApiException(
             "server_key_changed" -> "This server's identity changed. Check Settings › Connection before continuing."
             "server_identity_changed" -> "Couldn't verify this server's identity, so nothing was sent. It may have been replaced, or someone may be intercepting the connection."
             "clock_skew" -> "Your phone's clock looks wrong. Check the date and time settings."
+            "invalid_server" -> "That doesn't look like a server address."
+            // Our own network policy, while locked with "Pin server keys" on: the pins can't be read until unlock.
+            "locked" -> "Unlock GoldfishSend to continue."
+            // A request from before an erase. Nothing was sent, and there's nothing left to retry.
+            "stopped" -> "Stopped because GoldfishSend was erased."
             else -> "Something went wrong. We'll try again."
         }
     }

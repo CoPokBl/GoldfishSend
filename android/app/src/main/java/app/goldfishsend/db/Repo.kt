@@ -130,7 +130,14 @@ data class OutboxItem(
     val nextAt: Long,
     /** Group fan-out: the member this row goes to (identity key, b64u). Null for 1:1 rows. */
     val memberKey: String? = null,
-)
+    /**
+     * A re-send's deadline ([resendDeadline]). Past it the row is dropped unsent: the recipient may have removed the
+     * message, and only remembers that ([GONE_KEEP_MS]) for so long.
+     */
+    val notAfter: Long? = null,
+) {
+    fun expired(now: Long): Boolean = notAfter != null && now > notAfter
+}
 
 /** Typed data access over [Db]. Message bodies are always stored through [MessageVault]. */
 /** Incomplete chunked messages kept per contact (64 parts × 4 messages). */
@@ -142,8 +149,14 @@ const val KV_SHRED_PENDING = "shred_pending"
 /** Messages held behind a changed safety number, per contact. */
 const val MAX_HELD_PER_CONTACT = 200L
 
-/** How long after sending an unreceipted message may be re-sent automatically. */
+/**
+ * How long after sending a message a copy of it may still leave: re-sends of an unreceipted one, and manual retries.
+ * Enforced when the copy is sent, not just when it's queued ([OutboxItem.notAfter]).
+ */
 const val RESEND_WINDOW_MS = 7 * 86_400_000L
+
+/** The latest time a copy of a message first sent at [ts] may leave again. */
+fun resendDeadline(ts: Long): Long = ts + RESEND_WINDOW_MS
 
 /**
  * How long the wire id of a removed incoming message is remembered. A re-send leaves within [RESEND_WINDOW_MS] of the
@@ -943,14 +956,15 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     // --- outbox ---
 
-    fun enqueue(contactId: Long, messageId: String?, kind: Int, content: ByteArray?, memberKey: String? = null): Long {
+    fun enqueue(contactId: Long, messageId: String?, kind: Int, content: ByteArray?, memberKey: String? = null, notAfter: Long? = null): Long {
         val now = System.currentTimeMillis()
         // Sealed and stored in one transaction, like insertMessage, so a root rotation can't come in between.
         return db.tx {
             val sealed = content?.let { vault.sealBlob("outbox", it) }
             db.insert(
-                "INSERT INTO outbox (contact_id, message_id, kind, content, idem, next_at, created_at, member_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                contactId, messageId, kind, sealed, Rand.bytes(16), now, now, memberKey,
+                "INSERT INTO outbox (contact_id, message_id, kind, content, idem, next_at, created_at, member_key, not_after) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                contactId, messageId, kind, sealed, Rand.bytes(16), now, now, memberKey, notAfter,
             )
         }
     }
@@ -968,9 +982,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
         attempts = c.getInt(7),
         nextAt = c.getLong(8),
         memberKey = if (c.isNull(9)) null else c.getString(9),
+        notAfter = if (c.isNull(10)) null else c.getLong(10),
     )
 
-    private val outboxCols = "seq, contact_id, message_id, kind, content, blob, idem, attempts, next_at, member_key"
+    private val outboxCols = "seq, contact_id, message_id, kind, content, blob, idem, attempts, next_at, member_key, not_after"
 
     fun outboxAll(): List<OutboxItem> = db.query("SELECT $outboxCols FROM outbox ORDER BY contact_id, seq", map = ::outbox)
 

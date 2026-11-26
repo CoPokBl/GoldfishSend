@@ -52,6 +52,7 @@ object PushHub {
     fun onEndpoint(data: PushEndpointData) {
         Graph.prefs.pushStatus = "ok"
         Graph.prefs.pushHost = runCatching { java.net.URI(data.url).host }.getOrNull()
+        // App-wide: there may be no session yet. It finds one, or keeps the endpoint in the locked inbox.
         Graph.scope.launchSafe {
             val s = Graph.realSession ?: Graph.tryAutoUnlock()
             if (s == null) {

@@ -389,7 +389,7 @@ fun ChatScreen(s: Session, contactId: Long, back: () -> Unit, openInfo: () -> Un
                                                     // death, locking or dismissing can never show it twice.
                                                     Messenger.consumeViewOnce(s, m.id)?.let { viewing = it }
                                                 }
-                                            } else if (m.status == MsgStatus.FAILED) {
+                                            } else if (m.status == MsgStatus.FAILED && Outbox.canRetry(m.ts)) {
                                                 scope.launch(Dispatchers.IO) { Outbox.retry(s, m.id) }
                                             }
                                         },
@@ -808,7 +808,8 @@ private fun Bubble(
             if (out && waiting) {
                 Text("Waiting to send", style = MaterialTheme.typography.labelSmall, color = meta, modifier = Modifier.align(Alignment.End))
             } else if (out && m.status == MsgStatus.FAILED) {
-                Text("Not sent. Tap to retry", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.errorContainer)
+                // Too old to send again (Outbox.canRetry): it can still be copied into a new message.
+                Text(if (Outbox.canRetry(m.ts)) "Not sent. Tap to retry" else "Not sent", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.errorContainer)
             }
         }
     }
@@ -874,7 +875,7 @@ private fun MessageActions(
                     modifier = Modifier.clickable(onClick = act(onCopy)), colors = colors,
                 )
             }
-            if (m.status == MsgStatus.FAILED && m.outgoing) {
+            if (m.status == MsgStatus.FAILED && m.outgoing && Outbox.canRetry(m.ts)) {
                 ListItem(
                     headlineContent = { Text("Retry") }, leadingContent = { Icon(Icons.Rounded.Refresh, null) },
                     modifier = Modifier.clickable(onClick = act(onRetry)), colors = colors,

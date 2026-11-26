@@ -5,6 +5,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -307,13 +308,22 @@ object ChatListPreload {
     /** The session whose chat list already loaded, so a late [start] doesn't leave decrypted previews in memory. */
     private var loaded = java.lang.ref.WeakReference<Session>(null)
 
+    /** Runs in the session's scope: locking cancels it, and drops a result nobody took, previews and all. */
     @Synchronized
     fun start(s: Session) {
         if (loaded.get() === s) {
             return
         }
         val changes = s.db.changes.value
-        pending = Pending(s, changes, Graph.scope.async { runCatching { loadChats(s) }.getOrNull() })
+        pending = Pending(s, changes, s.scope.async { runCatching { loadChats(s) }.getOrNull() })
+        s.scope.coroutineContext.job.invokeOnCompletion { drop(s) }
+    }
+
+    @Synchronized
+    private fun drop(s: Session) {
+        if (pending?.session === s) {
+            pending = null
+        }
     }
 
     @Synchronized
@@ -321,7 +331,7 @@ object ChatListPreload {
         loaded = java.lang.ref.WeakReference(s)
         val p = pending ?: return null
         pending = null
-        return p.result.takeIf { p.session === s && p.changes == s.db.changes.value }
+        return p.result.takeIf { p.session === s && p.changes == s.db.changes.value && !it.isCancelled }
     }
 }
 

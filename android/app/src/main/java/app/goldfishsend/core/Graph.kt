@@ -68,6 +68,9 @@ class Session(
     /** Serialises libsignal and DB mutations: libsignal stores aren't safe for concurrent ratchet updates. */
     val lock = Mutex()
 
+    /** When the last delivery receipt went out per message, so re-sent copies don't each get one. */
+    internal val receipts = DuplicateReceipts()
+
     /** Hidden chats are only listed after the hidden-chats PIN was entered in this session. Resets on lock. */
     val hiddenRevealed = kotlinx.coroutines.flow.MutableStateFlow(false)
 
@@ -91,6 +94,7 @@ class Session(
         db.close()
         mk.wipe()
         messages.wipe()
+        receipts.clear()
     }
 }
 

@@ -86,6 +86,8 @@ class ForensicDeviceTest {
 
     @Before
     fun clean() {
+        // A wipe ends the process; the test runner's must survive it.
+        Wiper.endProcess = {}
         Graph.lock()
         runCatching { WorkManager.getInstance(ctx).cancelAllWork().result.get() }
         Graph.vault.destroyAll()

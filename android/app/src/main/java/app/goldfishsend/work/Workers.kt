@@ -70,6 +70,7 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
 class ExpiryReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val pending = goAsync()
+        // App-wide: it finds the session itself, and sweeps through the Keystore alone when there's none.
         Graph.scope.launchSafe {
             try {
                 val s = Graph.realSession ?: Graph.tryAutoUnlock()
@@ -110,7 +111,7 @@ class PanicTileService : TileService() {
         if (!Graph.prefs.onboarded) {
             return
         }
-        Wiper.wipeEverything(applicationContext, killProcess = true)
+        Wiper.wipeEverything(applicationContext)
         qsTile?.apply {
             state = Tile.STATE_UNAVAILABLE
             updateTile()

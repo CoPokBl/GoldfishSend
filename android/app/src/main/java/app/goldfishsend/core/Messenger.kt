@@ -8,6 +8,7 @@ import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.db.RESEND_WINDOW_MS
+import app.goldfishsend.db.resendDeadline
 import app.goldfishsend.net.Gateway
 import app.goldfishsend.net.ServerApi
 import app.goldfishsend.proto.B64
@@ -209,7 +210,7 @@ object Messenger {
                     s.repo.touchContact(cid, false)
                     notify(s, cid, "Connected")
                 }
-                Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
+                s.scope.launchSafe { Mailboxes.ensurePool(s) }
                 Outbox.kick()
             }
             is Content.Text -> onText(s, cid, c)
@@ -271,7 +272,10 @@ object Messenger {
             expiresAt = expiresAt,
             status = MsgStatus.DELIVERED,
         )
-        sendControl(s, cid, Content.Receipt(listOf(t.id), Content.Receipt.DELIVERED))
+        // A copy of one we have (or removed) still gets a receipt, so its sender stops re-sending, but not every copy.
+        if (s.receipts.shouldSend(cid, t.id.take(64))) {
+            sendControl(s, cid, Content.Receipt(listOf(t.id), Content.Receipt.DELIVERED))
+        }
         if (inserted == null) {
             return
         }
@@ -395,12 +399,16 @@ object Messenger {
         Outbox.kick()
     }
 
-    private fun enqueueText(s: Session, receivedAny: Boolean, cid: Long, localId: String, wire: String, body: String, ts: Long, exp: Long, once: Boolean) {
+    /** Queues a text message's parts. A copy of one sent before passes [notAfter] ([resendDeadline]). */
+    private fun enqueueText(
+        s: Session, receivedAny: Boolean, cid: Long, localId: String, wire: String, body: String, ts: Long, exp: Long, once: Boolean,
+        notAfter: Long? = null,
+    ) {
         val max = if (receivedAny) Padding.MAX_PLAINTEXT else Padding.MAX_PREKEY_PLAINTEXT
         val parts = Chunker.split(wire, body, ts, exp.takeIf { it > 0 }, once.takeIf { it }, max)
         s.db.tx {
             for (p in parts) {
-                s.repo.enqueue(cid, localId, OutboxKind.CONTENT, p.encode())
+                s.repo.enqueue(cid, localId, OutboxKind.CONTENT, p.encode(), notAfter = notAfter)
             }
         }
     }
@@ -408,7 +416,8 @@ object Messenger {
     /**
      * Re-sends messages that never got a delivery receipt (the push server may have dropped them), for up to
      * [RESEND_WINDOW_MS] after sending: the recipient remembers what it removed for longer than that, so a re-send never
-     * brings back a message they viewed once, deleted or let expire.
+     * brings back a message they viewed once, deleted or let expire. The window holds when the copy actually leaves too:
+     * one still queued at the deadline is dropped ([OutboxItem.notAfter]).
      */
     fun resendUnreceipted(s: Session) {
         val now = System.currentTimeMillis()
@@ -419,12 +428,15 @@ object Messenger {
                 continue
             }
             s.repo.incrementResend(m.id)
-            enqueueText(s, c.receivedAny, m.contactId, m.id, m.wireId, m.body, m.ts, m.expSecs, m.viewOnce)
+            enqueueText(s, c.receivedAny, m.contactId, m.id, m.wireId, m.body, m.ts, m.expSecs, m.viewOnce, resendDeadline(m.ts))
         }
         Outbox.kick()
     }
 
-    /** Re-queues an existing outgoing message's content (manual retry). */
+    /**
+     * Re-queues an existing outgoing message's content (manual retry). An earlier copy may have arrived, so this is a
+     * re-send like any other and has the same deadline ([Outbox.canRetry]).
+     */
     fun sendControlRaw(s: Session, m: app.goldfishsend.db.Message) {
         val c = s.repo.contact(m.contactId) ?: return
         if (c.isGroup) {
@@ -432,7 +444,7 @@ object Messenger {
             s.db.notifyChanged()
             return
         }
-        enqueueText(s, c.receivedAny, m.contactId, m.id, m.wireId, m.body, m.ts, m.expSecs, m.viewOnce)
+        enqueueText(s, c.receivedAny, m.contactId, m.id, m.wireId, m.body, m.ts, m.expSecs, m.viewOnce, resendDeadline(m.ts))
         s.db.notifyChanged()
     }
 

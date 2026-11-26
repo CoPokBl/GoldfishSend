@@ -63,6 +63,11 @@ object GroupOutbox {
             if (member in heads || member in waiting) {
                 continue
             }
+            if (r.expired(now)) {
+                // A re-send past its deadline: it may not leave any more (Outbox.canRetry).
+                failRow(s, r)
+                continue
+            }
             if (r.nextAt > now) {
                 waiting += member
                 continue

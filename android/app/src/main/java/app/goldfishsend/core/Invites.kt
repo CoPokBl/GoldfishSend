@@ -134,7 +134,7 @@ object Invites {
         }
         val expiresAt = System.currentTimeMillis() + ttl * 1000
         s.repo.markInviteUsed(mb.id, expiresAt)
-        Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
+        s.scope.launchSafe { Mailboxes.ensurePool(s) }
         val created = Created(InviteLink(Graph.prefs.serverUrl, serverKey, id, key), mb.id, expiresAt)
         if (purpose == Mailbox.PURPOSE_QR) {
             cachedQr = Cached(s, created)

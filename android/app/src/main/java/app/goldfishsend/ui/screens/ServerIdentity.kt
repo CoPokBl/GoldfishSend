@@ -78,7 +78,7 @@ fun ServerIdentityChangedDialog(s: Session) {
             TextButton(
                 onClick = {
                     reauth.require("Trusting a new server identity.") {
-                        Graph.scope.launchSafe { Mailboxes.trustNewServerKey(s, presented) }
+                        s.scope.launchSafe { Mailboxes.trustNewServerKey(s, presented) }
                     }
                 },
                 modifier = Modifier.blockWhenObscured(),

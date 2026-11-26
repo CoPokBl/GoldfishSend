@@ -16,6 +16,7 @@ import app.goldfishsend.db.groupsWithMember
 import app.goldfishsend.db.messageIdByWire
 import app.goldfishsend.db.pruneGoneCards
 import app.goldfishsend.db.pruneGroupHeld
+import app.goldfishsend.db.resendDeadline
 import app.goldfishsend.db.setRotateNeeded
 import app.goldfishsend.group.GroupEngine
 import app.goldfishsend.group.GroupEvent
@@ -334,7 +335,10 @@ object Groups {
         Outbox.kick()
     }
 
-    /** Retries a failed group message: queued again to every member (a member who has it already drops the copy). */
+    /**
+     * Retries a failed group message: queued again to every member (a member who has it already drops the copy), with
+     * the re-send deadline of any copy ([Outbox.canRetry]).
+     */
     fun resend(s: Session, msg: app.goldfishsend.db.Message) {
         val m = model(s, msg.contactId) ?: return
         if (m.state != GroupModel.JOINED) {
@@ -348,7 +352,7 @@ object Groups {
         s.db.tx {
             for (to in m.cards.keys) {
                 for (p in parts) {
-                    s.repo.enqueue(msg.contactId, msg.id, OutboxKind.CONTENT, p.encode(), memberKey = to)
+                    s.repo.enqueue(msg.contactId, msg.id, OutboxKind.CONTENT, p.encode(), memberKey = to, notAfter = resendDeadline(msg.ts))
                 }
             }
         }
@@ -452,7 +456,7 @@ object Groups {
             s.repo.releasePoolMailbox(mb.id)
             throw GroupException("Couldn't reach your server. Check your connection and try again.")
         }
-        Graph.scope.launchSafe { Mailboxes.ensurePool(s) }
+        s.scope.launchSafe { Mailboxes.ensurePool(s) }
         return mb to serverKey
     }
 
@@ -678,7 +682,7 @@ object Groups {
             val boxes = s.repo.mailboxesForContact(cid)
             s.repo.doomMailboxes(boxes, Graph.prefs.serverUrl, Graph.prefs.serverKey)
             if (boxes.isNotEmpty()) {
-                Graph.scope.launchSafe { Mailboxes.deleteDoomed(s) }
+                s.scope.launchSafe { Mailboxes.deleteDoomed(s) }
             }
         }
 
@@ -705,7 +709,7 @@ object Groups {
             s.repo.touchContact(cid, incrementUnread = !visible)
             if (visible) {
                 // Read receipts go out from markChatRead once the transaction is done.
-                Graph.scope.launchSafe { Messenger.markChatRead(s, cid) }
+                s.scope.launchSafe { Messenger.markChatRead(s, cid) }
             } else {
                 val who = memberName(s, m, from).label
                 Messenger.notify(s, cid, if (t.once == true) "$who: View-once message" else "$who: ${t.body}")
@@ -736,7 +740,7 @@ object Groups {
         override fun rotateInbox(m: GroupModel) {
             val cid = cid(m.gid) ?: return
             s.repo.setRotateNeeded(cid, true)
-            Graph.scope.launchSafe { rotatePending(s) }
+            s.scope.launchSafe { rotatePending(s) }
         }
 
         override fun validServer(url: String): Boolean = ServerApi.isValidContactServer(url)

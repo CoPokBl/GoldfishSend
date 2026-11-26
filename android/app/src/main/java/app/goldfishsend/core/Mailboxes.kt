@@ -469,7 +469,7 @@ object Mailboxes {
         if (m.purpose == Mailbox.PURPOSE_GROUP) {
             // A group inbox: a new one goes out to the members in a new card.
             s.repo.setRotateNeeded(cid, true)
-            Graph.scope.launchSafe { Groups.rotatePending(s) }
+            s.scope.launchSafe { Groups.rotatePending(s) }
             return
         }
         val fresh = take(s, Mailbox.PURPOSE_CONTACT) ?: return
@@ -508,7 +508,7 @@ object Mailboxes {
             Messenger.sendControl(s, cid, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(fresh.sendSecret), Graph.ownServerKey()))
         }
         if (due.isNotEmpty()) {
-            Graph.scope.launchSafe { ensurePool(s) }
+            s.scope.launchSafe { ensurePool(s) }
         }
     }
 
@@ -525,7 +525,7 @@ object Mailboxes {
             Messenger.sendControl(s, c.id, app.goldfishsend.proto.Content.Mailbox(Graph.prefs.serverUrl, B64.enc(mb.sendSecret), serverKey))
         }
         // Groups learn it from a new card.
-        Graph.scope.launchSafe { Groups.announceServerKey(s) }
+        s.scope.launchSafe { Groups.announceServerKey(s) }
     }
 
     /**
@@ -539,7 +539,7 @@ object Mailboxes {
         Graph.prefs.serverKey = presented
         Graph.prefs.serverKeyChanged = null
         announceServerKey(s, presented)
-        Graph.scope.launchSafe {
+        s.scope.launchSafe {
             runCatching { cleanup(s) }
             runCatching { ensurePool(s) }
         }
@@ -568,8 +568,10 @@ object Mailboxes {
         s.repo.kvPutString("endpoint_gone_at", now.toString())
         s.repo.kvPutString("rotation_needed", "1")
         Graph.scope.launchSafe {
+            // Registering is the device's, not the session's, so it goes on if the app locks meanwhile.
             runCatching { app.goldfishsend.push.PushHub.register(Graph.app) }
-            runCatching { rotateAll(s) }
+            // The rotation is the session's. Once it's locked, cleanup does it after the next unlock (rotation_needed).
+            s.scope.launchSafe { rotateAll(s) }
         }
     }
 

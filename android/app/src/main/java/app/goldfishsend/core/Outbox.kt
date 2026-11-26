@@ -9,6 +9,7 @@ import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.OutboxItem
 import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.db.isGroup
+import app.goldfishsend.db.resendDeadline
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.PowChallenge
 import app.goldfishsend.net.ServerApi
@@ -47,9 +48,12 @@ object Outbox {
     /** At most this many contacts are sent to at once. */
     private val parallel = Semaphore(4)
 
-    /** Starts sending now (in process) and schedules WorkManager as a durable fallback. */
+    /**
+     * Starts sending now (in process, in the session's scope, so it stops when the app locks) and schedules WorkManager as
+     * a durable fallback.
+     */
     fun kick() {
-        Graph.realSession?.let { s -> Graph.scope.launchSafe { runAndSchedule(s) } }
+        Graph.realSession?.let { s -> s.scope.launchSafe { runAndSchedule(s) } }
         val req = OneTimeWorkRequestBuilder<OutboxWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .build()
@@ -118,6 +122,10 @@ object Outbox {
     private suspend fun sendOne(s: Session, item: OutboxItem): Boolean {
         val contact = s.repo.contact(item.contactId) ?: run {
             s.repo.outboxDelete(item.seq)
+            return true
+        }
+        if (item.expired(System.currentTimeMillis())) {
+            expire(s, item)
             return true
         }
         val server = contact.outServer
@@ -316,9 +324,34 @@ object Outbox {
         runAndSchedule(s)
     }
 
-    /** Retries a failed message (user tapped "retry"). */
+    /**
+     * A re-send that was still queued at its deadline ([OutboxItem.notAfter]) is dropped unsent. A manual retry that
+     * never left shows as failed again. An automatic re-send leaves the message as it was: its first copy did go out.
+     */
+    internal fun expire(s: Session, item: OutboxItem) {
+        s.repo.outboxDelete(item.seq)
+        item.messageId?.let { id ->
+            if (s.repo.outboxRemaining(id) == 0L && s.repo.message(id)?.status == MsgStatus.QUEUED) {
+                s.repo.setStatus(id, MsgStatus.FAILED)
+            }
+        }
+        s.db.notifyChanged()
+    }
+
+    /**
+     * Whether a failed message sent at [ts] may still be retried. An earlier copy may have arrived and been removed
+     * (viewed once, deleted, expired), and the recipient only remembers that for a while
+     * ([app.goldfishsend.db.GONE_KEEP_MS]), so a retry is a re-send like any other and has the same window
+     * ([app.goldfishsend.db.RESEND_WINDOW_MS]). Past it the user can copy the text into a new message.
+     */
+    fun canRetry(ts: Long, now: Long = System.currentTimeMillis()): Boolean = now <= resendDeadline(ts)
+
+    /** Retries a failed message (user tapped "retry"), unless it's too old to send again ([canRetry]). */
     fun retry(s: Session, messageId: String) {
         val m = s.repo.message(messageId) ?: return
+        if (m.status != MsgStatus.FAILED || !canRetry(m.ts)) {
+            return
+        }
         s.repo.setStatus(messageId, MsgStatus.QUEUED)
         s.repo.setUnreachable(m.contactId, false)
         Messenger.sendControlRaw(s, m)

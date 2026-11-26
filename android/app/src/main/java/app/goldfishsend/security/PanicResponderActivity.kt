@@ -94,7 +94,7 @@ class PanicResponderActivity : FragmentActivity() {
         }
         when (response) {
             PanicResponse.WIPE_MESSAGES -> Wiper.wipeMessages()
-            PanicResponse.WIPE_EVERYTHING -> Wiper.wipeEverything(applicationContext, killProcess = true)
+            PanicResponse.WIPE_EVERYTHING -> Wiper.wipeEverything(applicationContext)
             else -> Unit
         }
     }

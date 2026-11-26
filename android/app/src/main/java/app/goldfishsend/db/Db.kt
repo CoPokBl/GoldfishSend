@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 8
+    const val VERSION = 9
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -229,9 +229,20 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 9) {
+                for (s in V9) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Re-sends carry a deadline. */
+    internal val V9 = listOf(
+        // The latest time this row may still leave (a re-send of an older message, [resendDeadline]). Null: no deadline.
+        "ALTER TABLE outbox ADD COLUMN not_after INTEGER",
+    )
 
     /** Held messages sealed like message bodies, tombstones for removed messages, and mailboxes still to delete. */
     internal val V8 = listOf(

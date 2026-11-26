@@ -9,6 +9,7 @@ import app.goldfishsend.crypto.UnlockMethod
 import app.goldfishsend.db.Db
 import app.goldfishsend.security.AppLock
 import app.goldfishsend.security.UnlockResult
+import app.goldfishsend.security.Wiper
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
@@ -28,6 +29,8 @@ class SecurityFeaturesDeviceTest {
 
     @Before
     fun clean() {
+        // A wipe ends the process; the test runner's must survive it.
+        Wiper.endProcess = {}
         Graph.lock()
         Graph.vault.destroyAll()
         Db.deleteFiles(ctx)

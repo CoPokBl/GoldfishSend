@@ -105,11 +105,20 @@ object Wiper {
     }
 
     /**
+     * How every [wipeEverything] ends, whichever path started it (panic tile or button, panic app, wrong PINs, duress PIN,
+     * inactivity, "Start over"): the process is killed, so nothing of it (decrypted strings, caches) survives in memory.
+     * The next start finds nothing set up. Tests that can't lose their process replace it.
+     */
+    @Volatile
+    internal var endProcess: () -> Unit = { android.os.Process.killProcess(android.os.Process.myPid()) }
+
+    /**
      * Panic wipe: destroy every key, delete the DB, the locked inbox and settings, and unregister push.
-     * Inbound mailboxes are then deleted on the server on a best-effort basis, from a snapshot taken before the keys went.
+     * Inbound mailboxes are then deleted on the server on a best-effort basis, from a snapshot taken before the keys went,
+     * and then the process ends ([endProcess]).
      */
     @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun wipeEverything(ctx: Context, killProcess: Boolean = false) {
+    fun wipeEverything(ctx: Context) {
         val s = Graph.realSession
         val remote = s?.let { runCatching { it.repo.allMailboxes().map(Mailboxes::item) }.getOrNull() }.orEmpty()
         val server = Graph.prefs.serverUrl
@@ -142,12 +151,11 @@ object Wiper {
             NetPrefs.clear()
             TorManager.deleteState(ctx)
             Graph.resetHttp()
-            if (killProcess) {
-                // Panic wipe: nothing of this process (decrypted strings, caches) survives in memory.
-                android.os.Process.killProcess(android.os.Process.myPid())
-            }
+            endProcess()
         }
         if (remote.isNotEmpty() && serverKey != null) {
+            // Not Graph.scope (stopBackground just cancelled it) or a session's scope (the session is gone): these deletes
+            // must outlive both, and the process ends when they finish or time out.
             GlobalScope.launch {
                 try {
                     withTimeoutOrNull(15_000) {

@@ -34,6 +34,8 @@ class AuditFixesDeviceTest {
 
     @Before
     fun clean() {
+        // A wipe ends the process; the test runner's must survive it.
+        Wiper.endProcess = {}
         Graph.lock()
         Graph.vault.destroyAll()
         BucketKeys.destroyAll()

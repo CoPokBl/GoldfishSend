@@ -546,7 +546,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
             "Panic wipe?",
             "All keys, contacts and messages are destroyed immediately. Your contacts won't be able to reach you. This can't be undone.",
             "Wipe everything", true, { confirmPanic = false },
-        ) { Wiper.wipeEverything(ctx, killProcess = true) }
+        ) { Wiper.wipeEverything(ctx) }
     }
 }
 
@@ -699,7 +699,8 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                     }
                     Graph.prefs.serverKeyChanged = null
                     Graph.scope.launchSafe { PushHub.register(ctx) }
-                    Graph.scope.launchSafe { app.goldfishsend.core.Mailboxes.deleteDoomed(s) }
+                    // Doomed rows stay until the server confirms, so if the app locks first, cleanup retries them.
+                    s.scope.launchSafe { app.goldfishsend.core.Mailboxes.deleteDoomed(s) }
                     onDismiss()
                 }
             }) { Text("Save") }

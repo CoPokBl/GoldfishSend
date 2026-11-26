@@ -28,6 +28,7 @@ class GfPushService : PushService() {
             return
         }
         val content = message.content
+        // App-wide: there may be no session yet. It finds one, or keeps the push in the locked inbox.
         Graph.scope.launchSafe { Messenger.onPushPayload(content) }
     }
 
