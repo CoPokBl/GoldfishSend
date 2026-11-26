@@ -186,6 +186,12 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     Icons.Rounded.ContentPaste,
                     onClick = { picker = Picker.CLIPBOARD },
                 )
+                SwitchRow(
+                    "Clear clipboard on lock",
+                    "A copied message also goes when GoldfishSend locks. With an immediate lock you can't paste it into another app.",
+                    Icons.Rounded.ContentPaste,
+                    p.clipboardClearOnLock,
+                ) { p.clipboardClearOnLock = it }
             }
             item {
                 SectionHeader("Disappearing messages")

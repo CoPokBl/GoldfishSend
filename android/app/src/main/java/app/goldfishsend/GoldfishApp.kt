@@ -16,6 +16,7 @@ import app.goldfishsend.core.Notifier
 import app.goldfishsend.core.ReceiveGuard
 import app.goldfishsend.core.launchSafe
 import app.goldfishsend.security.AppLock
+import app.goldfishsend.security.ClipboardGuard
 import app.goldfishsend.security.Wiper
 import app.goldfishsend.work.MaintenanceWorker
 
@@ -32,14 +33,18 @@ class GoldfishApp : Application() {
         // Order matters: the restart and inactivity wipes must run before anything can open the DB.
         Wiper.checkBoot(this, fromBootBroadcast = false)
         Wiper.checkInactivity(this)
+        // A new process starts locked: a message copied before the last one died goes now, if the user wants that.
+        ClipboardGuard.onLock(this)
         // Starts built-in Tor if the user turned it on (off by default).
         app.goldfishsend.net.NetStack.apply(this)
 
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 AppVisibility.foreground = true
-                AppLock.onForeground()
+                // The absence is judged before coming back to the app can count as presence: with no app lock the session
+                // is still open, and otherwise opening the app on a seized phone would reset the clock.
                 Wiper.checkInactivity(this@GoldfishApp)
+                AppLock.onForeground()
             }
 
             override fun onStop(owner: LifecycleOwner) {

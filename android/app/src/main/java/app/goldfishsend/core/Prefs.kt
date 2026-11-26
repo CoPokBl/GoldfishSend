@@ -208,6 +208,19 @@ class Prefs(context: Context) {
         get() = int("clip_clear", 30)
         set(v) = setInt("clip_clear", v)
 
+    /**
+     * Also clear a copied message as soon as the app locks. Off by default: with an immediate lock, switching to another
+     * app to paste would lose it.
+     */
+    var clipboardClearOnLock: Boolean
+        get() = bool("clip_clear_lock", false)
+        set(v) = setBool("clip_clear_lock", v)
+
+    /** The random mark of a copied message that hasn't been cleared yet (security/ClipboardGuard). */
+    var clipboardMark: String?
+        get() = str("clip_mark")
+        set(v) = setStrIfChanged("clip_mark", v)
+
     var socksProxy: Boolean
         get() = bool("socks", false)
         set(v) = setBool("socks", v)

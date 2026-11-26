@@ -443,6 +443,14 @@ object Messenger {
         return m.body
     }
 
+    /** Clears a chat: every message goes, and the message root key is replaced so stale copies can't be opened either. */
+    fun clearChat(s: Session, cid: Long) {
+        s.repo.clearConversation(cid)
+        runCatching { Shredder.runPending(s) }
+        s.db.notifyChanged()
+        Notifier.cancel(Graph.app)
+    }
+
     fun deleteForMe(s: Session, messageId: String) {
         s.repo.deleteMessage(messageId)
         s.db.notifyChanged()
@@ -480,6 +488,7 @@ object Messenger {
             s.lock.withLock { Groups.forgetSessions(s, members) }
         }
         s.repo.markNeedsVacuum()
+        runCatching { Shredder.runPending(s) }
         s.db.notifyChanged()
         Notifier.cancel(Graph.app)
         if (boxes.isNotEmpty()) {

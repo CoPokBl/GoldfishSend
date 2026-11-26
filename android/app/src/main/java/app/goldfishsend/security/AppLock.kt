@@ -6,6 +6,7 @@ import app.goldfishsend.core.LockedInbox
 import app.goldfishsend.core.Mailboxes
 import app.goldfishsend.core.Outbox
 import app.goldfishsend.core.Session
+import app.goldfishsend.core.Shredder
 import app.goldfishsend.core.Sweeper
 import app.goldfishsend.core.launchSafe
 import kotlinx.coroutines.Dispatchers
@@ -57,7 +58,8 @@ object AppLock {
         if (lockable && at != null && SystemClock.elapsedRealtime() - at >= Graph.prefs.lockTimeoutSecs * 1000L) {
             Graph.lock()
         }
-        // The user is looking at the app. Background auto-unlocks never count as presence.
+        // The user is looking at the app. Background auto-unlocks never count as presence, and recordPresence checks the
+        // inactivity limit before it refreshes anything.
         if (Graph.isUnlocked) {
             Wiper.recordPresence()
         }
@@ -151,6 +153,8 @@ object AppLock {
             return
         }
         Graph.scope.launchSafe {
+            // Deletes the last session didn't get to shred (MessageVault): first, before anything else is written.
+            runCatching { Shredder.runPending(s) }
             LockedInbox.drain(s)
             if (Graph.prefs.inboxRotatePending) {
                 // A reboot wipe happened while locked. Pushes sealed since the reboot were just drained; anything older

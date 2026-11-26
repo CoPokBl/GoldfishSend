@@ -27,7 +27,8 @@ import org.bouncycastle.crypto.params.Argon2Parameters
  *   Android Keystore "gf_device" (StrongBox if present, unlocked-device-required) --AES-GCM--> outer(inner or MK)
  *
  * MK (master key, 32 bytes) only lives in RAM while the app is unlocked. The DB key and other keys are derived from it.
- * A second Keystore key "gf_msg" wraps the message root key, so wiping on reboot only needs that alias deleted.
+ * A second Keystore key ("gf_msg_<random>", a new one for every root) wraps the message root key, so wiping on reboot
+ * only needs that alias deleted.
  * The optional "gf_bio" key is biometric-bound and holds a second copy of MK for fingerprint/face unlock.
  *
  * Unlock methods ([UnlockMethod]):
@@ -447,36 +448,76 @@ class KeyVault(private val context: Context) {
 
     // --- message root key (crypto-shredded on reboot wipe) ---
 
-    fun wrapMessageRoot(mrk: ByteArray): ByteArray {
-        if (!keyStore.containsAlias(ALIAS_MSG)) {
-            createKey(ALIAS_MSG, preferStrongBox = false, biometric = false)
+    /** A message root key wrapped by the Keystore key [alias]. Both are stored in the database. */
+    class WrappedRoot(val alias: String, val blob: ByteArray)
+
+    /**
+     * Wraps [mrk] under a brand-new Keystore key, each root under its own. The keys of earlier roots stay until
+     * [keepOnlyMessageKey], so a rotation that doesn't commit loses nothing.
+     */
+    fun wrapMessageRoot(mrk: ByteArray): WrappedRoot {
+        val alias = ALIAS_MSG + "_" + Rand.bytes(8).joinToString("") { "%02x".format(it) }
+        createKey(alias, preferStrongBox = false, biometric = false)
+        try {
+            return WrappedRoot(alias, keystoreSeal(alias, mrk))
+        } catch (e: Exception) {
+            deleteMessageKey(alias)
+            throw e
         }
-        return keystoreSeal(ALIAS_MSG, mrk)
     }
 
-    /** Null if the message key was destroyed (reboot/panic wipe) or the blob is invalid. */
-    fun unwrapMessageRoot(blob: ByteArray): ByteArray? {
-        if (!keyStore.containsAlias(ALIAS_MSG)) {
+    /** Null if the message key was destroyed (reboot/panic wipe) or the blob is invalid. [alias] null: the original key. */
+    fun unwrapMessageRoot(blob: ByteArray, alias: String?): ByteArray? {
+        val a = alias ?: ALIAS_MSG
+        if (!isMessageAlias(a) || !keyStore.containsAlias(a)) {
             return null
         }
         return try {
-            keystoreOpen(ALIAS_MSG, blob)
+            keystoreOpen(a, blob)
         } catch (e: Exception) {
             null
         }
     }
 
+    /** Deletes one message-root key: a rotation that failed, so its root was never stored. */
+    fun deleteMessageKey(alias: String) {
+        if (isMessageAlias(alias)) {
+            runCatching { keyStore.deleteEntry(alias) }
+        }
+    }
+
+    /**
+     * Deletes every message-root key but [alias] (null: the original key): once a rotation has committed, the old
+     * root's wrapper goes, and with it the only way to open stale copies of what was wrapped under it.
+     */
+    fun keepOnlyMessageKey(alias: String?) {
+        val keep = alias ?: ALIAS_MSG
+        for (a in messageAliases()) {
+            if (a != keep) {
+                runCatching { keyStore.deleteEntry(a) }
+            }
+        }
+    }
+
     /** Instantly makes every stored message unreadable. Works while the app is locked. */
     fun destroyMessageKey() {
-        runCatching { keyStore.deleteEntry(ALIAS_MSG) }
+        for (a in messageAliases()) {
+            runCatching { keyStore.deleteEntry(a) }
+        }
     }
+
+    private fun isMessageAlias(a: String) = a == ALIAS_MSG || a.startsWith(ALIAS_MSG + "_")
+
+    private fun messageAliases(): List<String> =
+        runCatching { keyStore.aliases().toList().filter(::isMessageAlias) }.getOrDefault(listOf(ALIAS_MSG))
 
     /** Destroys every key: everything encrypted becomes unrecoverable. */
     fun destroyAll() {
         val extra = listOfNotNull(prefs.getString(P_DEVICE_ALIAS, null), prefs.getString(P_NEXT_ALIAS, null))
-        for (alias in listOf(ALIAS_DEVICE, ALIAS_MSG, ALIAS_BIO, ALIAS_SYSLOCK) + extra) {
+        for (alias in listOf(ALIAS_DEVICE, ALIAS_BIO, ALIAS_SYSLOCK) + extra) {
             runCatching { keyStore.deleteEntry(alias) }
         }
+        destroyMessageKey()
         // Rotated device aliases from interrupted rotations.
         runCatching {
             for (alias in keyStore.aliases().toList().filter { it.startsWith("${ALIAS_DEVICE}_") }) {

@@ -133,6 +133,9 @@ data class OutboxItem(
 /** Incomplete chunked messages kept per contact (64 parts × 4 messages). */
 const val MAX_CHUNKS_PER_CONTACT = 256L
 
+/** kv: messages were deleted since the message root key was last rotated. */
+const val KV_SHRED_PENDING = "shred_pending"
+
 class Repo(val db: Db, private val vault: MessageVault) {
     // --- kv ---
 
@@ -315,7 +318,9 @@ class Repo(val db: Db, private val vault: MessageVault) {
             // A group's remembered member names (Groups.nameKey / pendingNameKey).
             db.exec("DELETE FROM kv WHERE k LIKE ? OR k LIKE ?", "gname/$id/%", "gjoin/$id/%")
             db.exec("DELETE FROM contacts WHERE id = ?", id)
+            deleted()
         }
+        onMessagesDeleted?.invoke()
     }
 
     fun chatSummaries(now: Long): List<ChatSummary> {
@@ -412,8 +417,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
             return null
         }
         val id = B64.enc(Rand.bytes(16))
-        val sealed = vault.seal(id, body.toByteArray(Charsets.UTF_8), expiresAt)
         db.tx {
+            // Sealed inside the transaction, so a root rotation (which holds the database meanwhile) can't slip in between
+            // sealing under the old root and storing the row.
+            val sealed = vault.seal(id, body.toByteArray(Charsets.UTF_8), expiresAt)
             db.exec(
                 "INSERT INTO messages (id, contact_id, wire_id, outgoing, kind, ciphertext, ts, received_at, exp_secs, view_once, expires_at, status, " +
                     "sender_key, recipients) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -480,12 +487,66 @@ class Repo(val db: Db, private val vault: MessageVault) {
         }
     }
 
+    /**
+     * Called after messages were deleted, so the message root key is rotated soon (core/Shredder). Until then, stale
+     * copies of the deleted rows in flash would still open with it.
+     */
+    @Volatile
+    var onMessagesDeleted: (() -> Unit)? = null
+
+    /** Messages were deleted since the message root key was last rotated. Kept in the DB, so a rotation is never lost. */
+    val shredPending: Boolean
+        get() = kvString(KV_SHRED_PENDING) != null
+
+    private fun deleted() {
+        kvPutString(KV_SHRED_PENDING, "1")
+    }
+
     fun deleteMessage(id: String) {
         db.tx {
             db.exec("DELETE FROM group_receipts WHERE message_id = ?", id)
             db.exec("DELETE FROM message_keys WHERE message_id = ?", id)
             db.exec("DELETE FROM outbox WHERE message_id = ?", id)
             db.exec("DELETE FROM messages WHERE id = ?", id)
+            deleted()
+        }
+        onMessagesDeleted?.invoke()
+    }
+
+    /**
+     * Rotates the message root key: everything still wrapped or sealed under it is re-wrapped under [next], [store]
+     * saves the new root, and the vault switches to it, all in one transaction. Stale copies of deleted rows stay under
+     * the old root, which the caller then destroys. On success the vault owns [next]; if this throws, nothing changed.
+     */
+    fun rotateMessageRoot(next: ByteArray, store: () -> Unit) {
+        var undo: (() -> Unit)? = null
+        try {
+            db.tx {
+                val keys = db.query("SELECT message_id, key FROM message_keys WHERE bucket IS NULL") { it.getString(0) to it.getBlob(1) }
+                for ((id, wk) in keys) {
+                    // A key that doesn't open is unreadable either way, so it's left as it is.
+                    vault.rewrapUnder(next, id, wk)?.let { db.exec("UPDATE message_keys SET key = ? WHERE message_id = ?", it, id) }
+                }
+                val chunks = db.query("SELECT contact_id, wire_id, part, body FROM chunks") {
+                    Triple(it.getLong(0), it.getString(1), it.getInt(2)) to it.getBlob(3)
+                }
+                for ((at, body) in chunks) {
+                    val (cid, wire, part) = at
+                    vault.resealUnder(next, "chunk/$cid/$wire/$part", body)?.let {
+                        db.exec("UPDATE chunks SET body = ? WHERE contact_id = ? AND wire_id = ? AND part = ?", it, cid, wire, part)
+                    }
+                }
+                val outbox = db.query("SELECT seq, content FROM outbox WHERE content IS NOT NULL") { it.getLong(0) to it.getBlob(1) }
+                for ((seq, content) in outbox) {
+                    vault.resealUnder(next, "outbox", content)?.let { db.exec("UPDATE outbox SET content = ? WHERE seq = ?", it, seq) }
+                }
+                store()
+                kvPutString(KV_SHRED_PENDING, null)
+                undo = vault.replaceRoot(next)
+            }
+        } catch (e: Exception) {
+            undo?.invoke()
+            throw e
         }
     }
 
@@ -525,7 +586,9 @@ class Repo(val db: Db, private val vault: MessageVault) {
             db.exec("DELETE FROM chunks WHERE contact_id = ?", contactId)
             db.exec("DELETE FROM group_held WHERE cid = ?", contactId)
             db.exec("DELETE FROM messages WHERE contact_id = ?", contactId)
+            deleted()
         }
+        onMessagesDeleted?.invoke()
     }
 
     /** Deletes every message and its key. The contacts and sessions stay. */
@@ -541,8 +604,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
             db.exec("DELETE FROM outbox WHERE kind = ? AND (member_key IS NULL OR message_id IS NOT NULL)", OutboxKind.CONTENT)
             db.exec("UPDATE contacts SET unread = 0")
             db.exec("DELETE FROM kv WHERE k LIKE 'bk/%'")
+            deleted()
         }
         markNeedsVacuum()
+        onMessagesDeleted?.invoke()
     }
 
     /** Outgoing text messages still awaiting a delivery receipt after [olderThan]. */
@@ -557,7 +622,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     // --- chunks ---
 
-    fun storeChunk(contactId: Long, wireId: String, part: Int, parts: Int, body: String) {
+    fun storeChunk(contactId: Long, wireId: String, part: Int, parts: Int, body: String) = db.tx {
         // Bounded per contact: a hostile peer can't fill storage with chunks that never complete.
         if (db.long("SELECT COUNT(*) FROM chunks WHERE contact_id = ?", contactId) >= MAX_CHUNKS_PER_CONTACT) {
             db.exec(
@@ -565,6 +630,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
                 contactId, contactId,
             )
         }
+        // Sealed and stored in one transaction, like insertMessage, so a root rotation can't come in between.
         val sealed = vault.sealBlob("chunk/$contactId/$wireId/$part", body.toByteArray(Charsets.UTF_8))
         db.exec(
             "INSERT OR REPLACE INTO chunks (contact_id, wire_id, part, parts, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -751,11 +817,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun enqueue(contactId: Long, messageId: String?, kind: Int, content: ByteArray?, memberKey: String? = null): Long {
         val now = System.currentTimeMillis()
-        val sealed = content?.let { vault.sealBlob("outbox", it) }
-        return db.insert(
-            "INSERT INTO outbox (contact_id, message_id, kind, content, idem, next_at, created_at, member_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            contactId, messageId, kind, sealed, Rand.bytes(16), now, now, memberKey,
-        )
+        // Sealed and stored in one transaction, like insertMessage, so a root rotation can't come in between.
+        return db.tx {
+            val sealed = content?.let { vault.sealBlob("outbox", it) }
+            db.insert(
+                "INSERT INTO outbox (contact_id, message_id, kind, content, idem, next_at, created_at, member_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                contactId, messageId, kind, sealed, Rand.bytes(16), now, now, memberKey,
+            )
+        }
     }
 
     fun openOutboxContent(item: OutboxItem): ByteArray? = item.content?.let { vault.openBlob("outbox", it) }
