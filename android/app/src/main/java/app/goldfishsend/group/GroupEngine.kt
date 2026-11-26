@@ -286,6 +286,10 @@ class GroupEngine(
         if (m.state != GroupModel.INVITED || mine?.role != Role.INVITED || mine.since != m.since || m.view()?.owner == null) {
             return false
         }
+        // Members take a card only for the stint it names.
+        if (myCard.card.since != m.since || myCard.card.g != m.gid) {
+            return false
+        }
         val before = m.view()
         val fact = GroupCrypto.signFact(
             identity.privateKey,
@@ -351,7 +355,10 @@ class GroupEngine(
             val run = if (m.state == GroupModel.JOINED) ownRun(m).map { it.wire() } else emptyList()
             val content = Content.GState(m.gid, h, rosters = run, facts = listOf(fact.wire()))
             val v = m.view()!!
-            val targets = (if (m.state == GroupModel.JOINED) v.ids().filter { v.isActive(it) } else emptyList()) + listOfNotNull(m.invitedBy, v.owner)
+            // Whoever is still in, and the owner. The one who invited us only while they're in too (or while we're only
+            // declining): someone who has gone since isn't told who's in now.
+            val inviter = m.invitedBy?.takeIf { m.state == GroupModel.INVITED || v.isActive(it) }
+            val targets = (if (m.state == GroupModel.JOINED) v.ids().filter { v.isActive(it) } else emptyList()) + listOfNotNull(inviter, v.owner)
             for (id in targets.toSet() - me) {
                 send(m, id, content)
             }
@@ -453,10 +460,12 @@ class GroupEngine(
             }
         }
         // Who was taken out is owed the rosters that say so (through their old card, or over 1:1), again if they still
-        // write to the group ([receive]).
+        // write to the group ([receive]): up to the one that took them out, and none after it.
         for ((id, ps) in m.peers.filter { it.value.out && it.value.sent == null }) {
             val from = ps.acked?.v ?: (ps.outFrom - 1)
-            val ok = states(m, mine, from, withCards = false, withFacts = false, newest = true).all { s ->
+            // Nothing to tell them if we no longer hold the roster that took them out.
+            val until = stintRun(m, id, ps.outFrom)?.last()?.roster?.ver
+            val ok = until == null || states(m, mine, from, withCards = false, withFacts = false, newest = true, until = until).all { s ->
                 io.sendDirect(m.gid, id, s) || sendGroupTo(m, id, s)
             }
             if (ok) {
@@ -525,16 +534,30 @@ class GroupEngine(
     }
 
     /**
-     * Our state for someone at version [from]: our chain after it (the first [SYNC_ROSTERS]: they ask again from where
-     * they got to; or with [newest], the last ones, for someone out, who can take the newest past a gap), the facts our
-     * roster doesn't show yet, and (if [withCards]) every card we hold, in as many messages as it takes to keep each small.
+     * Our state for someone at version [from]: our chain after it, up to [until] (the first [SYNC_ROSTERS]: they ask again
+     * from where they got to; or with [newest], the last ones, for someone out, who can take the newest past a gap), the
+     * facts our roster doesn't show yet, and (if [withCards]) every card we hold, in as many messages as it takes to keep
+     * each small.
      */
-    private fun states(m: GroupModel, h: Head, from: Long, withCards: Boolean, withFacts: Boolean = true, newest: Boolean = false): List<Content.GState> {
-        val after = chain(m, from + 1)
-        val rosters = (if (newest) after.takeLast(SYNC_ROSTERS) else after.take(SYNC_ROSTERS)).map { it.wire() }
+    private fun states(
+        m: GroupModel,
+        h: Head,
+        from: Long,
+        withCards: Boolean,
+        withFacts: Boolean = true,
+        newest: Boolean = false,
+        until: Long = Long.MAX_VALUE,
+    ): List<Content.GState> {
+        val after = chain(m, from + 1).filter { it.roster.ver <= until }
         val r = m.roster!!.roster
         val facts = if (withFacts) m.facts.filter { Membership.applies(r, it.fact) }.map { it.wire() } else emptyList()
         val cards = if (withCards) (m.cards.values + listOfNotNull(m.myCard)).map { Signed(B64.enc(it.bytes), B64.enc(it.sig)) } else emptyList()
+        return pack(m, h, if (newest) after.takeLast(SYNC_ROSTERS) else after.take(SYNC_ROSTERS), facts, cards)
+    }
+
+    /** [rosters], [facts] and [cards] in as many state messages as it takes to keep each small. */
+    private fun pack(m: GroupModel, h: Head, list: List<SignedRoster>, facts: List<Signed>, cards: List<Signed>): List<Content.GState> {
+        val rosters = list.map { it.wire() }
         val out = mutableListOf<Content.GState>()
         var cur = Content.GState(m.gid, h, facts = facts)
         var size = facts.sumOf { it.data.length }
@@ -569,6 +592,16 @@ class GroupEngine(
         }
         io.sendGroup(m.gid, id, content)
         return true
+    }
+
+    /**
+     * [id]'s stint [since] as our chain tells it: the rosters from the one that invited them up to and including the one
+     * that ended it, oldest first. Null if we hold no roster of it, or it hasn't ended.
+     */
+    private fun stintRun(m: GroupModel, id: String, since: Long): List<SignedRoster>? {
+        val run = chain(m, since)
+        val end = run.indexOfFirst { it.roster.member(id)?.since != since }
+        return if (end > 0) run.subList(0, end + 1) else null
     }
 
     /** Our chain from version [from] (inclusive) to the current roster, oldest first, as far back as we hold it. */
@@ -657,7 +690,8 @@ class GroupEngine(
      * another group: then the hint names someone we know from there. Either way it's decrypted without storing anything
      * ([ScratchStore]): no session or identity is kept, nor an existing one moved on, for someone who may never be a
      * member. What they send counts only if it comes from further on than our roster, where a roster could list them
-     * ([onContent]).
+     * ([onContent]). The blob goes along with what's held from it, so the real session consumes it before that's
+     * delivered ([consume]).
      */
     private fun fromUnlisted(m: GroupModel, inboxHintKey: ByteArray, blob: GroupBlob) {
         val from = if (blob.type == PREKEY) {
@@ -675,20 +709,46 @@ class GroupEngine(
             return
         }
         val content = decrypt(from, blob, ScratchStore(signal)) ?: return
-        onContent(m.gid, from, content, direct = false, unlisted = true)
+        onContent(m.gid, from, content, direct = false, unlisted = true, raw = blob)
     }
 
-    private fun decrypt(sender: String, blob: GroupBlob, keys: SignalProtocolStore = signal): Content? = try {
+    /**
+     * Before content read with a [ScratchStore] counts ([raw], the blob it came in, or the last part of it), the blob is
+     * decrypted again with the real store, now that its sender is a member: the session moves past it, so the server
+     * delivering it again later gets nowhere (libsignal rejects it as a duplicate). Without that, nothing would have
+     * recorded that it was read: the group's last-resort prekeys would decrypt it again, and a view-once, disappearing
+     * or deleted message would come back. Returns false if the real session had already had it (it was delivered).
+     */
+    private fun consume(sender: String, raw: GroupBlob?): Boolean {
+        raw ?: return true
+        return try {
+            open(sender, raw, signal)
+            true
+        } catch (e: DuplicateMessageException) {
+            dbg { "already had what ${who(sender)} sent before they were listed" }
+            false
+        } catch (e: Exception) {
+            // It was read once, and the real session can't move past it: nothing can decrypt it again either.
+            true
+        }
+    }
+
+    /** The padded plaintext of [blob] from [sender], or null if the PreKey message names someone else. Throws if it fails. */
+    private fun open(sender: String, blob: GroupBlob, keys: SignalProtocolStore): ByteArray? {
         val addr = GroupCrypto.address(sender)
         val key = IdentityKey(B64.dec(sender))
         val cipher = SessionCipher(keys, LOCAL, addr)
         // libsignal stores the sender's identity itself, once the message has decrypted.
-        val padded = if (blob.type == PREKEY) {
+        return if (blob.type == PREKEY) {
             val msg = PreKeySignalMessage(blob.body)
             if (msg.identityKey != key) null else cipher.decrypt(msg)
         } else {
             cipher.decrypt(SignalMessage(blob.body))
         }
+    }
+
+    private fun decrypt(sender: String, blob: GroupBlob, keys: SignalProtocolStore = signal): Content? = try {
+        val padded = open(sender, blob, keys)
         if (padded == null) dbg { "identity mismatch from ${who(sender)}" }
         padded?.let { Content.decode(Padding.unpad(it)) }
     } catch (e: DuplicateMessageException) {
@@ -707,8 +767,11 @@ class GroupEngine(
         onContent(gid, from, content, direct = true)
     }
 
-    /** [unlisted]: from someone our roster didn't list when it arrived, read by [fromUnlisted]. */
-    private fun onContent(gid: String, from: String, content: Content, direct: Boolean, unlisted: Boolean = false) {
+    /**
+     * [unlisted]: from someone our roster didn't list when it arrived, read by [fromUnlisted]; [raw], the blob it was read
+     * from then (see [consume]).
+     */
+    private fun onContent(gid: String, from: String, content: Content, direct: Boolean, unlisted: Boolean = false, raw: GroupBlob? = null) {
         if (content is Content.Chunk) {
             if (content.parts !in 2..Chunker.MAX_PARTS || content.part !in 0 until content.parts || content.data.length > 4096) {
                 return
@@ -717,7 +780,8 @@ class GroupEngine(
             val joined = store.storeChunk(gid, key, content.part, content.parts, content.data) ?: return
             val inner = runCatching { Content.decode(B64.dec(joined)) }.getOrNull() ?: return
             if (inner !is Content.Chunk) {
-                onContent(gid, from, inner, direct, unlisted)
+                // Its last part's blob: once the real session has that one, the server can't make the whole again.
+                onContent(gid, from, inner, direct, unlisted, raw)
             }
             return
         }
@@ -730,9 +794,12 @@ class GroupEngine(
         dbg { "${who(me)} content ${content.javaClass.simpleName} g=${gid.take(6)} from=${who(from)} direct=$direct unlisted=$unlisted" }
         when (content) {
             is Content.GState -> onState(from, content, direct)
-            is Content.GText -> active(gid, from, content.h)?.let { io.onText(it, from, content) } ?: holdFromInvitee(gid, from, content, unlisted)
-            is Content.GReceipt -> active(gid, from, content.h)?.let { io.onReceipt(it, from, content) } ?: holdFromInvitee(gid, from, content, unlisted)
-            is Content.GDelete -> active(gid, from, content.h)?.let { io.onDelete(it, from, content) } ?: holdFromInvitee(gid, from, content, unlisted)
+            is Content.GText -> active(gid, from, content.h)?.let { m -> if (consume(from, raw)) io.onText(m, from, content) }
+                ?: holdFromInvitee(gid, from, content, unlisted, raw)
+            is Content.GReceipt -> active(gid, from, content.h)?.let { m -> if (consume(from, raw)) io.onReceipt(m, from, content) }
+                ?: holdFromInvitee(gid, from, content, unlisted, raw)
+            is Content.GDelete -> active(gid, from, content.h)?.let { m -> if (consume(from, raw)) io.onDelete(m, from, content) }
+                ?: holdFromInvitee(gid, from, content, unlisted, raw)
             else -> Unit
         }
         store.load(gid)?.let { flush(it) }
@@ -752,9 +819,9 @@ class GroupEngine(
      * A message from someone still invited as far as we know: their admission hasn't reached us yet (pushes arrive out of
      * order). Keep it until it does, bounded like other held blobs. It's already decrypted (the session has moved on), so
      * it's kept as content, then replayed by [replayHeld]. With [unlisted], from someone our roster doesn't list at all
-     * (a newcomer from a roster we haven't got).
+     * (a newcomer from a roster we haven't got); [raw] is kept with it (see [consume]).
      */
-    private fun holdFromInvitee(gid: String, from: String, content: Content, unlisted: Boolean) {
+    private fun holdFromInvitee(gid: String, from: String, content: Content, unlisted: Boolean, raw: GroupBlob?) {
         val m = store.load(gid) ?: return
         val role = m.view()?.role(from)
         if (m.state != GroupModel.JOINED || (role != Role.INVITED && !(role == null && unlisted))) {
@@ -765,7 +832,8 @@ class GroupEngine(
             behindAGap(m)
         }
         dbg { "holding ${content.javaClass.simpleName} from invitee ${who(from)}" }
-        store.hold(gid, if (role == null) HELD_UNLISTED else HELD_CONTENT, B64.dec(from) + content.encode())
+        val blob = raw?.encode() ?: ByteArray(0)
+        store.hold(gid, if (role == null) HELD_UNLISTED else HELD_CONTENT, B64.dec(from) + u32(blob.size) + blob + content.encode())
     }
 
     /** The group, if we're in it and [from] is a current member (not just invited); their head is noted. */
@@ -796,29 +864,41 @@ class GroupEngine(
     /**
      * State from a peer, merged: rosters extend our chain, facts join the set, the higher card `seq` wins. Merging the
      * same state again changes nothing. Then whatever it changed is owed on ([flush], by [onContent]).
+     *
+     * The work one state can cause is bounded: the group is loaded once and every step works on that model, a fact
+     * repeated in it (the same bytes, or the same stint and kind) is looked at once, and only one stale acceptance per
+     * state is answered ([answerStale]).
      */
     private fun onState(from: String, c: Content.GState, direct: Boolean) {
         val rosters = c.rosters.take(SYNC_ROSTERS).mapNotNull { w -> GroupCrypto.openRoster(w)?.takeIf { RosterRules.wellFormed(it.roster, c.g) } }
-        if (store.load(c.g) == null) {
-            val first = rosters.firstOrNull() ?: return
-            invitation(from, first, direct) ?: return
-        }
-        val was = store.load(c.g)?.roster?.roster?.ver ?: return
+        val m = store.load(c.g) ?: invitation(from, rosters.firstOrNull() ?: return, direct) ?: return
+        val was = m.roster?.roster?.ver ?: return
         for (sr in rosters) {
-            onSignedRoster(store.load(c.g) ?: return, sr)
+            onSignedRoster(m, sr)
         }
-        store.load(c.g)?.let { m -> if (m.roster?.roster?.ver == was && rosters.any { it.roster.ver > was + 1 }) behindAGap(m) }
-        val before = store.load(c.g)?.view() ?: return
+        if (m.roster?.roster?.ver == was && rosters.any { it.roster.ver > was + 1 }) {
+            behindAGap(m)
+        }
+        val before = m.view() ?: return
         var changed = false
         var by = from
-        for (w in c.facts.take(MAX_FACTS)) {
+        var answered = false
+        val seen = HashSet<String>()
+        for (w in c.facts.distinctBy { it.data }.take(MAX_FACTS)) {
             val sf = GroupCrypto.openFact(w) ?: continue
-            if (onFact(store.load(c.g) ?: return, from, sf, direct)) {
+            if (!seen.add(sf.key)) {
+                continue
+            }
+            val counts = onFact(m, from, sf, direct) { stale ->
+                if (!answered) {
+                    answered = answerStale(m, from, stale, c.h)
+                }
+            }
+            if (counts) {
                 changed = true
                 by = sf.fact.id
             }
         }
-        val m = store.load(c.g) ?: return
         if (changed && m.state != GroupModel.LEFT && m.state != GroupModel.REMOVED) {
             settle(m, before, by)
         }
@@ -849,11 +929,15 @@ class GroupEngine(
         }
     }
 
-    /** A roster for a group we don't know: an invitation if it came over 1:1, signed by its owner, listing us invited. */
+    /**
+     * A roster for a group we don't know: an invitation if it came over 1:1 from its owner, who signed it, listing us
+     * invited. The 1:1 session says who it's from, so no contact can invite us in someone else's name (nor relay a roster
+     * a stranger signed, who would then be the owner).
+     */
     private fun invitation(from: String, signed: SignedRoster, direct: Boolean): GroupModel? {
         val r = signed.roster
         val mine = r.member(me)
-        if (!direct || r.by != r.owner || mine?.role != Role.INVITED) {
+        if (!direct || from != r.by || r.by != r.owner || mine?.role != Role.INVITED) {
             return null
         }
         val fresh = GroupModel(r.g, GroupModel.INVITED, signed, mutableMapOf(), null, r.by, mutableListOf(), mine.since)
@@ -889,13 +973,16 @@ class GroupEngine(
     }
 
     /**
-     * Out of the group (or only invited, and taken out meanwhile), [r] lists us as invited in a newer stint, signed by its
-     * owner. Like a first invitation, it's taken on its owner's word, gap or not. (Not while we're in: then the chain is
-     * ours to follow.)
+     * Out of the group (or only invited, and taken out meanwhile), [r] lists us as invited in a newer stint, signed by the
+     * owner as far as we know (our view's), who is its owner too. Like a first invitation, it's taken on its owner's word,
+     * gap or not. (Not while we're in: then the chain is ours to follow.) Only the owner we know: anyone else who knows
+     * the group could sign a roster further on that makes themselves its owner, and with it take over our invitation, or
+     * our place in a group we left, and keep the real owner's later rosters out (ours would be further on).
      */
     private fun invitesAgain(m: GroupModel, r: SignedRoster): Boolean {
         val mine = r.roster.member(me) ?: return false
-        return m.state != GroupModel.JOINED && r.roster.by == r.roster.owner && mine.role == Role.INVITED && mine.since > m.since
+        val owner = m.view()?.owner ?: return false
+        return m.state != GroupModel.JOINED && r.roster.by == owner && r.roster.owner == owner && mine.role == Role.INVITED && mine.since > m.since
     }
 
     /** Moves to [signed] past a gap (see [onSignedRoster]). */
@@ -912,15 +999,14 @@ class GroupEngine(
 
     /**
      * A member's accept or leave. It counts if it's about a stint our roster lists; one about a newer stint (we're behind)
-     * is kept for when our roster catches up; one about a stint that's over is ignored, so replays do nothing. Returns
-     * whether it's new and counts.
+     * is kept for when our roster catches up; one about a stint that's over is ignored, so replays do nothing, but for
+     * [stale], which may answer its author ([answerStale]). Returns whether it's new and counts.
      */
-    private fun onFact(m0: GroupModel, from: String, sf: SignedFact, direct: Boolean): Boolean {
+    private fun onFact(m: GroupModel, from: String, sf: SignedFact, direct: Boolean, stale: (SignedFact) -> Unit): Boolean {
         val f = sf.fact
-        if (f.g != m0.gid || f.id == me) {
+        if (f.g != m.gid || f.id == me) {
             return false
         }
-        val m = store.load(m0.gid) ?: return false
         val r = m.roster?.roster ?: return false
         val out = m.state == GroupModel.LEFT || m.state == GroupModel.REMOVED
         if (out) {
@@ -930,7 +1016,7 @@ class GroupEngine(
         }
         if (Membership.stale(r, f)) {
             if (!out) {
-                answerStale(m, from, sf)
+                stale(sf)
             }
             return false
         }
@@ -971,15 +1057,18 @@ class GroupEngine(
      * An acceptance, from its author, that our roster doesn't take: they're waiting to be let in, and what we sent them
      * was lost, or they sent it again ([sendAgain]). Taking it again changes nothing; they're answered instead.
      * - **Already let in:** what we owe them is owed again, so they get our state.
-     * - **The invitation is over** (withdrawn, or a newer one since): our chain from that invitation, which says how it
-     *   ended, over 1:1.
+     * - **Taken out by us:** the rosters that say so are owed again ([flush]).
+     * - **The stint is over otherwise** (the invitation withdrawn, or they were taken out): our chain from where they are
+     *   (their head [h], or that invitation) up to the roster that ended it, which says how it ended, over 1:1. Never the
+     *   rosters after it: who came in since is none of their business. Nothing if they left: they know how it ended.
      *
-     * Once per our head, and at most once per [SEND_AGAIN_AFTER].
+     * Once per our head, and at most once per [SEND_AGAIN_AFTER]. Returns whether it looked for the stint in our chain,
+     * the costly part, which [onState] does for one acceptance per state.
      */
-    private fun answerStale(m: GroupModel, from: String, sf: SignedFact) {
+    private fun answerStale(m: GroupModel, from: String, sf: SignedFact, h: Head): Boolean {
         val f = sf.fact
         if (from != f.id || f.kind != FactKind.ACCEPT || m.state != GroupModel.JOINED) {
-            return
+            return false
         }
         val ps = m.peers[from] ?: PeerSync()
         if (m.roster?.roster?.member(f.id)?.since == f.since) {
@@ -988,17 +1077,35 @@ class GroupEngine(
                 m.peers[from] = ps.copy(sent = null, sentN = 0)
                 store.save(m)
             }
-            return
+            return false
         }
-        val mine = head(m) ?: return
+        if (ps.out && ps.outFrom == f.since) {
+            if (ps.sent != null && io.nowMillis() - ps.sentTs >= SEND_AGAIN_AFTER) {
+                m.peers[from] = ps.copy(sent = null)
+                store.save(m)
+            }
+            return false
+        }
+        val mine = head(m) ?: return false
         val key = "stale>${mine.key}"
-        if ((ps.sent == key && io.nowMillis() - ps.sentTs < SEND_AGAIN_AFTER) || chain(m, 0).none { it.roster.member(f.id)?.since == f.since }) {
-            return
+        if (ps.sent == key && io.nowMillis() - ps.sentTs < SEND_AGAIN_AFTER) {
+            return false
         }
-        if (states(m, mine, f.since - 1, withCards = false, withFacts = false).all { io.sendDirect(m.gid, from, it) }) {
+        val run = stintRun(m, f.id, f.since) ?: return true
+        val left = run.last().roster.proof.any { w ->
+            GroupCrypto.openFact(w)?.fact?.let { it.kind == FactKind.LEAVE && it.id == f.id && it.since == f.since } == true
+        }
+        if (left) {
+            return true
+        }
+        // From where they say they are, if that's inside the stint: each "Send again" gets them further.
+        val rest = run.dropWhile { it.roster.ver <= h.v }.ifEmpty { run.takeLast(1) }.take(SYNC_ROSTERS)
+        dbg { "${who(me)} answers ${who(from)}'s stale acceptance: v${rest.first().roster.ver} to v${rest.last().roster.ver}" }
+        if (pack(m, mine, rest, emptyList(), emptyList()).all { io.sendDirect(m.gid, from, it) }) {
             m.peers[from] = ps.copy(sent = key, sentTs = io.nowMillis())
             store.save(m)
         }
+        return true
     }
 
     /**
@@ -1036,11 +1143,14 @@ class GroupEngine(
         // Out of the group, we keep no cards, but for one: having declined, the owner's, to send them the decline.
         val declined = m.state == GroupModel.LEFT && m.roster?.roster?.role(me) == Role.INVITED
         val out = (m.state == GroupModel.LEFT && !declined) || m.state == GroupModel.REMOVED
-        if (card.card.g != m.gid || id == me || m.roster?.roster?.role(id) == null || out || (declined && id != m.view()?.owner)) {
+        // A card names the stint it's for: one kept from an earlier stint (whose inbox and keys are gone) never stands in
+        // for this one's, whatever its seq.
+        val since = m.roster?.roster?.member(id)?.since
+        if (card.card.g != m.gid || id == me || since == null || card.card.since != since || out || (declined && id != m.view()?.owner)) {
             return
         }
         val existing = m.cards[id]
-        if (existing != null && existing.card.seq >= card.card.seq) {
+        if (existing != null && existing.card.since == since && existing.card.seq >= card.card.seq) {
             return
         }
         m.cards[id] = card
@@ -1101,6 +1211,8 @@ class GroupEngine(
         m.departed.clear()
         m.cards.filterKeys { it !in ids }.let { m.departed.putAll(it) }
         m.cards.keys.retainAll(ids)
+        // A card from someone's earlier stint is no use for this one (its inbox is gone): theirs comes with their admission.
+        m.cards.entries.removeAll { (id, c) -> after.member(id)?.since != c.card.since }
         m.peers.keys.retainAll { it in ids || m.peers[it]?.out == true }
         store.save(m)
         if (events.isNotEmpty()) {
@@ -1177,9 +1289,15 @@ class GroupEngine(
     fun replayHeld(gid: String, h: HeldBlob) {
         store.dropHeld(h.id)
         if (h.hintKey.contentEquals(HELD_CONTENT) || h.hintKey.contentEquals(HELD_UNLISTED)) {
-            val from = B64.enc(h.blob.copyOfRange(0, IDENTITY_LEN))
-            val content = runCatching { Content.decode(h.blob.copyOfRange(IDENTITY_LEN, h.blob.size)) }.getOrNull()
-            content?.let { onContent(gid, from, it, direct = false, unlisted = h.hintKey.contentEquals(HELD_UNLISTED)) }
+            // The sender, the blob it was read from (if that was without a session: see [consume]), then the content.
+            val held = runCatching {
+                val from = B64.enc(h.blob.copyOfRange(0, IDENTITY_LEN))
+                val n = java.nio.ByteBuffer.wrap(h.blob, IDENTITY_LEN, 4).int
+                val at = IDENTITY_LEN + 4
+                val raw = if (n == 0) null else GroupBlob.decode(h.blob.copyOfRange(at, at + n)) ?: error("bad blob")
+                Triple(from, raw, Content.decode(h.blob.copyOfRange(at + n, h.blob.size)))
+            }.getOrNull() ?: return
+            onContent(gid, held.first, held.third, direct = false, unlisted = h.hintKey.contentEquals(HELD_UNLISTED), raw = held.second)
         } else {
             receive(gid, h.hintKey, h.blob)
         }
@@ -1231,6 +1349,8 @@ class GroupEngine(
         /** The same, from someone our roster didn't list ([fromUnlisted]). */
         private val HELD_UNLISTED = byteArrayOf(0x55)
         private const val IDENTITY_LEN = 33
+
+        private fun u32(n: Int): ByteArray = java.nio.ByteBuffer.allocate(4).putInt(n).array()
 
         /** Protocol decisions, for debugging. The app routes this to logcat in debug builds only; it never carries content. */
         @Volatile

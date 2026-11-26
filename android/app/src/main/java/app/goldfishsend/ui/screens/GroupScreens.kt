@@ -217,8 +217,10 @@ private fun loadInfo(s: Session, cid: Long): GroupInfo? {
     val me = Groups.me(s)
     val routes = s.repo.memberRoutes(cid)
     val roster = m.view() ?: return null
+    // The row says who isn't a contact; names that look alike still get their suffixes.
+    val names = Groups.memberNames(s, m, roster.ids())
     val rows = roster.members.map { rm ->
-        val n = Groups.memberName(s, m, rm.id)
+        val n = names.getValue(rm.id)
         MemberRow(
             rm.id, n.name, rm.role, rm.id == me, n.isContact, n.verified,
             routes[rm.id]?.let { it.pendingServerKey != null || it.unreachable } == true,

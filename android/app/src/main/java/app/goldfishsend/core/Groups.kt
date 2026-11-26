@@ -1,6 +1,7 @@
 package app.goldfishsend.core
 
 import android.util.Log
+import app.goldfishsend.db.Contact
 import app.goldfishsend.db.Mailbox
 import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
@@ -29,6 +30,7 @@ import app.goldfishsend.proto.Chunker
 import app.goldfishsend.proto.Content
 import app.goldfishsend.proto.GroupCard
 import app.goldfishsend.proto.GroupCrypto
+import app.goldfishsend.proto.MemberNames
 import app.goldfishsend.proto.Padding
 import app.goldfishsend.proto.Rand
 import app.goldfishsend.proto.Role
@@ -114,7 +116,7 @@ object Groups {
         val (mb, serverKey) = inbox(s)
         val hintKey = Rand.bytes(GroupCrypto.HINT_KEY)
         val cid = locked(s) {
-            val card = newCard(s, gid, mb, hintKey, serverKey, seq = 1, bundle = null)
+            val card = newCard(s, gid, mb, hintKey, serverKey, seq = 1, since = 1, bundle = null)
             engine(s).create(gid, clean, invitees, card, Graph.prefs.defaultTimerSecs)
             val cid = store(s).cidOf(gid)!!
             s.repo.bindGroupInbox(mb.id, cid, hintKey)
@@ -135,8 +137,9 @@ object Groups {
         val hintKey = Rand.bytes(GroupCrypto.HINT_KEY)
         val ok = withEngine(s) { e ->
             val fresh = model(s, cid) ?: return@withEngine false
-            // After an earlier stint, members may still hold our old card: this one must be newer.
-            val card = newCard(s, fresh.gid, mb, hintKey, serverKey, seq = (fresh.myCard?.card?.seq ?: 0) + 1, bundle = null)
+            // For this stint: members may still hold a card of ours from an earlier one, and take this one instead whatever
+            // that one's seq.
+            val card = newCard(s, fresh.gid, mb, hintKey, serverKey, seq = (fresh.myCard?.card?.seq ?: 0) + 1, since = fresh.since, bundle = null)
             s.repo.bindGroupInbox(mb.id, cid, hintKey)
             e.join(fresh, card)
         }
@@ -411,7 +414,7 @@ object Groups {
                 old?.let { s.repo.retireGroupInbox(it.id, now, now + DRAIN_MS) }
                 s.repo.bindGroupInbox(mb.id, cid, hintKey)
                 val prev = cur.myCard!!.card
-                val card = newCard(s, cur.gid, mb, hintKey, serverKey, seq = prev.seq + 1, bundle = prev.bundle)
+                val card = newCard(s, cur.gid, mb, hintKey, serverKey, seq = prev.seq + 1, since = prev.since, bundle = prev.bundle)
                 engine(s).updateCard(cur, card)
                 s.repo.setRotateNeeded(cid, false)
             }
@@ -461,6 +464,7 @@ object Groups {
         hintKey: ByteArray,
         serverKey: String,
         seq: Long,
+        since: Long,
         bundle: CardBundle?,
     ): SignedCard {
         val identity = s.signal.identityKeyPair
@@ -492,12 +496,25 @@ object Groups {
             hintKey = B64.enc(hintKey),
             bundle = b,
             seq = seq,
+            since = since,
         )
         return GroupEngine.makeCard(identity, card)
     }
 
-    /** How a member appears: your own name for them if they're your contact, otherwise their self-chosen name. */
-    data class MemberName(val name: String, val isContact: Boolean, val verified: Boolean, val known: Boolean = true)
+    /**
+     * How a member appears: "You"; your own name for them if they're your contact; otherwise the name they chose, with a
+     * short suffix from their key if it looks like a contact's, another member's or "You" ([MemberNames]).
+     */
+    data class MemberName(val name: String, val isContact: Boolean, val verified: Boolean, val known: Boolean = true) {
+        /**
+         * As shown where messages are read (bubbles, the chat list, notifications, system lines): a name the member chose
+         * themselves is marked as theirs ("~ Sam"), so it can't pass for one of yours.
+         */
+        val label: String get() = if (isContact || !known) name else "~ $name"
+    }
+
+    /** What the app calls members itself, which a self-chosen name mustn't pass for either. */
+    private val PLACEHOLDERS = listOf("You", "Someone", "Someone new", "Former member")
 
     /** Self-chosen names seen in a group's cards, kept after the card goes (removed members, old messages). */
     private fun nameKey(cid: Long, member: String) = "gname/$cid/${GroupCrypto.tag(member)}"
@@ -505,21 +522,40 @@ object Groups {
     /** Members whose join line was written before we knew their name: the line naming them follows their card. */
     private fun pendingNameKey(cid: Long, member: String) = "gjoin/$cid/${GroupCrypto.tag(member)}"
 
-    fun memberName(s: Session, m: GroupModel?, member: String): MemberName {
-        if (member == me(s)) {
-            return MemberName("You", true, true)
+    fun memberName(s: Session, m: GroupModel?, member: String, people: List<Contact> = s.repo.people()): MemberName =
+        memberNames(s, m, listOf(member), people).getValue(member)
+
+    /**
+     * How each of [ids] appears in [m]. They're named together with everyone in the group's view, so that a self-chosen
+     * name that looks like another member's, a contact's (any of [people] not hidden) or one the app uses itself is told
+     * apart from it.
+     */
+    fun memberNames(s: Session, m: GroupModel?, ids: Collection<String>, people: List<Contact> = s.repo.people()): Map<String, MemberName> {
+        val me = me(s)
+        val byKey = people.filter { it.identityKey != null }.associateBy { B64.enc(it.identityKey!!) }
+        val cid = m?.let { RepoGroupStore(s.repo).cidOf(it.gid) }
+        val all = (ids + m?.view()?.ids().orEmpty()).toSet()
+        val plain = all.associateWith { id ->
+            val contact = byKey[id]
+            when {
+                id == me -> MemberName("You", true, true)
+                contact != null -> MemberName(contact.name, true, contact.verified)
+                else -> {
+                    val own = (m?.cards?.get(id) ?: m?.departed?.get(id))?.card?.name?.let { Sanitize.name(it) }
+                        ?: cid?.let { s.repo.kvString(nameKey(it, id)) }
+                    if (own != null) MemberName(own, false, false) else MemberName("Someone new", false, false, known = false)
+                }
+            }
         }
-        val contact = runCatching { s.repo.personByIdentity(B64.dec(member)) }.getOrNull()
-        if (contact != null) {
-            return MemberName(contact.name, true, contact.verified)
-        }
-        val own = (m?.cards?.get(member) ?: m?.departed?.get(member))?.card?.name?.let { Sanitize.name(it) }
-            ?: m?.let { g -> RepoGroupStore(s.repo).cidOf(g.gid) }?.let { cid -> s.repo.kvString(nameKey(cid, member)) }
-        return if (own != null) MemberName(own, false, false) else MemberName("Someone new", false, false, known = false)
+        val shown = MemberNames.distinct(
+            plain.filterValues { it.known }.map { (id, n) -> MemberNames.Member(id, n.name, own = !n.isContact) },
+            people.filter { !it.hidden }.map { it.name } + PLACEHOLDERS,
+        )
+        return ids.associateWith { id -> plain.getValue(id).let { n -> shown[id]?.let { n.copy(name = it) } ?: n } }
     }
 
     private fun names(s: Session, m: GroupModel, ids: List<String>): String =
-        ids.map { memberName(s, m, it).name }.let { list ->
+        memberNames(s, m, ids).let { n -> ids.map { n.getValue(it).label } }.let { list ->
             when (list.size) {
                 0 -> ""
                 1 -> list[0]
@@ -554,12 +590,12 @@ object Groups {
             for (e in events) {
                 val text = when (e) {
                     GroupEvent.Created -> "You created the group. Messages are end-to-end encrypted."
-                    is GroupEvent.Invited -> "${memberName(s, m, e.by).name} invited you to this group."
+                    is GroupEvent.Invited -> "${memberName(s, m, e.by).label} invited you to this group."
                     is GroupEvent.Added -> {
                         val unknown = e.ids.filter { !memberName(s, m, it).known }
                         unknown.forEach { s.repo.kvPutString(pendingNameKey(cid, it), "1") }
                         val known = names(s, m, e.ids - unknown.toSet())
-                        val by = memberName(s, m, e.by).name
+                        val by = memberName(s, m, e.by).label
                         when {
                             unknown.isEmpty() -> "$by added $known."
                             known.isEmpty() -> "$by added ${if (unknown.size == 1) "someone new" else "${unknown.size} new people"}."
@@ -570,29 +606,29 @@ object Groups {
                         for (id in e.ids) {
                             s.repo.outboxDropMember(cid, id).forEach { settleStatus(s, it) }
                         }
-                        "${memberName(s, m, e.by).name} removed ${names(s, m, e.ids)}."
+                        "${memberName(s, m, e.by).label} removed ${names(s, m, e.ids)}."
                     }
                     is GroupEvent.Left -> {
                         s.repo.outboxDropMember(cid, e.id).forEach { settleStatus(s, it) }
-                        "${memberName(s, m, e.id).name} left."
+                        "${memberName(s, m, e.id).label} left."
                     }
                     is GroupEvent.Joined -> when {
                         e.id == me(s) -> "You joined the group."
-                        memberName(s, m, e.id).known -> "${memberName(s, m, e.id).name} joined."
+                        memberName(s, m, e.id).known -> "${memberName(s, m, e.id).label} joined."
                         else -> {
                             s.repo.kvPutString(pendingNameKey(cid, e.id), "1")
                             "Someone new joined."
                         }
                     }
                     is GroupEvent.OwnerChanged ->
-                        if (e.id == me(s)) "You're the owner of the group now." else "${memberName(s, m, e.id).name} is the owner of the group now."
-                    is GroupEvent.Renamed -> "${memberName(s, m, e.by).name} renamed the group to “${Sanitize.name(e.name) ?: ""}”."
+                        if (e.id == me(s)) "You're the owner of the group now." else "${memberName(s, m, e.id).label} is the owner of the group now."
+                    is GroupEvent.Renamed -> "${memberName(s, m, e.by).label} renamed the group to “${Sanitize.name(e.name) ?: ""}”."
                     is GroupEvent.TimerChanged ->
-                        "${memberName(s, m, e.by).name} set disappearing messages to ${timerLabel(e.secs).lowercase()}."
+                        "${memberName(s, m, e.by).label} set disappearing messages to ${timerLabel(e.secs).lowercase()}."
                     is GroupEvent.YouWereRemoved -> {
                         dropOutbox(cid)
                         afterDeparture(cid, m)
-                        "${memberName(s, m, e.by).name} removed you from the group."
+                        "${memberName(s, m, e.by).label} removed you from the group."
                     }
                     GroupEvent.YouLeft -> {
                         afterDeparture(cid, m)
@@ -618,7 +654,7 @@ object Groups {
             // A join line said "someone new": now we can say who it was (contacts show your own name for them).
             if (s.repo.kvString(pendingNameKey(cid, id)) != null) {
                 s.repo.kvPutString(pendingNameKey(cid, id), null)
-                Messenger.systemMessage(s, cid, "${memberName(s, m, id).name} is in the group.")
+                Messenger.systemMessage(s, cid, "${memberName(s, m, id).label} is in the group.")
             }
         }
 
@@ -672,7 +708,7 @@ object Groups {
                 // Read receipts go out from markChatRead once the transaction is done.
                 Graph.scope.launchSafe { Messenger.markChatRead(s, cid) }
             } else {
-                val who = memberName(s, m, from).name
+                val who = memberName(s, m, from).label
                 Messenger.notify(s, cid, if (t.once == true) "$who: View-once message" else "$who: ${t.body}")
             }
             Sweeper.schedule(s)

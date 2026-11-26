@@ -70,6 +70,7 @@ internal object GroupKit {
                 kyberId, B64.enc(kyber.publicKey.serialize()), B64.enc(kyberSig),
             ),
             seq = 1,
+            since = 1,
         )
         return Triple(s.repo.mailbox(mbId)!!, hint, GroupEngine.makeCard(identity, card))
     }
