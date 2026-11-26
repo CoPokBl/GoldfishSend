@@ -9,6 +9,14 @@ set -eu
 # Where onion traffic goes: Caddy's onion-only listener by default. The Traefik overlay points it straight at the api
 # instead (Tor needs an IP address here, not a hostname).
 : "${GOLDFISH_ONION_TARGET:=${GOLDFISH_ONION_CADDY_IP}:8081}"
+# Optional (docker-compose.onion-circuits.yml): start each forwarded connection with a PROXY protocol line naming its Tor
+# circuit, so the api can give each circuit its own flood-guard bucket. The target must then be the api's onion
+# listener (Goldfish:Network:OnionCircuitEndpoint), which requires that line: Caddy doesn't expect it.
+: "${GOLDFISH_ONION_CIRCUIT_IDS:=0}"
+CIRCUIT_IDS=""
+if [ "$GOLDFISH_ONION_CIRCUIT_IDS" = "1" ]; then
+    CIRCUIT_IDS="HiddenServiceExportCircuitID haproxy"
+fi
 
 umask 077
 cat > /tmp/torrc <<EOF
@@ -18,6 +26,7 @@ SocksPort 0
 ClientOnly 1
 HiddenServiceDir /var/lib/tor/goldfish
 HiddenServicePort 80 ${GOLDFISH_ONION_TARGET}
+${CIRCUIT_IDS}
 # Built-in defences against introduction-point flooding.
 HiddenServiceEnableIntroDoSDefense 1
 HiddenServicePoWDefensesEnabled 1

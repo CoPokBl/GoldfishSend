@@ -136,7 +136,7 @@ public sealed class AbuseTests {
     }
 
     [IntegrationFact]
-    public async Task PowRedemptions_ThatFailVerificationOrTheRateLimits_DontCountTowardLoad() {
+    public async Task PowRedemptions_ThatFailVerification_DontCountTowardLoad_ButRefusedValidOnesDo() {
         await using var node = NodeBehindProxy(ApiNode(Policy("create-ip", 1, 3600, 1), new Dictionary<string, string> {
             ["Goldfish__Pow__NetworkLoadThreshold"] = "1",
             ["Goldfish__Pow__MaxNetworkExtraDifficulty"] = "6",
@@ -165,12 +165,45 @@ public sealed class AbuseTests {
         }
         Assert.Equal(await DifficultyOf(reference), await DifficultyOf(client));
 
-        // One creation passes (one is not over the threshold of one), then valid proofs of work refused by create-ip.
+        // One creation passes (one is not over the threshold of one). Valid proofs of work that create-ip then refuses
+        // still count: they cost the server a verification, so a flood refused by the limits slows the flooder too.
         Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(client)).StatusCode);
-        for (var i = 0; i < 4; i++) {
+        Assert.Equal(await DifficultyOf(reference), await DifficultyOf(client));
+        for (var i = 0; i < 3; i++) {
             Assert.Equal((429, "rate_limited", "ip"), await ErrorOf(await CreateAsync(client)));
         }
-        Assert.Equal(await DifficultyOf(reference), await DifficultyOf(client));
+        Assert.Equal(await DifficultyOf(reference) + 3, await DifficultyOf(client));
+    }
+
+    [IntegrationFact]
+    public async Task PowLoad_CountsAgainstTheNetworkThatFetchedTheChallenge() {
+        await using var node = NodeBehindProxy(ApiNode(new Dictionary<string, string> {
+            ["Goldfish__Pow__NetworkLoadThreshold"] = "1",
+            ["Goldfish__Pow__MaxNetworkExtraDifficulty"] = "6",
+        }));
+        using var quiet = ClientFrom(node, "198.18.60.1");
+        using var busy = ClientFrom(node, "198.18.61.1");
+        using var reference = ClientFrom(node, "198.18.62.1");
+        var device = _f.Push.NewDevice();
+
+        // Challenges fetched from a quiet network and spent from a busy one raise the quiet network's difficulty too, so
+        // they can't be farmed at base difficulty.
+        for (var i = 0; i < 4; i++) {
+            var issued = await (await quiet.PostAsync("/v1/pow/challenge", null)).Content.ReadFromJsonAsync<JsonElement>();
+            var challenge = Base64Url.DecodeFromChars(issued.GetProperty("challenge").GetString());
+            var nonce = ProofOfWork.Solve(challenge, PowOf(issued));
+            var response = await busy.PostAsJsonAsync("/v1/mailboxes", new {
+                pow = new { challenge = B64(challenge), nonce = B64(nonce) },
+                sendSecret = B64(RandomNumberGenerator.GetBytes(32)),
+                ownerHash = B64(RandomNumberGenerator.GetBytes(32)),
+                endpoint = device.Url,
+                p256dh = B64(device.P256dh),
+                auth = B64(device.Auth),
+            });
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        }
+        Assert.Equal(await DifficultyOf(reference) + 3, await DifficultyOf(quiet));
+        Assert.Equal(await DifficultyOf(reference) + 3, await DifficultyOf(busy));
     }
 
     [IntegrationFact]
@@ -417,6 +450,42 @@ public sealed class AbuseTests {
     }
 
     [IntegrationFact]
+    public async Task UploadsRefusedPerAddress_DontSpendTheServerWideInviteBudget() {
+        // A period over an hour keys these buckets apart from the fixture node's.
+        await using var node = NodeBehindProxy(ApiNode(
+            Policy("invite-create-ip", 1, 7200, 1), Policy("invite-create-global", 2, 7200, 2)));
+        using var flooder = ClientFrom(node, "198.18.65.1");
+        using var honest = ClientFrom(node, "198.18.66.1");
+        var blob = RandomNumberGenerator.GetBytes(100);
+
+        Assert.Equal(HttpStatusCode.Created, (await flooder.PostAsync("/v1/invites", Octets(blob))).StatusCode);
+        for (var i = 0; i < 10; i++) {
+            Assert.Equal((429, "rate_limited", "ip"), await ErrorOf(await flooder.PostAsync("/v1/invites", Octets(blob))));
+        }
+        Assert.Equal(HttpStatusCode.Created, (await honest.PostAsync("/v1/invites", Octets(blob))).StatusCode);
+    }
+
+    [IntegrationFact]
+    public async Task OneNetwork_CanHoldOnlyItsShareOfTheLiveInvites() {
+        await using var node = NodeBehindProxy(ApiNode(new Dictionary<string, string> {
+            ["Goldfish__Invites__MaxLivePerNetwork"] = "2",
+            ["Goldfish__RateLimits__invite-create-ip__Limit"] = "1000",
+            ["Goldfish__RateLimits__invite-create-ip__Burst"] = "1000",
+            ["Goldfish__RateLimits__invite-create-net__Limit"] = "1000",
+            ["Goldfish__RateLimits__invite-create-net__Burst"] = "1000",
+        }));
+        using var a = ClientFrom(node, "198.18.67.1");
+        using var neighbour = ClientFrom(node, "198.18.67.2");
+        using var other = ClientFrom(node, "198.18.68.1");
+        var blob = RandomNumberGenerator.GetBytes(100);
+
+        Assert.Equal(HttpStatusCode.Created, (await a.PostAsync("/v1/invites", Octets(blob))).StatusCode);
+        Assert.Equal(HttpStatusCode.Created, (await neighbour.PostAsync("/v1/invites", Octets(blob))).StatusCode);
+        Assert.Equal((429, "rate_limited", "network"), await ErrorOf(await a.PostAsync("/v1/invites", Octets(blob))));
+        Assert.Equal(HttpStatusCode.Created, (await other.PostAsync("/v1/invites", Octets(blob))).StatusCode);
+    }
+
+    [IntegrationFact]
     public async Task CircuitBreaker_PausesAHostFailingForSeveralSubscribers_ThenCloses() {
         await using var push = new FakePushServer();
         await push.StartAsync("127.0.0.6");
@@ -455,10 +524,16 @@ public sealed class AbuseTests {
         await first.StartAsync("127.0.0.7");
         await using var second = new FakePushServer();
         await second.StartAsync("127.0.0.8");
+        await using var refusing = new FakePushServer();
+        await refusing.StartAsync("127.0.0.9");
         // A period under an hour keys the bucket daily, apart from the fixture's hourly one.
         var (factory, client) = Node(ApiNode(Policy("newhost-global", 1, 600, 1)));
         await using var node = factory;
 
+        // A host that refuses the push doesn't spend the server-wide budget, so junk host names can't drain it.
+        var junk = refusing.NewDevice();
+        junk.Status = 410;
+        Assert.Equal(HttpStatusCode.BadGateway, (await CreateAsync(client, junk)).StatusCode);
         Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(client, first.NewDevice())).StatusCode);
         var refusedDevice = second.NewDevice();
         Assert.Equal((429, "rate_limited", "global"), await ErrorOf(await CreateAsync(client, refusedDevice)));
@@ -466,6 +541,26 @@ public sealed class AbuseTests {
         // Hosts that already took a verification push aren't charged: real push services keep working.
         Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(client, first.NewDevice())).StatusCode);
         Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(client)).StatusCode);
+    }
+
+    [IntegrationFact]
+    public async Task NewHostBudget_IsCharged_PerNetwork() {
+        await using var junk = new FakePushServer();
+        await junk.StartAsync("127.0.0.10");
+        await using var other = new FakePushServer();
+        await other.StartAsync("127.0.0.11");
+        await using var real = new FakePushServer();
+        await real.StartAsync("127.0.0.12");
+        await using var node = NodeBehindProxy(ApiNode(Policy("newhost-net", 1, 600, 1)));
+        using var attacker = ClientFrom(node, "198.18.63.1");
+        using var honest = ClientFrom(node, "198.18.64.1");
+
+        // Every attempt at a new host costs the asking network, even one the host refuses, but no other network.
+        var refusing = junk.NewDevice();
+        refusing.Status = 410;
+        Assert.Equal(HttpStatusCode.BadGateway, (await CreateAsync(attacker, refusing)).StatusCode);
+        Assert.Equal((429, "rate_limited", "network"), await ErrorOf(await CreateAsync(attacker, other.NewDevice())));
+        Assert.Equal(HttpStatusCode.Accepted, (await CreateAsync(honest, real.NewDevice())).StatusCode);
     }
 
     [IntegrationFact]

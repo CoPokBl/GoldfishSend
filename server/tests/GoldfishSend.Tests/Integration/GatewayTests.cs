@@ -388,7 +388,9 @@ public sealed class GatewayTests {
         var ephemeral = mux.GetServers()[0].Keys(1, "gf:gwr:*").ToList();
         Assert.Empty(persistent);
         Assert.NotEmpty(ephemeral);
+        // Fixed-size Bloom filter slices and their counters, never one key per request.
+        Assert.InRange(ephemeral.Count, 1, 2 * GatewayReplayGuard.Slices);
         var ttl = await mux.GetDatabase(1).KeyTimeToLiveAsync(ephemeral[0]);
-        Assert.InRange(ttl!.Value.TotalSeconds, 1, GatewayReplayGuard.Retention.TotalSeconds);
+        Assert.InRange(ttl!.Value.TotalSeconds, 1, (GatewayReplayGuard.Slices + 1) * GatewayReplayGuard.SliceSeconds);
     }
 }

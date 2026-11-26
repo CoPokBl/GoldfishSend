@@ -99,7 +99,8 @@ public sealed class WebPushCryptoTests {
 
         var message = WebPushCrypto.Encrypt(plaintext, uaPublic, auth);
 
-        Assert.Equal(86 + size + 1 + 16, message.Length);
+        Assert.Contains(message.Length, WebPushCrypto.PaddedMessageSizes);
+        Assert.Equal(WebPushCrypto.PaddedMessageSizes.First(s => s >= 86 + size + 1 + 16), message.Length);
         Assert.Equal(4096u, BinaryPrimitives.ReadUInt32BigEndian(message.AsSpan(16)));
         Assert.Equal(65, message[20]);
         Assert.Equal(0x04, message[21]);

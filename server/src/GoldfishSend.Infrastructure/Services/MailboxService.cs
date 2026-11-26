@@ -22,6 +22,9 @@ public sealed record NewEndpoint(string Url, byte[] P256dh, byte[] Auth) {
 }
 
 public sealed class MailboxService {
+    private static readonly byte[] GlobalSubject = "global"u8.ToArray();
+    private static readonly byte[] NewHostSubject = "newhost"u8.ToArray();
+
     private readonly MailboxCrypto _crypto;
     private readonly MailboxRepository _mailboxes;
     private readonly EndpointValidator _validator;
@@ -35,10 +38,12 @@ public sealed class MailboxService {
     private readonly ClusterSecret _secret;
 
     /// <summary>
-    /// Verification pushes are padded to the size of a typical message so a push provider can't count mailbox creations
-    /// (a proxy for how many contacts a device has) by size. The code is the first 16 bytes of the body.
+    /// The size of a short text message's body, so a verification push carries what a message would. The Web Push layer
+    /// then pads every push to the same few sizes (<see cref="WebPushCrypto.PaddedRecordLength"/>), and the push TTL is
+    /// a fresh message's, so a push provider can't count mailbox creations (a proxy for how many contacts a device has)
+    /// by size or TTL. The code is the first 16 bytes of the body, and the rest is random.
     /// </summary>
-    public const int VerificationBodySize = 1024;
+    public const int VerificationBodySize = 512;
 
     public MailboxService(
         MailboxCrypto crypto, MailboxRepository mailboxes, EndpointValidator validator, PushClient push, PowService pow,
@@ -83,26 +88,22 @@ public sealed class MailboxService {
         }
 
         // The proof of work is checked first: requests without one never touch the address budgets, so junk from a shared
-        // address (Tor exit, CGNAT) can't lock everyone behind it out of creating mailboxes.
+        // address (Tor exit, CGNAT) can't lock everyone behind it out of creating mailboxes. A valid one counts toward the
+        // load of the network that asked for it and of this one (PowService.RedeemAsync), even if a limit below refuses
+        // the creation, so a flood slows the flooder.
         if (ServiceError.FromPow(await _pow.RedeemAsync(powChallenge, powNonce, client, PowPurpose.Create, ct)) is { } powError) {
             return powError;
         }
-        foreach (var (policy, subject) in new[] {
-                     (RatePolicies.CreateGlobal, "global"u8.ToArray()),
-                     (RatePolicies.CreatePerAllocation, client.Allocation),
-                     (RatePolicies.CreatePerNetwork, client.Network),
-                     (RatePolicies.CreatePerIp, client.Host),
-                 }) {
-            if (subject is null) {
-                continue; // IPv4 has no /32 tier.
-            }
-            var limit = await _limiter.CheckAsync(policy, subject, failOpen: false);
-            if (!limit.Allowed) {
-                return ServiceError.RateLimited(limit);
-            }
+        // All or nothing: a creation refused by a narrow limit doesn't use up the network's or the server's budget.
+        var limit = await _limiter.CheckAllAsync([
+            new RateScope(RatePolicies.CreateGlobal, GlobalSubject),
+            new RateScope(RatePolicies.CreatePerAllocation, client.Allocation),
+            new RateScope(RatePolicies.CreatePerNetwork, client.Network),
+            new RateScope(RatePolicies.CreatePerIp, client.Host),
+        ], failOpen: false);
+        if (!limit.Allowed) {
+            return ServiceError.RateLimited(limit);
         }
-        // Raises this network's difficulty only. Server-wide load counts verified mailboxes (VerifyAsync).
-        await _pow.CountCreationAsync(client);
 
         var id = _crypto.MailboxId(sendSecret);
         var sealKey = _crypto.SealKey(sendSecret);
@@ -116,7 +117,7 @@ public sealed class MailboxService {
                 return ServiceError.MailboxExists;
             }
 
-            if (await SendVerificationAsync(record, MailboxCrypto.Tag(sendSecret), code, ct) is { } pushError) {
+            if (await SendVerificationAsync(record, MailboxCrypto.Tag(sendSecret), code, client, ct) is { } pushError) {
                 await _mailboxes.DeleteAsync(id, ct);
                 return pushError;
             }
@@ -144,12 +145,11 @@ public sealed class MailboxService {
         if (rows.Any(r => r.State == MailboxState.PendingVerification)) {
             return ServiceError.NotFound;
         }
-        // Each rotation makes us POST to a new, arbitrary URL, so it's budgeted per mailbox as well as per IP.
-        foreach (var id in ids) {
-            var decision = await _limiter.CheckAsync(RatePolicies.RotatePerMailbox, id);
-            if (!decision.Allowed) {
-                return ServiceError.RateLimited(decision);
-            }
+        // Each rotation makes us POST to a new, arbitrary URL, so it's budgeted per mailbox as well as per IP. All or
+        // nothing, so a batch refused for one mailbox doesn't spend the others' budgets.
+        var rotate = await _limiter.CheckAllAsync(ids.Select(id => new RateScope(RatePolicies.RotatePerMailbox, id)).ToList());
+        if (!rotate.Allowed) {
+            return ServiceError.RateLimited(rotate);
         }
 
         var record = new EndpointRecord(endpoint.Url, endpoint.P256dh, endpoint.Auth);
@@ -165,7 +165,7 @@ public sealed class MailboxService {
                 return ServiceError.NotFound;
             }
 
-            if (await SendVerificationAsync(record, MailboxCrypto.Tag(items[0].SendSecret), code, ct) is { } pushError) {
+            if (await SendVerificationAsync(record, MailboxCrypto.Tag(items[0].SendSecret), code, client, ct) is { } pushError) {
                 await _mailboxes.CancelRotationAsync(ids, ct);
                 return pushError;
             }
@@ -260,15 +260,15 @@ public sealed class MailboxService {
                 return ServiceError.InvalidRequest;
             }
         }
-        // The network budget is always charged. The per-address budget is only peeked here, and charged when the
+        // The network and /32 budgets are always charged. The per-address budget is only peeked here, and charged when the
         // request fails ownership or verification (OwnerFailureAsync). Legitimate owners behind a shared address are
         // therefore never locked out by someone else's junk, while guessing stays limited.
-        var net = await _limiter.CheckAsync(RatePolicies.OwnerPerNetwork, client.Network);
-        if (!net.Allowed) {
-            return ServiceError.RateLimited(net);
-        }
-        var ip = await _limiter.CheckAsync(RatePolicies.OwnerPerIp, client.Host, cost: 0);
-        return ip.Allowed ? null : ServiceError.RateLimited(ip);
+        var limit = await _limiter.CheckAllAsync([
+            new RateScope(RatePolicies.OwnerPerAllocation, client.Allocation),
+            new RateScope(RatePolicies.OwnerPerNetwork, client.Network),
+            new RateScope(RatePolicies.OwnerPerIp, client.Host, Cost: 0),
+        ]);
+        return limit.Allowed ? null : ServiceError.RateLimited(limit);
     }
 
     private async Task<ServiceError> OwnerFailureAsync(ServiceError error, ClientSubject client) {
@@ -303,19 +303,31 @@ public sealed class MailboxService {
     }
 
     /// <returns>Null when the push service accepted it, otherwise the error to return.</returns>
-    private async Task<ServiceError?> SendVerificationAsync(EndpointRecord record, byte[] tag, byte[] code, CancellationToken ct) {
-        // Every create or rotation makes us POST to a URL the client chose. Hosts no mailbox has used before get their own
-        // small server-wide budget, so this can't be turned into a bulk "send requests to arbitrary sites" service.
+    private async Task<ServiceError?> SendVerificationAsync(
+        EndpointRecord record, byte[] tag, byte[] code, ClientSubject client, CancellationToken ct) {
+        // Every create or rotation makes us POST to a URL the client chose. Push hosts no mailbox has used before have
+        // their own small budgets, so this can't be turned into a bulk "send requests to arbitrary sites" service. Hosts
+        // are grouped by registrable domain, so a wildcard domain counts once. The client's network and /32 pay for every
+        // attempt. The server-wide budget is only checked here and charged once the host has accepted the push, so junk or
+        // unreachable host names can't drain it for everyone. Well-known push services never count as new, so a restart
+        // of the ephemeral Redis (which forgets every seen host) doesn't put all users behind the server-wide budget.
         var host = Uri.TryCreate(record.Url, UriKind.Absolute, out var uri) ? uri.IdnHost.ToLowerInvariant() : "";
-        var seenKey = RedisKeys.HostSeen(await _secret.HmacHexAsync("host-seen", System.Text.Encoding.UTF8.GetBytes(host)));
-        var seen = false;
-        try {
-            seen = await _ephemeral.Db.KeyExistsAsync(seenKey);
-        } catch (Exception ex) when (ex is StackExchange.Redis.RedisException or TimeoutException) {
-            // Treat as unseen (charged below).
+        var seenKey = RedisKeys.HostSeen(await _secret.HmacHexAsync(
+            "host-seen", System.Text.Encoding.UTF8.GetBytes(HostGrouping.BaseDomain(host))));
+        var seen = HostGrouping.IsWithin(host, _options.Push.KnownHosts);
+        if (!seen) {
+            try {
+                seen = await _ephemeral.Db.KeyExistsAsync(seenKey);
+            } catch (Exception ex) when (ex is StackExchange.Redis.RedisException or TimeoutException) {
+                // Treat as unseen (charged below).
+            }
         }
         if (!seen) {
-            var budget = await _limiter.CheckAsync(RatePolicies.NewHostGlobal, "newhost"u8.ToArray());
+            var budget = await _limiter.CheckAllAsync([
+                new RateScope(RatePolicies.NewHostGlobal, NewHostSubject, Cost: 0),
+                new RateScope(RatePolicies.NewHostPerAllocation, client.Allocation),
+                new RateScope(RatePolicies.NewHostPerNetwork, client.Network),
+            ]);
             if (!budget.Allowed) {
                 return ServiceError.RateLimited(budget);
             }
@@ -326,17 +338,24 @@ public sealed class MailboxService {
         RandomNumberGenerator.Fill(body.AsSpan(code.Length));
         var envelope = PushEnvelope.Build(PushType.Verification, tag, body);
         try {
-            var ttl = _options.Mailboxes.VerificationMinutes * 60;
+            // The TTL a message sent now with the default TTL would get on its first push. The app ignores a code that
+            // arrives after the verification deadline, so the longer TTL costs nothing.
+            var now = DateTime.UtcNow;
+            var ttl = (int)(HeldExpiry.At(now, _options.Messages.DefaultTtlSeconds) - now).TotalSeconds;
             var result = await _push.SendAsync(record, envelope, ttl, ct);
             if (result.Status != PushStatus.Delivered) {
                 _logger.LogInformation("Verification push not accepted: {Status}", result.Status);
             }
             switch (result.Status) {
                 case PushStatus.Delivered:
-                    try {
-                        await _ephemeral.Db.StringSetAsync(seenKey, 1, TimeSpan.FromDays(30));
-                    } catch (Exception ex) when (ex is StackExchange.Redis.RedisException or TimeoutException) {
-                        // Only affects the new-host budget.
+                    if (!seen) {
+                        try {
+                            await _ephemeral.Db.StringSetAsync(seenKey, 1, TimeSpan.FromDays(30));
+                        } catch (Exception ex) when (ex is StackExchange.Redis.RedisException or TimeoutException) {
+                            // Only affects the new-host budget.
+                        }
+                        // The verdict doesn't matter: the push has gone. Concurrent first pushes can overshoot by a few.
+                        await _limiter.CheckAsync(RatePolicies.NewHostGlobal, NewHostSubject);
                     }
                     return null;
                 case PushStatus.Deferred:

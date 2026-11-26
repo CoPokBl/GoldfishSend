@@ -99,27 +99,28 @@ public sealed class MessageService {
     }
 
     /// <summary>
-    /// Client limits run widest first (network, then address), so one allocation can't multiply its budget by rotating
-    /// addresses. Shared-address users (Tor, CGNAT) who hit either can pay with a proof of work instead.
+    /// Client limits: the IPv6 /32, the network and the address, all or nothing, so a request refused by one never
+    /// uses up another (and one allocation can't multiply its budget by rotating addresses). Shared-address users (Tor,
+    /// CGNAT) who hit any of them can pay with a proof of work instead.
     /// </summary>
     private async Task<ServiceError?> ChargeClientAsync(ClientSubject client, PowToken? pow, int cost) {
-        foreach (var (policy, subject) in new[] { (RatePolicies.SendPerNetwork, client.Network), (RatePolicies.SendPerIp, client.Host) }) {
-            var decision = await _limiter.CheckAsync(policy, subject, cost: cost);
-            if (!decision.Allowed) {
-                if (pow is null) {
-                    return ServiceError.RateLimited(decision);
-                }
-                // Paying a send limit never counts toward the creation load, so heavy senders can't make onboarding harder.
-                switch (await _pow.RedeemAsync(pow.Challenge, pow.Nonce, client, PowPurpose.Send)) {
-                    case PowRedemption.Busy:
-                        return ServiceError.PowBusy;
-                    case PowRedemption.Invalid:
-                        return ServiceError.RateLimited(decision);
-                }
-                break; // A valid PoW pays for this request at every client scope.
-            }
+        var decision = await _limiter.CheckAllAsync([
+            new RateScope(RatePolicies.SendPerAllocation, client.Allocation, cost),
+            new RateScope(RatePolicies.SendPerNetwork, client.Network, cost),
+            new RateScope(RatePolicies.SendPerIp, client.Host, cost),
+        ]);
+        if (decision.Allowed) {
+            return null;
         }
-        return null;
+        if (pow is null) {
+            return ServiceError.RateLimited(decision);
+        }
+        // Paying a send limit never counts toward the creation load, so heavy senders can't make onboarding harder.
+        return await _pow.RedeemAsync(pow.Challenge, pow.Nonce, client, PowPurpose.Send) switch {
+            PowRedemption.Busy => ServiceError.PowBusy,
+            PowRedemption.Invalid => ServiceError.RateLimited(decision),
+            _ => null, // A valid PoW pays for this request at every client scope.
+        };
     }
 
     private async Task<ServiceResult<byte[]>> AcceptItemAsync(
@@ -145,12 +146,11 @@ public sealed class MessageService {
             return original;
         }
 
-        // These limits protect the recipient from a hostile contact flooding them.
-        foreach (var policy in new[] { RatePolicies.SendPerMailboxDaily, RatePolicies.SendPerMailbox }) {
-            var decision = await _limiter.CheckAsync(policy, mailboxId);
-            if (!decision.Allowed) {
-                return ServiceError.RateLimited(decision);
-            }
+        // These limits protect the recipient from a hostile contact flooding them. Only peeked here (a spent budget
+        // saves the held-count query), and charged below with the global budget once the message will be accepted.
+        var recipient = await _limiter.CheckAllAsync(RecipientScopes(mailboxId, cost: 0));
+        if (!recipient.Allowed) {
+            return ServiceError.RateLimited(recipient);
         }
 
         // Bounded holding: an offline or dead recipient can't be used to fill our disk.
@@ -166,10 +166,14 @@ public sealed class MessageService {
             return ServiceError.StorageFull;
         }
 
-        // Charged last, only for messages that are about to be accepted. Junk can't drain the shared budget.
-        var global = await _limiter.CheckAsync(RatePolicies.SendGlobal, GlobalSubject);
-        if (!global.Allowed) {
-            return ServiceError.RateLimited(global);
+        // Charged last, only for messages that are about to be accepted, and all or nothing: junk can't drain the shared
+        // budget, and a message the server-wide budget refuses doesn't use up the recipient's.
+        var charged = await _limiter.CheckAllAsync([
+            ..RecipientScopes(mailboxId, cost: 1),
+            new RateScope(RatePolicies.SendGlobal, GlobalSubject),
+        ]);
+        if (!charged.Allowed) {
+            return ServiceError.RateLimited(charged);
         }
 
         var messageId = RandomNumberGenerator.GetBytes(ProtocolLimits.MessageIdSize);
@@ -187,7 +191,7 @@ public sealed class MessageService {
         if (gone) {
             ttl = Math.Min(ttl, Math.Max(_options.Messages.MinTtlSeconds, _options.Messages.GoneMaxTtlSeconds));
         }
-        var expiresAt = WholeSeconds(DateTime.UtcNow.AddSeconds(ttl));
+        var expiresAt = HeldExpiry.At(DateTime.UtcNow, ttl);
 
         var sealKey = _crypto.SealKey(sendSecret);
         var envelope = PushEnvelope.Build(PushType.Message, MailboxCrypto.Tag(sendSecret), body);
@@ -200,7 +204,8 @@ public sealed class MessageService {
             } else {
                 // The hot queue is full (a backlog) or Redis is out of memory: hand the job straight to the durable
                 // held-message table, due now. It's delivered the same way, just through the retry worker.
-                await _pending.UpsertAsync(job.Id, job.MailboxId, job.KeyEpoch, job.Blob, 0, DateTime.UtcNow, job.ExpiresAt, ct);
+                await _pending.UpsertAsync(
+                    job.Id, job.MailboxId, job.KeyEpoch, job.Blob, 0, HeldExpiry.DueNow(DateTime.UtcNow), job.ExpiresAt, ct);
                 await _signal.NotifyRetryAsync();
                 _spilled.Add(1);
             }
@@ -216,8 +221,8 @@ public sealed class MessageService {
         return messageId;
     }
 
-    /// <summary>MySQL DATETIME has whole-second precision, and the expiry is bound into the job's AAD, so it must round-trip exactly.</summary>
-    internal static DateTime WholeSeconds(DateTime utc) {
-        return new DateTime(utc.Ticks - utc.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc);
-    }
+    private static RateScope[] RecipientScopes(byte[] mailboxId, int cost) => [
+        new RateScope(RatePolicies.SendPerMailboxDaily, mailboxId, cost),
+        new RateScope(RatePolicies.SendPerMailbox, mailboxId, cost),
+    ];
 }

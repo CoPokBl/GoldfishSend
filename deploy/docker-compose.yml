@@ -29,7 +29,8 @@
 #             SSRF-filtered in the app (private, loopback, link-local, metadata ranges are refused).
 #   onion     caddy + the optional tor container (profile "onion"). Not internal, because tor needs to
 #             reach the Tor network. Deliberately NOT in TrustedProxies: tor talks to Caddy's onion-only
-#             listener, never to the api, so it can't spoof X-Forwarded-For.
+#             listener, so it can't spoof X-Forwarded-For. With docker-compose.onion-circuits.yml (optional)
+#             the api joins it too, and tor talks to the api's onion listener directly.
 #
 # Optional onion service
 #   docker compose --profile onion up -d --build

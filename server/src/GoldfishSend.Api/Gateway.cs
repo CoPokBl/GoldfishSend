@@ -55,7 +55,8 @@ public sealed class GatewayMiddleware {
             await HandleAsync(context);
             return;
         }
-        if (request.Path.StartsWithSegments("/v1", StringComparison.OrdinalIgnoreCase)) {
+        // The onion listener serves the gateway only, as Caddy's onion route does: no health endpoints.
+        if (request.Path.StartsWithSegments("/v1", StringComparison.OrdinalIgnoreCase) || OnionCircuits.From(context) is not null) {
             await PlainErrorAsync(context, 404, "not_found");
             return;
         }
@@ -64,7 +65,7 @@ public sealed class GatewayMiddleware {
 
     private async Task HandleAsync(HttpContext context) {
         var request = context.Request;
-        if (!_flood.TryAcquire(Endpoints.HttpHelpers.Subject(context))) {
+        if (!_flood.TryAcquire(Endpoints.HttpHelpers.Subject(context), OnionCircuits.From(context))) {
             context.Response.Headers.RetryAfter = "1";
             context.Response.StatusCode = 429;
             context.Response.ContentType = "application/json; charset=utf-8";

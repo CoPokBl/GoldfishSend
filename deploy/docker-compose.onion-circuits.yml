@@ -1,0 +1,30 @@
+# Optional, off unless you add this file: per-Tor-circuit gateway flood buckets for the onion service.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.onion-circuits.yml --profile onion up -d --build
+#   # behind Traefik: -f docker-compose.yml -f docker-compose.traefik.yml -f docker-compose.onion-circuits.yml
+#
+# Without it, every onion client reaches the api from the Tor container's address, so they all share one gateway
+# flood-guard bucket, and any one of them can use it up for everyone. With it, Tor starts each connection with a PROXY
+# protocol line naming the circuit it came in on (HiddenServiceExportCircuitID haproxy), and the api gives every
+# circuit its own bucket inside one onion-wide bucket (Goldfish:Network:GatewayOnionFactor times a client's). Clients
+# can't choose the circuit id, and rate limits past the gateway still see all onion clients as one address.
+#
+# Trade-offs:
+#   - Onion traffic goes straight to the api's onion listener instead of through Caddy. The api's own limits apply, and
+#     that listener serves only /v1/gw and /v1/key.
+#   - The api needs a fixed address on the onion network (GOLDFISH_ONION_API_IP), so it can't be scaled with
+#     `--scale api=N` while this is on.
+
+services:
+  api:
+    networks:
+      onion:
+        ipv4_address: "${GOLDFISH_ONION_API_IP:-172.30.251.3}"
+    environment:
+      # Bound to the onion network only: whoever can connect here can name any circuit.
+      Goldfish__Network__OnionCircuitEndpoint: "${GOLDFISH_ONION_API_IP:-172.30.251.3}:8081"
+
+  tor:
+    environment:
+      GOLDFISH_ONION_CIRCUIT_IDS: "1"
+      GOLDFISH_ONION_TARGET: "${GOLDFISH_ONION_API_IP:-172.30.251.3}:8081"
