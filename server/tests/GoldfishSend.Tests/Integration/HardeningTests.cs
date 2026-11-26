@@ -32,8 +32,8 @@ public sealed class HardeningTests {
         var mailbox = new Mailbox(RandomNumberGenerator.GetBytes(32), RandomNumberGenerator.GetBytes(32), device);
         Assert.Equal(HttpStatusCode.Accepted, (await _f.RequestMailboxAsync(mailbox.SendSecret, mailbox.OwnerSecret, device)).StatusCode);
         var (_, _, body) = await device.NextAsync();
-        // Same size as a typical message, so push providers can't count mailbox creations by size.
-        Assert.Equal(1024, body.Length);
+        // A short message's body. The Web Push layer pads it like every message (WebPushCryptoTests).
+        Assert.Equal(GoldfishSend.Infrastructure.Services.MailboxService.VerificationBodySize, body.Length);
         Assert.Equal(HttpStatusCode.OK, (await _f.VerifyAsync([mailbox], body[..16])).StatusCode);
     }
 

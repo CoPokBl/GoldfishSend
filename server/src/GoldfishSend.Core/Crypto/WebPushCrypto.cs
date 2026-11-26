@@ -5,7 +5,7 @@ namespace GoldfishSend.Core.Crypto;
 
 /// <summary>
 /// RFC 8291 Web Push message encryption using the RFC 8188 "aes128gcm" content coding,
-/// as a single record.
+/// as a single record, padded to one of a few fixed sizes (<see cref="PaddedRecordLength"/>).
 /// </summary>
 public static class WebPushCrypto {
     public const int RecordSize = 4096;
@@ -22,21 +22,49 @@ public static class WebPushCrypto {
     private static readonly byte[] CekInfo = "Content-Encoding: aes128gcm\0"u8.ToArray();
     private static readonly byte[] NonceInfo = "Content-Encoding: nonce\0"u8.ToArray();
 
+    /// <summary>The sizes a whole push message is padded up to. The largest is <see cref="RecordSize"/>.</summary>
+    public static readonly int[] PaddedMessageSizes = [1024, 2048, 3072, RecordSize];
+
     public static byte[] Encrypt(ReadOnlySpan<byte> plaintext, ReadOnlySpan<byte> uaPublic, ReadOnlySpan<byte> authSecret) {
+        if (plaintext.Length > MaxPlaintextSize) {
+            throw new ArgumentException($"Plaintext exceeds {MaxPlaintextSize} bytes.", nameof(plaintext));
+        }
         using var asKey = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var salt = RandomNumberGenerator.GetBytes(SaltSize);
-        return Encrypt(plaintext, uaPublic, authSecret, asKey, salt);
+        return Encrypt(plaintext, uaPublic, authSecret, asKey, salt, PaddedRecordLength(plaintext.Length));
+    }
+
+    /// <summary>
+    /// The length of the record's content (plaintext, the 0x02 delimiter and zero padding, RFC 8188 section 2) that makes
+    /// the whole message the smallest of <see cref="PaddedMessageSizes"/> it fits. Push services (and anyone watching
+    /// them) then see only a few sizes, so they can't tell a verification push from a message, a new session's first
+    /// message from the rest, or a group message from a one-to-one one by its length. Receivers strip the padding.
+    /// </summary>
+    public static int PaddedRecordLength(int plaintextLength) {
+        foreach (var size in PaddedMessageSizes) {
+            var content = size - HeaderSize - TagSize;
+            if (plaintextLength + 1 <= content) {
+                return content;
+            }
+        }
+        return plaintextLength + 1;
     }
 
     /// <summary>Deterministic variant for test vectors. Never reuse <paramref name="asKey"/> or <paramref name="salt"/>.</summary>
+    /// <param name="recordLength">The record content length, at least <c>plaintext + 1</c>. 0 means no padding.</param>
     internal static byte[] Encrypt(
         ReadOnlySpan<byte> plaintext,
         ReadOnlySpan<byte> uaPublic,
         ReadOnlySpan<byte> authSecret,
         ECDiffieHellman asKey,
-        byte[] salt) {
+        byte[] salt,
+        int recordLength = 0) {
         if (plaintext.Length > MaxPlaintextSize) {
             throw new ArgumentException($"Plaintext exceeds {MaxPlaintextSize} bytes.", nameof(plaintext));
+        }
+        recordLength = Math.Max(recordLength, plaintext.Length + 1);
+        if (HeaderSize + recordLength + TagSize > RecordSize) {
+            throw new ArgumentException($"A padded record exceeds {RecordSize} bytes.", nameof(recordLength));
         }
         if (authSecret.Length != AuthSecretSize) {
             throw new ArgumentException("Auth secret must be 16 bytes.", nameof(authSecret));
@@ -51,7 +79,7 @@ public static class WebPushCrypto {
 
         var (cek, nonce) = DeriveKeys(ecdhSecret, authSecret, uaPublic, asPublic, salt);
         try {
-            var output = new byte[HeaderSize + plaintext.Length + 1 + TagSize];
+            var output = new byte[HeaderSize + recordLength + TagSize];
             var span = output.AsSpan();
 
             salt.CopyTo(span);
@@ -59,10 +87,10 @@ public static class WebPushCrypto {
             span[SaltSize + 4] = PublicKeySize;
             asPublic.CopyTo(span[(SaltSize + 5)..]);
 
-            // Single (and therefore last) record: plaintext ‖ 0x02, no extra padding.
-            var padded = new byte[plaintext.Length + 1];
+            // Single (and therefore last) record: plaintext ‖ 0x02 ‖ zero padding.
+            var padded = new byte[recordLength];
             plaintext.CopyTo(padded);
-            padded[^1] = 0x02;
+            padded[plaintext.Length] = 0x02;
 
             using var gcm = new AesGcm(cek, TagSize);
             gcm.Encrypt(

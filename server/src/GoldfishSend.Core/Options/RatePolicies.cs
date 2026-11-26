@@ -3,6 +3,7 @@ namespace GoldfishSend.Core.Options;
 public static class RatePolicies {
     public const string SendPerIp = "send-ip";
     public const string SendPerNetwork = "send-net";
+    public const string SendPerAllocation = "send-alloc";
     /// <summary>All sends that reach the database lookup, server-wide. It protects MySQL from floods of junk send tokens.</summary>
     public const string SendLookupGlobal = "send-lookup-global";
     public const string SendPerMailbox = "send-mailbox";
@@ -13,16 +14,24 @@ public static class RatePolicies {
     /// <summary>Per IPv6 /32. Much looser than <see cref="CreatePerNetwork"/>: it only stops one actor with thousands of /48s.</summary>
     public const string CreatePerAllocation = "create-alloc";
     public const string CreateGlobal = "create-global";
-    /// <summary>Verification pushes to push hosts no mailbox has used before, server-wide.</summary>
+    /// <summary>
+    /// Verification pushes to push hosts (grouped by registrable domain) no mailbox has used before, server-wide. Only
+    /// pushes the host accepted are charged, so junk host names can't drain it.
+    /// </summary>
     public const string NewHostGlobal = "newhost-global";
+    /// <summary>The same per client network and IPv6 /32, charged for every attempt, so one actor can't take the global share.</summary>
+    public const string NewHostPerNetwork = "newhost-net";
+    public const string NewHostPerAllocation = "newhost-alloc";
     public const string PowPerIp = "pow-ip";
     public const string PowPerNetwork = "pow-net";
     public const string PowPerAllocation = "pow-alloc";
     public const string OwnerPerIp = "owner-ip";
     public const string OwnerPerNetwork = "owner-net";
+    public const string OwnerPerAllocation = "owner-alloc";
     public const string RotatePerMailbox = "rotate-mailbox";
     public const string InviteCreatePerIp = "invite-create-ip";
     public const string InviteCreatePerNetwork = "invite-create-net";
+    public const string InviteCreatePerAllocation = "invite-create-alloc";
     public const string InviteCreateGlobal = "invite-create-global";
     public const string InviteFetchPerIp = "invite-fetch-ip";
     public const string InviteFetchPerNetwork = "invite-fetch-net";
@@ -37,6 +46,8 @@ public static class RatePolicies {
     public static readonly IReadOnlyDictionary<string, RatePolicy> Defaults = new Dictionary<string, RatePolicy> {
         [SendPerIp] = new(60, 60, 20),
         [SendPerNetwork] = new(600, 60, 200),
+        // 5x one /48. It keeps one actor with many /48s from taking the whole send-lookup-global budget alone.
+        [SendPerAllocation] = new(3000, 60, 1000),
         [SendLookupGlobal] = new(3000, 1, 6000),
         [SendPerMailbox] = new(30, 60, 30),
         [SendPerMailboxDaily] = new(1000, 86400, 1000),
@@ -51,14 +62,18 @@ public static class RatePolicies {
         // everyone out. Floods are slowed by the per-address limits and the per-network PoW difficulty instead.
         [CreateGlobal] = new(30000, 3600, 3000),
         [NewHostGlobal] = new(120, 3600, 30),
+        [NewHostPerNetwork] = new(10, 3600, 5),
+        [NewHostPerAllocation] = new(40, 3600, 20),
         [PowPerIp] = new(30, 60, 30),
         [PowPerNetwork] = new(300, 60, 100),
         [PowPerAllocation] = new(3000, 60, 1000),
         [OwnerPerIp] = new(30, 60, 30),
         [OwnerPerNetwork] = new(300, 60, 100),
+        [OwnerPerAllocation] = new(1500, 60, 500),
         [RotatePerMailbox] = new(10, 86400, 5),
         [InviteCreatePerIp] = new(20, 3600, 10),
         [InviteCreatePerNetwork] = new(100, 3600, 30),
+        [InviteCreatePerAllocation] = new(500, 3600, 150),
         [InviteCreateGlobal] = new(5, 1, 50),
         [InviteFetchPerIp] = new(60, 60, 20),
         [InviteFetchPerNetwork] = new(300, 60, 100),
@@ -77,7 +92,9 @@ public static class RatePolicies {
     /// </summary>
     public static string ScopeOf(string policy) => policy switch {
         SendPerIp or CreatePerIp or PowPerIp or OwnerPerIp or InviteCreatePerIp or InviteFetchPerIp => ScopeIp,
-        SendPerNetwork or CreatePerNetwork or CreatePerAllocation or PowPerNetwork or PowPerAllocation or OwnerPerNetwork or InviteCreatePerNetwork or InviteFetchPerNetwork => ScopeNetwork,
+        SendPerNetwork or SendPerAllocation or CreatePerNetwork or CreatePerAllocation or PowPerNetwork or PowPerAllocation
+            or OwnerPerNetwork or OwnerPerAllocation or InviteCreatePerNetwork or InviteCreatePerAllocation or InviteFetchPerNetwork
+            or NewHostPerNetwork or NewHostPerAllocation => ScopeNetwork,
         SendPerMailbox or SendPerMailboxDaily or RotatePerMailbox or PushPerMailbox => ScopeMailbox,
         _ => ScopeGlobal,
     };

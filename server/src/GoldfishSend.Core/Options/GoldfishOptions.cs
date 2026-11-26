@@ -114,10 +114,17 @@ public sealed class PowOptions {
     public int GlobalLoadThresholdPerMinute { get; set; } = 120;
     public int MaxGlobalExtraDifficulty { get; set; } = 2;
     /// <summary>
-    /// Argon2 verifications running at once per process. 0 means one per CPU. One network (/24 or /48) may hold at most a
-    /// quarter of them and one IPv6 /32 at most half (at least one each), so junk from one place can't take them all.
+    /// Argon2 verifications running at once per process. 0 means one per two CPUs (at least one), which leaves the rest for
+    /// the gateway and the API even when junk keeps every slot busy. One network (/24 or /48) may hold at most a quarter of
+    /// them and one IPv6 /32 at most half (at least one each), so junk from one place can't take them all.
     /// </summary>
     public int MaxConcurrentVerifications { get; set; }
+    /// <summary>
+    /// Extra <c>pow-net</c> and <c>pow-alloc</c> tokens charged to the network that was issued a challenge when a wrong
+    /// solution to it costs a verification. Junk solutions then soon stop the network that asked for them getting more
+    /// challenges, while an honest client (which never sends one) pays nothing. 0 turns it off.
+    /// </summary>
+    public int InvalidSolutionPenalty { get; set; } = 10;
 }
 
 public sealed class PushOptions {
@@ -127,6 +134,14 @@ public sealed class PushOptions {
     public string[] BlockedHosts { get; set; } = [];
     /// <summary>Extra CIDRs to refuse, for example this server's own public addresses.</summary>
     public string[] ExtraBlockedRanges { get; set; } = [];
+    /// <summary>
+    /// Well-known push services (and their subdomains) that never count against the new-push-host budgets
+    /// (<c>newhost-*</c>). Those budgets remember the hosts they've seen only in the ephemeral Redis, so without this
+    /// list a restart of it would put every user behind the small server-wide budget. Setting it replaces the defaults.
+    /// </summary>
+    public string[] KnownHosts { get; set; } = [
+        "ntfy.sh", "fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com",
+    ];
     public int ConnectTimeoutSeconds { get; set; } = 5;
     /// <summary>
     /// How long a push server may take to answer once connected. The push deadline is
@@ -172,6 +187,14 @@ public sealed class InviteOptions {
     /// Uploads beyond it get <c>429</c> (scope <c>global</c>) until older invites are fetched or expire.
     /// </summary>
     public int MaxLiveInvites { get; set; } = 20_000;
+    /// <summary>
+    /// The most live invites one network (IPv4 /24, IPv6 /48) may hold, so a few networks can't fill
+    /// <see cref="MaxLiveInvites"/> for everyone. Counted until each invite would expire, even once fetched. Uploads beyond
+    /// it get <c>429</c> (scope <c>network</c>). 0 turns it off.
+    /// </summary>
+    public int MaxLivePerNetwork { get; set; } = 400;
+    /// <summary>The same for an IPv6 /32, which can hold a whole ISP's customers. 0 turns it off.</summary>
+    public int MaxLivePerAllocation { get; set; } = 2_000;
 }
 
 public enum EpochKeyStore {
@@ -197,18 +220,38 @@ public sealed class NetworkOptions {
 
     /// <summary>
     /// Gateway requests per second per client (IPv4 address or IPv6 /64) on each API node, before any decryption. 0 turns
-    /// it off. Onion clients all share the Tor container's address, so raise it if a large onion user base hits it.
+    /// it off. Onion clients all share the Tor container's address unless <see cref="OnionCircuitEndpoint"/> is set, so
+    /// without it raise this if a large onion user base hits it.
     /// </summary>
     public double GatewayRequestsPerSecond { get; set; } = 50;
     public int GatewayBurst { get; set; } = 200;
 
     /// <summary>
-    /// How many clients the gateway flood guard tracks on each API node (about 200 bytes each). One IPv6 allocation holds
-    /// many /64s, so without a cap a client could add an entry per request. Clients seen once the table is full share
-    /// one overflow bucket, <see cref="GatewayOverflowFactor"/> times the size of a client's, until idle entries expire.
+    /// The gateway bucket of a whole network (IPv4 /24, IPv6 /48), and of an IPv6 /32, as multiples of a client's. Every
+    /// request is charged at all three, so one allocation can't multiply its decryption budget by rotating addresses.
+    /// </summary>
+    public int GatewayNetworkFactor { get; set; } = 4;
+    public int GatewayAllocationFactor { get; set; } = 20;
+
+    /// <summary>
+    /// How many clients, networks and /32s the gateway flood guard tracks on each API node (each table, about 200 bytes
+    /// an entry). A client that finds no room is charged only at its network and /32 (one network may hold at most 256
+    /// clients, one /32 at most 64 networks). Only an IPv4 network that finds the network table full shares one overflow
+    /// bucket, <see cref="GatewayOverflowFactor"/> times the size of a client's, until idle entries expire.
     /// </summary>
     public int GatewayMaxClients { get; set; } = 100_000;
     public int GatewayOverflowFactor { get; set; } = 20;
+
+    /// <summary>
+    /// Optional, off by default: an <c>ip:port</c> for a second listener that only Tor connects to, with
+    /// <c>HiddenServiceExportCircuitID haproxy</c> on, so each connection starts with a PROXY protocol line naming its Tor
+    /// circuit. The gateway flood guard then gives every circuit its own bucket inside one onion-wide bucket
+    /// (<see cref="GatewayOnionFactor"/>), so one onion client can't use up the bucket all of them would otherwise share.
+    /// Bind it to an address only the Tor container can reach: whoever connects can name any circuit. Connections without
+    /// a valid header are dropped, and only <c>/v1/gw</c> and <c>/v1/key</c> are served on it.
+    /// </summary>
+    public string OnionCircuitEndpoint { get; set; } = "";
+    public int GatewayOnionFactor { get; set; } = 20;
 }
 
 /// <summary>GCRA policy: <see cref="Limit"/> events per <see cref="PeriodSeconds"/>, with up to <see cref="Burst"/> at once.</summary>

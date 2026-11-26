@@ -29,8 +29,10 @@ public readonly record struct GateResult(HostGuards.Lease? Lease, TimeSpan? Retr
 /// <item><b>Pacing</b>: a per-mailbox outbound share sits in front of the per-host budget (both cluster-wide), so a few
 /// mailboxes can't consume a shared push service's whole budget.</item>
 /// <item><b>In-flight cap</b> per host per process, well below the delivery parallelism, so one host can't take every slot.</item>
-/// <item><b>Slow lane</b>: hosts whose base domain recently timed out share a small, separate pool of slots. That catches
-/// tarpits spread across wildcard subdomains.</item>
+/// <item><b>Slow lane</b>: hosts whose base domain (registrable domain, <see cref="HostGrouping.BaseDomain"/>) recently
+/// timed out share a small, separate pool of slots. That catches tarpits spread across wildcard subdomains. One base domain
+/// may hold only half of the pool, so a tarpit mostly competes with itself, and a host that answers quickly again leaves
+/// the slow lane without waiting for its base domain's mark to expire.</item>
 /// </list>
 /// Every denial here is a local deferral: it doesn't count as a failed attempt or escalate the message's backoff.
 /// </summary>
@@ -38,6 +40,8 @@ public sealed class HostGuards {
     private static readonly byte[] FingerprintKey = RandomNumberGenerator.GetBytes(32);
     private static readonly TimeSpan Window = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan SlowFor = TimeSpan.FromMinutes(10);
+    /// <summary>A healthy answer this quick takes its host out of the slow lane. Real push services answer well within it.</summary>
+    private static readonly TimeSpan FastFor = TimeSpan.FromSeconds(1);
 
     // KEYS: attempts, failures, failing endpoints, open flag. ARGV: failed (0/1), endpoint hash, window ms, min volume,
     // ratio, min distinct endpoints, open ms. Returns 1 if this call opened the circuit.
@@ -62,6 +66,8 @@ public sealed class HostGuards {
     private readonly EphemeralRedis _redis;
     private readonly ClusterSecret _secret;
     private readonly SemaphoreSlim _slowLane;
+    private readonly int _slowPerBase;
+    private readonly Dictionary<string, int> _slowInFlight = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, HostState> _hosts = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _slowBases = new(StringComparer.Ordinal);
 
@@ -71,6 +77,7 @@ public sealed class HostGuards {
         _redis = redis;
         _secret = secret;
         _slowLane = new SemaphoreSlim(Math.Max(1, _options.SlowLaneSlots));
+        _slowPerBase = Math.Max(1, _options.SlowLaneSlots / 2);
     }
 
     /// <param name="mailboxId">The mailbox being delivered to, for its fair share. Null for verification pushes.</param>
@@ -93,25 +100,23 @@ public sealed class HostGuards {
             // Local state only.
         }
 
-        if (mailboxId is not null) {
-            var share = await _limiter.CheckAsync(RatePolicies.PushPerMailbox, mailboxId);
-            if (!share.Allowed) {
-                return new GateResult(null, share.RetryAfter);
-            }
-        }
-        var pace = await _limiter.CheckAsync(RatePolicies.PushPerHost, Encoding.UTF8.GetBytes(host));
+        // All or nothing: a push the host budget defers doesn't also use up the mailbox's share, and the reverse.
+        var pace = await _limiter.CheckAllAsync([
+            new RateScope(RatePolicies.PushPerMailbox, mailboxId),
+            new RateScope(RatePolicies.PushPerHost, Encoding.UTF8.GetBytes(host)),
+        ]);
         if (!pace.Allowed) {
             return new GateResult(null, pace.RetryAfter);
         }
 
-        var slow = await IsSlowAsync(keys.BaseKey);
-        if (slow && !_slowLane.Wait(0)) {
+        var slow = !Volatile.Read(ref state.ProvenFast) && await IsSlowAsync(keys.BaseKey);
+        if (slow && !TryEnterSlowLane(keys.BaseKey)) {
             return new GateResult(null, TimeSpan.FromSeconds(5));
         }
         if (Interlocked.Increment(ref state.InFlight) > Math.Max(1, _options.MaxInFlightPerHost)) {
             Interlocked.Decrement(ref state.InFlight);
             if (slow) {
-                _slowLane.Release();
+                ExitSlowLane(keys.BaseKey);
             }
             return new GateResult(null, TimeSpan.FromSeconds(1));
         }
@@ -127,6 +132,7 @@ public sealed class HostGuards {
         private readonly HostState _state;
         private readonly HostKeys _keys;
         private readonly bool _slowLane;
+        private readonly long _started = Environment.TickCount64;
         private int _exited;
 
         internal Lease(HostGuards owner, HostState state, HostKeys keys, bool slowLane) {
@@ -144,16 +150,51 @@ public sealed class HostGuards {
             }
             Interlocked.Decrement(ref _state.InFlight);
             if (_slowLane) {
-                _owner._slowLane.Release();
+                _owner.ExitSlowLane(_keys.BaseKey);
             }
-            return _owner.RecordAsync(_state, _keys, outcome, endpointUrl, timedOut);
+            var fast = !timedOut && outcome == HostOutcome.Healthy && Environment.TickCount64 - _started < FastFor.TotalMilliseconds;
+            return _owner.RecordAsync(_state, _keys, outcome, endpointUrl, timedOut, fast);
         }
     }
 
-    private async Task RecordAsync(HostState state, HostKeys keys, HostOutcome outcome, string endpointUrl, bool timedOut) {
+    /// <summary>A slot in the slow-lane pool, of which one base domain may hold at most half.</summary>
+    private bool TryEnterSlowLane(string baseKey) {
+        if (!_slowLane.Wait(0)) {
+            return false;
+        }
+        lock (_slowInFlight) {
+            var held = _slowInFlight.GetValueOrDefault(baseKey);
+            if (held < _slowPerBase) {
+                _slowInFlight[baseKey] = held + 1;
+                return true;
+            }
+        }
+        _slowLane.Release();
+        return false;
+    }
+
+    private void ExitSlowLane(string baseKey) {
+        lock (_slowInFlight) {
+            var held = _slowInFlight.GetValueOrDefault(baseKey) - 1;
+            if (held <= 0) {
+                _slowInFlight.Remove(baseKey);
+            } else {
+                _slowInFlight[baseKey] = held;
+            }
+        }
+        _slowLane.Release();
+    }
+
+    private async Task RecordAsync(
+        HostState state, HostKeys keys, HostOutcome outcome, string endpointUrl, bool timedOut, bool fast) {
         var failed = outcome == HostOutcome.HostFailure;
+        // Per host and per process: a quick answer clears this host of its base domain's slow mark (a neighbour on a
+        // shared domain, or the tarpit itself once it behaves), and its next timeout puts it back.
         if (timedOut) {
+            Volatile.Write(ref state.ProvenFast, false);
             _slowBases[keys.BaseKey] = Environment.TickCount64 + (long)SlowFor.TotalMilliseconds;
+        } else if (fast) {
+            Volatile.Write(ref state.ProvenFast, true);
         }
         try {
             var db = _redis.Db;
@@ -267,6 +308,7 @@ public sealed class HostGuards {
     internal sealed class HostState(string key) {
         public readonly string Key = key;
         public long InFlight;
+        public bool ProvenFast;
         public long OpenUntil;
         public long LastUsed;
         public long WindowStart;

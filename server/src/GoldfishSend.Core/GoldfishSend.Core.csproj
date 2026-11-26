@@ -5,4 +5,8 @@
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- A Public Suffix List snapshot for HostGrouping. Embedded, so nothing is ever downloaded at run time. -->
+    <EmbeddedResource Include="Net/public_suffix_list.dat" LogicalName="GoldfishSend.Core.public_suffix_list.dat" />
+  </ItemGroup>
 </Project>

@@ -68,18 +68,15 @@ public static class ApiEndpoints {
             default:
                 return Error(ServiceError.InvalidRequest);
         }
-        foreach (var (policy, subject) in new[] {
-                     (RatePolicies.PowPerAllocation, client.Allocation),
-                     (RatePolicies.PowPerNetwork, client.Network),
-                     (RatePolicies.PowPerIp, client.Host),
-                 }) {
-            if (subject is null) {
-                continue;
-            }
-            var limit = await limiter.CheckAsync(policy, subject);
-            if (!limit.Allowed) {
-                return Error(ServiceError.RateLimited(limit));
-            }
+        // All or nothing: requests one address sends past its own limit don't use up its network's or /32's budget, so one
+        // host can't lock out everyone sharing its prefix (CGNAT neighbours, a mobile carrier's other customers).
+        var limit = await limiter.CheckAllAsync([
+            new RateScope(RatePolicies.PowPerAllocation, client.Allocation),
+            new RateScope(RatePolicies.PowPerNetwork, client.Network),
+            new RateScope(RatePolicies.PowPerIp, client.Host),
+        ]);
+        if (!limit.Allowed) {
+            return Error(ServiceError.RateLimited(limit));
         }
         var challenge = await pow.IssueAsync(client, purpose);
         var p = challenge.Parameters;

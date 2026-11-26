@@ -44,6 +44,18 @@ builder.WebHost.ConfigureKestrel(kestrel => {
     kestrel.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(60);
     kestrel.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10);
     kestrel.Limits.MaxConcurrentConnections = 10_000;
+    if (!string.IsNullOrWhiteSpace(options.Network.OnionCircuitEndpoint) && options.HasRole("api")) {
+        var onion = IPEndPoint.TryParse(options.Network.OnionCircuitEndpoint.Trim(), out var endpoint) && endpoint.Port > 0
+            ? endpoint
+            : throw new InvalidOperationException(
+                $"Goldfish:Network:OnionCircuitEndpoint must be ip:port, not '{options.Network.OnionCircuitEndpoint}'");
+        // Listening in code replaces the configured URLs, so the usual listeners are added back first.
+        foreach (var listen in ConfiguredEndpoints(builder.Configuration)) {
+            kestrel.Listen(listen);
+        }
+        kestrel.Listen(onion, listen => listen.Use(OnionCircuits.Middleware(
+            listen.ApplicationServices.GetRequiredService<ILoggerFactory>().CreateLogger("GoldfishSend.Onion"))));
+    }
 });
 
 builder.Services.ConfigureHttpJsonOptions(json => {
@@ -177,6 +189,29 @@ static bool IsPrivate(IPAddress address) {
         return b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 100 && b[1] >= 64 && b[1] <= 127);
     }
     return ip.IsIPv6UniqueLocal || ip.IsIPv6LinkLocal;
+}
+
+// The listeners ASP.NET Core would have made from ASPNETCORE_URLS or ASPNETCORE_HTTP_PORTS (8080 in the container image).
+static List<IPEndPoint> ConfiguredEndpoints(IConfiguration configuration) {
+    var endpoints = new List<IPEndPoint>();
+    var urls = configuration["urls"];
+    if (!string.IsNullOrWhiteSpace(urls)) {
+        foreach (var url in urls.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+            var uri = new Uri(url.Replace("://*", "://0.0.0.0", StringComparison.Ordinal).Replace("://+", "://0.0.0.0", StringComparison.Ordinal));
+            if (uri.Scheme != "http") {
+                throw new InvalidOperationException($"With Goldfish:Network:OnionCircuitEndpoint, only http:// URLs can be listened on, not '{url}'");
+            }
+            var host = uri.Host.Trim('[', ']');
+            endpoints.Add(new IPEndPoint(
+                host is "0.0.0.0" or "::" ? IPAddress.IPv6Any : host == "localhost" ? IPAddress.Loopback : IPAddress.Parse(host), uri.Port));
+        }
+        return endpoints;
+    }
+    var ports = configuration["http_ports"];
+    foreach (var port in (string.IsNullOrWhiteSpace(ports) ? "8080" : ports).Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+        endpoints.Add(new IPEndPoint(IPAddress.IPv6Any, int.Parse(port, System.Globalization.CultureInfo.InvariantCulture)));
+    }
+    return endpoints;
 }
 
 static void PrintKeys() {

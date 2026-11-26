@@ -9,11 +9,16 @@
 #     only `Host(GOLDFISH_DOMAIN)` with the paths /v1/gw (the encrypted gateway) and /v1/key is routed, on the TLS
 #     entrypoint only, with a 20 KiB body cap and HSTS. /healthz and /readyz are never routed. Traefik only ever sees
 #     encrypted API requests: TLS is terminated here, but every request body is end-to-end encrypted to the api.
-#   - The api trusts X-Forwarded-For only from the Traefik network's subnet (GOLDFISH_TRAEFIK_SUBNET). Without it, every
-#     client looks like Traefik and shares one rate limit, and the api logs a warning saying so.
+#   - The api trusts X-Forwarded-For only from Traefik's own address on that network (GOLDFISH_TRAEFIK_IP), never from
+#     the whole network: other containers on it could otherwise connect to the api directly and claim any client
+#     address, escaping rate limits or exhausting someone else's. Without it, every client looks like Traefik and shares
+#     one rate limit, and the api logs a warning saying so.
 #   - The api keeps outbound internet (for verification pushes) through the egress network.
 #
 # Requirements on YOUR Traefik (static configuration). See server/README.md, "Running behind Traefik":
+#   - A fixed address on GOLDFISH_TRAEFIK_NETWORK, so GOLDFISH_TRAEFIK_IP stays right when the Traefik container is
+#     recreated: `ipv4_address` (and `ipv6_address`) under that network in Traefik's own compose file. The network
+#     needs a configured subnet for that (docker network inspect <network>).
 #   - The TLS entrypoint (GOLDFISH_TRAEFIK_ENTRYPOINT, default "websecure") must NOT set forwardedHeaders.insecure.
 #     Only set forwardedHeaders.trustedIPs for a load balancer in front of Traefik (and then GOLDFISH_FORWARD_LIMIT=2).
 #   - No accessLog for this router. If access logs are on globally, they record client IPs and URLs. Turn them off,
@@ -36,8 +41,9 @@ services:
         ipv4_address: "${GOLDFISH_ONION_API_IP:-172.30.251.3}"
     environment:
       # Overrides the Caddy defaults from docker-compose.yml.
-      Goldfish__Network__TrustedProxies__0: "${GOLDFISH_TRAEFIK_SUBNET:?set GOLDFISH_TRAEFIK_SUBNET to your Traefik network's subnet (docker network inspect <network>)}"
-      Goldfish__Network__TrustedProxies__1: "${GOLDFISH_TRAEFIK_SUBNET6:-}"
+      # Single addresses, not the network's subnet: only Traefik itself may vouch for a client's address.
+      Goldfish__Network__TrustedProxies__0: "${GOLDFISH_TRAEFIK_IP:?set GOLDFISH_TRAEFIK_IP to your Traefik container's fixed address on its network}"
+      Goldfish__Network__TrustedProxies__1: "${GOLDFISH_TRAEFIK_IP6:-}"
       Goldfish__Network__TrustedProxies__2: "${GOLDFISH_UPSTREAM_PROXIES:-}"
       Goldfish__Network__ForwardLimit: "${GOLDFISH_FORWARD_LIMIT:-1}"
     labels:

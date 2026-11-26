@@ -13,12 +13,41 @@ public sealed class HostGroupingTests {
     [InlineData("a2.b.evil.example", "evil.example")]
     [InlineData("push.example.co.uk", "example.co.uk")]
     [InlineData("ntfy.sh", "ntfy.sh")]
-    [InlineData("fcm.googleapis.com", "googleapis.com")]
     [InlineData("localhost", "localhost")]
     [InlineData("127.0.0.1", "127.0.0.1")]
+    [InlineData("[2001:db8::1]", "[2001:db8::1]")]
     [InlineData("Push.Example.COM.", "example.com")]
-    public void BaseDomain_GroupsWildcardSubdomains(string host, string expected) {
+    // Short registrable names under a two-letter TLD are still one domain.
+    [InlineData("a1.q7z.de", "q7z.de")]
+    [InlineData("a2.ab.io", "ab.io")]
+    [InlineData("x.y.example.com.au", "example.com.au")]
+    // Shared hosting suffixes (the PSL's private section): every customer is its own domain.
+    [InlineData("alice.ts.net", "alice.ts.net")]
+    [InlineData("ntfy.bob.ts.net", "bob.ts.net")]
+    [InlineData("a.b.duckdns.org", "b.duckdns.org")]
+    [InlineData("fcm.googleapis.com", "fcm.googleapis.com")]
+    [InlineData("x.trycloudflare.com", "x.trycloudflare.com")]
+    // Wildcard and exception rules: *.ck and !www.ck.
+    [InlineData("a.b.ck", "a.b.ck")]
+    [InlineData("a.www.ck", "www.ck")]
+    // A public suffix itself, and an unlisted TLD (the implicit "*" rule).
+    [InlineData("co.uk", "co.uk")]
+    [InlineData("a.b.example.invalidtld", "example.invalidtld")]
+    // Internationalised rules match the ASCII form hosts arrive in (公司.cn).
+    [InlineData("a.example.xn--55qx5d.cn", "example.xn--55qx5d.cn")]
+    public void BaseDomain_IsTheRegistrableDomain(string host, string expected) {
         Assert.Equal(expected, HostGrouping.BaseDomain(host));
+    }
+
+    [Theory]
+    [InlineData("ntfy.sh", true)]
+    [InlineData("eu.ntfy.sh", true)]
+    [InlineData("NTFY.SH.", true)]
+    [InlineData("notntfy.sh", false)]
+    [InlineData("ntfy.sh.evil.example", false)]
+    [InlineData("", false)]
+    public void IsWithin_MatchesNamesAndTheirSubdomains(string host, bool expected) {
+        Assert.Equal(expected, HostGrouping.IsWithin(host, ["ntfy.sh", "web.push.apple.com"]));
     }
 }
 
@@ -61,7 +90,7 @@ public sealed class JobCodecTests {
         var key = RandomNumberGenerator.GetBytes(32);
         var id = RandomNumberGenerator.GetBytes(16);
         var mailbox = RandomNumberGenerator.GetBytes(32);
-        var expires = MessageService.WholeSeconds(DateTime.UtcNow.AddDays(1));
+        var expires = HeldExpiry.At(DateTime.UtcNow, 86400);
         var envelope = new byte[20];
         var blob = JobCodec.Seal(key, id, mailbox, expires, RandomNumberGenerator.GetBytes(32), envelope);
 
@@ -71,10 +100,47 @@ public sealed class JobCodecTests {
         Assert.ThrowsAny<CryptographicException>(() => JobCodec.Open(key, id, mailbox, expires.AddDays(7), blob));
     }
 
+}
+
+public sealed class HeldExpiryTests {
+    private static readonly DateTime Now = new(2026, 11, 13, 10, 17, 42, 999, DateTimeKind.Utc);
+
     [Fact]
-    public void WholeSeconds_Truncates() {
-        var t = new DateTime(2026, 11, 13, 10, 0, 0, 999, DateTimeKind.Utc);
-        Assert.Equal(new DateTime(2026, 11, 13, 10, 0, 0, DateTimeKind.Utc), MessageService.WholeSeconds(t));
+    public void LongTtls_RoundDownToTheHour() {
+        Assert.Equal(new DateTime(2026, 11, 16, 10, 0, 0, DateTimeKind.Utc), HeldExpiry.At(Now, 72 * 3600));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(60)]
+    [InlineData(600)]
+    [InlineData(3599)]
+    [InlineData(86400)]
+    [InlineData(14 * 86400)]
+    public void Expiry_IsWholeSeconds_NeverLate_AndLosesAtMostAQuarterOfTheTtl(int ttl) {
+        var exact = Now.AddSeconds(ttl);
+        var expiry = HeldExpiry.At(Now, ttl);
+        Assert.Equal(0, expiry.Ticks % TimeSpan.TicksPerSecond);
+        Assert.Equal(DateTimeKind.Utc, expiry.Kind);
+        Assert.True(expiry <= exact);
+        Assert.True(exact - expiry < TimeSpan.FromSeconds(Math.Max(1, Math.Min(ttl / 4, 3600))));
+        Assert.True(expiry > Now);
+    }
+
+    [Fact]
+    public void MessagesAcceptedInTheSameHour_ShareTheirExpiry() {
+        // A group fan-out (or anything else) in one hour can't be told apart by its stored expiry.
+        var a = HeldExpiry.At(new DateTime(2026, 11, 13, 10, 0, 1, DateTimeKind.Utc), 86400);
+        var b = HeldExpiry.At(new DateTime(2026, 11, 13, 10, 59, 58, DateTimeKind.Utc), 86400);
+        Assert.Equal(a, b);
+    }
+
+    [Fact]
+    public void DueNow_DropsTheSeconds_ButIsNeverInTheFuture() {
+        var due = HeldExpiry.DueNow(Now);
+        Assert.Equal(new DateTime(2026, 11, 13, 10, 17, 0, DateTimeKind.Utc), due);
+        Assert.True(due <= Now);
     }
 }
 

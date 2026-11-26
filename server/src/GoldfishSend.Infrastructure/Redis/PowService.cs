@@ -28,6 +28,12 @@ public enum PowRedemption {
 /// short-period rate-limit buckets (a daily-keyed HMAC of the prefix), and none of them refers to a mailbox. Send
 /// challenges have a fixed difficulty.
 /// </para>
+/// <para>
+/// A challenge remembers (as those same HMACs) the network that asked for it. A creation counts toward that network's
+/// load as well as the redeeming one's, so challenges fetched from a quiet network can't be spent at base difficulty
+/// from a busy one. A wrong solution costs the asking network extra challenge budget (<see cref="PowOptions.InvalidSolutionPenalty"/>).
+/// The redeemer need not be the asker, so a client whose address changes (a new Tor circuit) can still use its challenge.
+/// </para>
 /// </summary>
 public sealed class PowService {
     /// <summary>How long a redemption may wait for a verification slot before it's told to retry.</summary>
@@ -61,7 +67,9 @@ public sealed class PowService {
                 $"Goldfish:Pow:SendDifficulty is out of range: at most {ProofOfWork.MaxSendDifficulty} bits and " +
                 $"{ProofOfWork.MaxSendWorkKiB} KiB of expected work");
         }
-        var slots = _options.MaxConcurrentVerifications > 0 ? _options.MaxConcurrentVerifications : Environment.ProcessorCount;
+        var slots = _options.MaxConcurrentVerifications > 0
+            ? _options.MaxConcurrentVerifications
+            : Math.Max(1, Environment.ProcessorCount / 2);
         VerificationSlots = new SemaphoreSlim(slots, slots);
         _networkShare = Math.Max(1, slots / 4);
         _allocationShare = Math.Max(1, slots / 2);
@@ -81,35 +89,41 @@ public sealed class PowService {
 
     /// <summary>The difficulty a creation challenge issued to <paramref name="client"/> would get now.</summary>
     public async Task<int> DifficultyForAsync(ClientSubject client) {
-        var network = await _limiter.DailySubjectKeyAsync(NetworkPurpose, client.Network);
-        var allocation = client.Allocation is null ? null : await _limiter.DailySubjectKeyAsync(AllocationPurpose, client.Allocation);
+        return await DifficultyForAsync(await LoadKeysAsync(client));
+    }
+
+    private async Task<int> DifficultyForAsync(LoadKeys load) {
         var minute = Minute;
         var keys = new RedisKey[3 * Window];
         for (var i = 0; i < Window; i++) {
-            keys[i] = RedisKeys.PowNetworkLoad(network, minute - i);
+            keys[i] = RedisKeys.PowNetworkLoad(load.Network, minute - i);
             keys[Window + i] = RedisKeys.PowLoad(minute - i);
             // IPv4 clients have no /32 tier: read the network key again (counted as 0 below), keeping one round trip.
-            keys[2 * Window + i] = allocation is null ? keys[i] : RedisKeys.PowNetworkLoad(allocation, minute - i);
+            keys[2 * Window + i] = load.Allocation is null ? keys[i] : RedisKeys.PowNetworkLoad(load.Allocation, minute - i);
         }
         var values = await _redis.Db.StringGetAsync(keys);
         long networkCount = 0, globalCount = 0, allocationCount = 0;
         for (var i = 0; i < Window; i++) {
             networkCount += (long)values[i];
             globalCount += (long)values[Window + i];
-            allocationCount += allocation is null ? 0 : (long)values[2 * Window + i];
+            allocationCount += load.Allocation is null ? 0 : (long)values[2 * Window + i];
         }
         return PowDifficulty.For(_options, networkCount, allocationCount, globalCount);
     }
 
     public async Task<PowChallenge> IssueAsync(ClientSubject client, PowPurpose purpose = PowPurpose.Create) {
+        var issuer = new Issuer(
+            await LoadKeysAsync(client),
+            await _limiter.BucketKeyAsync(RatePolicies.PowPerNetwork, client.Network),
+            await _limiter.BucketKeyAsync(RatePolicies.PowPerAllocation, client.Allocation));
         var parameters = purpose == PowPurpose.Send
             ? SendParameters
-            : new PowParameters(await DifficultyForAsync(client), _options.MemoryKiB, _options.Iterations);
+            : new PowParameters(await DifficultyForAsync(issuer.Load), _options.MemoryKiB, _options.Iterations);
         var challenge = RandomNumberGenerator.GetBytes(ProofOfWork.ChallengeSize);
         var ttl = TimeSpan.FromSeconds(_options.ChallengeTtlSeconds);
         var expiresAt = DateTimeOffset.UtcNow + ttl;
         // The parameters are stored with the challenge, so a config change can't invalidate solutions in flight.
-        await _redis.Db.StringSetAsync(RedisKeys.Pow(Convert.ToHexString(challenge)), Encode(parameters, purpose, expiresAt), ttl);
+        await _redis.Db.StringSetAsync(RedisKeys.Pow(Convert.ToHexString(challenge)), Encode(parameters, purpose, expiresAt, issuer), ttl);
         return new PowChallenge(challenge, parameters, purpose, ttl, expiresAt);
     }
 
@@ -120,7 +134,11 @@ public sealed class PowService {
     /// share. When none comes free quickly it returns <see cref="PowRedemption.Busy"/> instead of queueing, and puts the
     /// challenge back.
     /// <para>A creation needs a creation challenge. A send accepts either kind (a creation challenge costs at least as much).</para>
-    /// <para>Redeeming never counts toward load: see <see cref="CountCreationAsync"/> and <see cref="CountVerifiedAsync"/>.</para>
+    /// <para>
+    /// A valid creation counts toward the load of the network the challenge was issued to and of the redeeming one (once
+    /// if they're the same), whatever the rate limits then decide, so a flood slows the flooder. Server-wide load counts
+    /// verified mailboxes instead (<see cref="CountVerifiedAsync"/>). Sends never count.
+    /// </para>
     /// </summary>
     public async Task<PowRedemption> RedeemAsync(
         byte[] challenge, byte[] nonce, ClientSubject client, PowPurpose purpose, CancellationToken ct = default) {
@@ -129,7 +147,7 @@ public sealed class PowService {
         }
         var key = RedisKeys.Pow(Convert.ToHexString(challenge));
         var stored = await _redis.Db.StringGetDeleteAsync(key);
-        if ((stored.IsNull ? null : Decode(stored!)) is not (var parameters, var issuedFor, var expiresAt)
+        if ((stored.IsNull ? null : Decode(stored!)) is not (var parameters, var issuedFor, var expiresAt, var issuer)
             || !parameters.IsValid || expiresAt < DateTimeOffset.UtcNow || (purpose == PowPurpose.Create && issuedFor != PowPurpose.Create)) {
             return PowRedemption.Invalid;
         }
@@ -139,11 +157,33 @@ public sealed class PowService {
             await PutBackAsync(key, stored!, expiresAt);
             return PowRedemption.Busy;
         }
+        bool valid;
         try {
-            return ProofOfWork.Verify(challenge, nonce, parameters) ? PowRedemption.Ok : PowRedemption.Invalid;
+            valid = ProofOfWork.Verify(challenge, nonce, parameters);
         } finally {
             VerificationSlots.Release();
             Shares.Exit(shares);
+        }
+        if (!valid) {
+            await PenalizeAsync(issuer);
+            return PowRedemption.Invalid;
+        }
+        if (purpose == PowPurpose.Create) {
+            await CountCreationAsync(issuer.Load, client);
+        }
+        return PowRedemption.Ok;
+    }
+
+    private async Task PenalizeAsync(Issuer issuer) {
+        var cost = _options.InvalidSolutionPenalty;
+        if (cost <= 0) {
+            return;
+        }
+        if (issuer.NetworkBucket is { } network) {
+            await _limiter.PenalizeAsync(RatePolicies.PowPerNetwork, network, cost);
+        }
+        if (issuer.AllocationBucket is { } allocation) {
+            await _limiter.PenalizeAsync(RatePolicies.PowPerAllocation, allocation, cost);
         }
     }
 
@@ -183,18 +223,28 @@ public sealed class PowService {
         return keys;
     }
 
+    /// <summary>The network's (and IPv6 /32's) load-counter keys: daily-keyed HMACs of the prefixes.</summary>
+    private async Task<LoadKeys> LoadKeysAsync(ClientSubject client) {
+        return new LoadKeys(
+            await _limiter.DailySubjectKeyAsync(NetworkPurpose, client.Network),
+            client.Allocation is null ? null : await _limiter.DailySubjectKeyAsync(AllocationPurpose, client.Allocation));
+    }
+
     /// <summary>
-    /// Counts a mailbox creation that passed the rate limits toward its network's (and IPv6 /32's) load. It can only raise
-    /// the difficulty for that network, so it's counted whether or not the mailbox is ever verified: a flood slows the
-    /// flooder.
+    /// Counts a creation toward the issuing and the redeeming networks' (and IPv6 /32s') load. It can only raise the
+    /// difficulty for those networks, so it's counted whether or not the mailbox is ever created or verified.
     /// </summary>
-    public async Task CountCreationAsync(ClientSubject client) {
+    private async Task CountCreationAsync(LoadKeys issuer, ClientSubject redeemer) {
         try {
-            var network = await _limiter.DailySubjectKeyAsync(NetworkPurpose, client.Network);
-            await IncrementAsync(RedisKeys.PowNetworkLoad(network, Minute), 1);
-            if (client.Allocation is not null) {
-                var allocation = await _limiter.DailySubjectKeyAsync(AllocationPurpose, client.Allocation);
-                await IncrementAsync(RedisKeys.PowNetworkLoad(allocation, Minute), 1);
+            var own = await LoadKeysAsync(redeemer);
+            var keys = new HashSet<string>(StringComparer.Ordinal) { issuer.Network, own.Network };
+            foreach (var allocation in new[] { issuer.Allocation, own.Allocation }) {
+                if (allocation is not null) {
+                    keys.Add(allocation);
+                }
+            }
+            foreach (var key in keys) {
+                await IncrementAsync(RedisKeys.PowNetworkLoad(key, Minute), 1);
             }
         } catch (Exception ex) when (ex is RedisException or TimeoutException) {
             _logger.LogWarning("PoW load counter unavailable ({Type})", ex.GetType().Name);
@@ -236,13 +286,20 @@ public sealed class PowService {
         }
     }
 
-    private static string Encode(PowParameters p, PowPurpose purpose, DateTimeOffset expiresAt) => string.Create(
-        CultureInfo.InvariantCulture,
-        $"{p.Difficulty}:{p.MemoryKiB}:{p.Iterations}:{expiresAt.ToUnixTimeMilliseconds()}:{(purpose == PowPurpose.Send ? "s" : "c")}");
+    internal readonly record struct LoadKeys(string Network, string? Allocation);
 
-    private static (PowParameters, PowPurpose, DateTimeOffset)? Decode(string value) {
-        var parts = value.Split(':');
-        if (parts.Length != 5
+    /// <summary>Who a challenge was issued to, as HMACs only: its load counters and its pow-net and pow-alloc buckets.</summary>
+    internal readonly record struct Issuer(LoadKeys Load, string? NetworkBucket, string? AllocationBucket);
+
+    internal static string Encode(PowParameters p, PowPurpose purpose, DateTimeOffset expiresAt, Issuer issuer) => string.Create(
+        CultureInfo.InvariantCulture,
+        $"{p.Difficulty}:{p.MemoryKiB}:{p.Iterations}:{expiresAt.ToUnixTimeMilliseconds()}:{(purpose == PowPurpose.Send ? "s" : "c")}" +
+        $"|{issuer.Load.Network}|{issuer.Load.Allocation}|{issuer.NetworkBucket}|{issuer.AllocationBucket}");
+
+    internal static (PowParameters, PowPurpose, DateTimeOffset, Issuer)? Decode(string value) {
+        var fields = value.Split('|');
+        var parts = fields[0].Split(':');
+        if (fields.Length != 5 || fields[1].Length == 0 || parts.Length != 5
             || !int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var difficulty)
             || !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var memory)
             || !int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var iterations)
@@ -250,7 +307,9 @@ public sealed class PowService {
             || parts[4] is not ("c" or "s")) {
             return null;
         }
+        static string? Optional(string field) => field.Length == 0 ? null : field;
+        var issuer = new Issuer(new LoadKeys(fields[1], Optional(fields[2])), Optional(fields[3]), Optional(fields[4]));
         return (new PowParameters(difficulty, memory, iterations), parts[4] == "s" ? PowPurpose.Send : PowPurpose.Create,
-            DateTimeOffset.FromUnixTimeMilliseconds(expires));
+            DateTimeOffset.FromUnixTimeMilliseconds(expires), issuer);
     }
 }

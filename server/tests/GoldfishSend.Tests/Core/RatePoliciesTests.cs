@@ -18,6 +18,11 @@ public sealed class RatePoliciesTests {
     [InlineData(RatePolicies.OwnerPerNetwork, "network")]
     [InlineData(RatePolicies.InviteCreatePerNetwork, "network")]
     [InlineData(RatePolicies.InviteFetchPerNetwork, "network")]
+    [InlineData(RatePolicies.SendPerAllocation, "network")]
+    [InlineData(RatePolicies.OwnerPerAllocation, "network")]
+    [InlineData(RatePolicies.InviteCreatePerAllocation, "network")]
+    [InlineData(RatePolicies.NewHostPerNetwork, "network")]
+    [InlineData(RatePolicies.NewHostPerAllocation, "network")]
     [InlineData(RatePolicies.SendPerMailbox, "mailbox")]
     [InlineData(RatePolicies.SendPerMailboxDaily, "mailbox")]
     [InlineData(RatePolicies.RotatePerMailbox, "mailbox")]
@@ -35,7 +40,7 @@ public sealed class RatePoliciesTests {
     [Fact]
     public void ScopeTable_CoversEveryDefaultPolicy() {
         // A newly added policy must be added to the theory above (and ScopeOf) deliberately.
-        Assert.Equal(24, RatePolicies.Defaults.Count);
+        Assert.Equal(29, RatePolicies.Defaults.Count);
     }
 
     [Fact]
@@ -66,6 +71,12 @@ public sealed class RatePoliciesTests {
                      (RatePolicies.OwnerPerIp, RatePolicies.OwnerPerNetwork),
                      (RatePolicies.InviteFetchPerIp, RatePolicies.InviteFetchPerNetwork),
                      (RatePolicies.CreatePerIp, RatePolicies.CreatePerNetwork),
+                     (RatePolicies.SendPerNetwork, RatePolicies.SendPerAllocation),
+                     (RatePolicies.OwnerPerNetwork, RatePolicies.OwnerPerAllocation),
+                     (RatePolicies.InviteCreatePerNetwork, RatePolicies.InviteCreatePerAllocation),
+                     (RatePolicies.CreatePerNetwork, RatePolicies.CreatePerAllocation),
+                     (RatePolicies.PowPerNetwork, RatePolicies.PowPerAllocation),
+                     (RatePolicies.NewHostPerNetwork, RatePolicies.NewHostPerAllocation),
                  }) {
             var n = RatePolicies.Defaults[narrow];
             var w = RatePolicies.Defaults[wide];
