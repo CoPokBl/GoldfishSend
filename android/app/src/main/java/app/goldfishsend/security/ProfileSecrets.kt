@@ -3,6 +3,7 @@ package app.goldfishsend.security
 import app.goldfishsend.core.DuressAction
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.KvStore
+import app.goldfishsend.crypto.HiddenSlot
 import app.goldfishsend.crypto.KeyVault
 import app.goldfishsend.proto.Rand
 import app.goldfishsend.proto.wipe
@@ -21,12 +22,20 @@ interface ProfileSecrets {
 
     fun setDuress(pin: CharArray?)
 
-    fun isHiddenPin(pin: CharArray): Boolean
+    /**
+     * The hidden-chats secret [pin] opens (core/HiddenChats), or null. Always one KDF run, whether a hidden-chats PIN is
+     * set or not. The caller wipes it.
+     */
+    fun openHidden(pin: CharArray): ByteArray?
 
-    fun setHiddenPin(pin: CharArray?)
+    /** Seals the hidden-chats [secret] under [pin], or (both null) replaces the slot with filler that no PIN opens. */
+    fun setHidden(pin: CharArray?, secret: ByteArray?)
 
     var duressAction: DuressAction
 }
+
+/** Convenience for checks that only need a yes or no (a new PIN mustn't be the hidden-chats PIN). */
+fun ProfileSecrets.isHiddenPin(pin: CharArray): Boolean = openHidden(pin)?.also { it.wipe() } != null
 
 /** The real profile: everything lives in the vault. */
 object VaultSecrets : ProfileSecrets {
@@ -39,9 +48,9 @@ object VaultSecrets : ProfileSecrets {
 
     override fun setDuress(pin: CharArray?) = vault.setDuress(pin)
 
-    override fun isHiddenPin(pin: CharArray): Boolean = vault.isHiddenPin(pin)
+    override fun openHidden(pin: CharArray): ByteArray? = vault.openHidden(pin)
 
-    override fun setHiddenPin(pin: CharArray?) = vault.setHiddenPin(pin)
+    override fun setHidden(pin: CharArray?, secret: ByteArray?) = vault.setHidden(pin, secret)
 
     override var duressAction: DuressAction
         get() = vault.duressAction
@@ -79,9 +88,32 @@ class DecoySecrets(
 
     override fun setDuress(pin: CharArray?) = set(K_DURESS, pin)
 
-    override fun isHiddenPin(pin: CharArray): Boolean = matches(K_HIDDEN, pin)
+    /**
+     * The decoy's hidden-chats slot: salt ‖ [HiddenSlot], under the same KDF as its app secret ([secretKdf], the real
+     * vault's Keystore HMAC and Argon2), so a copy of the decoy database can't be tested offline either.
+     */
+    override fun openHidden(pin: CharArray): ByteArray? {
+        val v = kv.get(K_HIDDEN)?.takeIf { it.size == HIDDEN_SLOT } ?: fillHidden()
+        val kek = secretKdf(pin, v.copyOfRange(0, 16))
+        try {
+            return HiddenSlot.open(kek, v.copyOfRange(16, v.size))
+        } finally {
+            kek.wipe()
+        }
+    }
 
-    override fun setHiddenPin(pin: CharArray?) = set(K_HIDDEN, pin)
+    override fun setHidden(pin: CharArray?, secret: ByteArray?) {
+        if (pin == null || secret == null) {
+            fillHidden()
+            return
+        }
+        val salt = Rand.bytes(16)
+        val kek = secretKdf(pin, salt)
+        kv.put(K_HIDDEN, salt + HiddenSlot.seal(kek, secret))
+        kek.wipe()
+    }
+
+    private fun fillHidden(): ByteArray = (Rand.bytes(16) + HiddenSlot.filler()).also { kv.put(K_HIDDEN, it) }
 
     override var duressAction: DuressAction
         get() = kv.get(K_ACTION)?.firstOrNull()?.toInt()?.let { DuressAction.entries.getOrNull(it) } ?: DuressAction.WIPE_ALL
@@ -113,5 +145,8 @@ class DecoySecrets(
         const val K_DURESS = "decoy_duress"
         const val K_HIDDEN = "decoy_hidden"
         const val K_ACTION = "decoy_duress_action"
+
+        /** salt ‖ nonce ‖ (marker ‖ secret) ‖ tag. */
+        const val HIDDEN_SLOT = 16 + 12 + 64 + 16
     }
 }

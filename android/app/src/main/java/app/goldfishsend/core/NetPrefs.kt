@@ -177,10 +177,12 @@ object NetPrefs {
     fun usedServers(repo: Repo): Set<String> {
         val urls = repo.contacts().mapNotNull { it.outServer } +
             repo.groupRefs().flatMap { g -> repo.memberRoutes(g.cid).values.map { it.card.inbox.server } }
-        return urls.mapNotNull { u ->
-            u.trim().trimEnd('/').plus("/").toHttpUrlOrNull()?.let { app.goldfishsend.net.PinPolicy.hostKey(it.host, it.port) }
-        }.toSet()
+        return urls.mapNotNull(::hostKeyOf).toSet()
     }
+
+    /** The host key a server URL's pins are kept under, or null if it isn't a URL. */
+    fun hostKeyOf(url: String): String? =
+        url.trim().trimEnd('/').plus("/").toHttpUrlOrNull()?.let { app.goldfishsend.net.PinPolicy.hostKey(it.host, it.port) }
 
     /**
      * Drops pins of servers we no longer use (not in [servers], host keys from [usedServers]) from the database, for

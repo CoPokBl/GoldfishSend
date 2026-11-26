@@ -359,11 +359,12 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                     enabled = canEdit,
                     onClick = { timer = true },
                 )
-                val hiddenOn by rememberQuery(s) { q -> q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
-                if (hiddenOn == true) {
+                // Only while hidden chats are shown: nothing else knows whether they exist, and hiding needs their key.
+                val hiddenShown by s.hiddenRevealed.collectAsState()
+                if (hiddenShown || c.hidden) {
                     SwitchRow(
                         "Hide this chat",
-                        "Keeps it out of the chat list until you enter your hidden-chats PIN",
+                        "Encrypted under your hidden-chats PIN and out of the chat list once hidden chats are put away again",
                         Icons.Rounded.VisibilityOff,
                         checked = c.hidden,
                         onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setHidden(cid, v); s.db.notifyChanged() } },

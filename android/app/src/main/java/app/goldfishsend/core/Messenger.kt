@@ -79,8 +79,12 @@ object Messenger {
         ReceiveGuard.runSuspend("message") { receiveOne(s, tag, raw) }
     }
 
+    /** A push parked for hidden chats ([HiddenChats.park]), delivered now that they're shown. */
+    internal suspend fun receiveParked(s: Session, tag: ByteArray, raw: ByteArray) = receive(s, tag, raw)
+
     private suspend fun receiveOne(s: Session, tag: ByteArray, raw: ByteArray) {
-        val mb = s.repo.mailboxByTag(tag) ?: return
+        // Not one of ours that this profile knows: it may be a put-away hidden chat's.
+        val mb = s.repo.mailboxByTag(tag) ?: return HiddenChats.park(s, tag, raw)
         if (mb.purpose == Mailbox.PURPOSE_GROUP) {
             // A group inbox: only group blobs (docs/groups.md), from whichever member the sender hint names.
             if (GroupBlob.isGroup(raw)) {
@@ -358,12 +362,13 @@ object Messenger {
 
     /**
      * Hidden chats post nothing, unless the user allowed it and this isn't a decoy session. Even then the notification
-     * is generic, with no name and no text. (While locked, the chat isn't known yet: see [onPushPayload].)
+     * is generic, with no name and no text. (While locked, the chat isn't known yet: see [onPushPayload]. While hidden
+     * chats are put away, nor is it: see [HiddenChats.park].)
      */
     internal fun notify(s: Session, cid: Long, text: String?) {
         val c = s.repo.contact(cid)
         if (c?.hidden == true) {
-            if (!s.decoy && s.repo.kvString(app.goldfishsend.security.AppLock.KV_NOTIFY_HIDDEN) == "1") {
+            if (!s.decoy && !s.replayingHidden && s.repo.kvString(app.goldfishsend.security.AppLock.KV_NOTIFY_HIDDEN) == "1") {
                 Notifier.newMessage(Graph.app, null, null)
             }
             return

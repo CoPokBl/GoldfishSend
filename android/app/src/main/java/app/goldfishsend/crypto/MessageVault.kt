@@ -133,6 +133,37 @@ class MessageVault(mrk: ByteArray, private val buckets: Buckets? = null) {
     }
 
     /**
+     * A message key wrapped by this root, re-wrapped by [to]'s root: hidden chats moving between the profile's root and
+     * their own (core/HiddenChats). Null if it doesn't open.
+     */
+    fun moveKey(to: MessageVault, messageId: String, wrappedKey: ByteArray): ByteArray? {
+        val aad = ("gf/msgkey/" + messageId).utf8()
+        val k = runCatching { openUnderRoot(wrappedKey, aad) }.getOrNull() ?: return null
+        try {
+            return Aead.seal(to.mrk, k, aad)
+        } finally {
+            k.wipe()
+        }
+    }
+
+    /** A [sealBlob] blob sealed as [label] here, sealed as [newLabel] under [to]'s root. Null if it doesn't open. */
+    fun moveBlob(to: MessageVault, label: String, newLabel: String, blob: ByteArray): ByteArray? {
+        val plain = runCatching { openBlob(label, blob) }.getOrNull() ?: return null
+        try {
+            return to.sealBlob(newLabel, plain)
+        } finally {
+            plain.wipe()
+        }
+    }
+
+    /** Whether a key wrapped under expiry [bucket] still opens: the bucket hasn't ended, and messages weren't erased. */
+    fun bucketOpens(messageId: String, wrappedKey: ByteArray, bucket: Long): Boolean {
+        val k = runCatching { unwrap(messageId, wrappedKey, bucket) }.getOrNull() ?: return false
+        k.wipe()
+        return true
+    }
+
+    /**
      * Makes [next] the root (the vault takes ownership of it) once everything has been re-wrapped under it. The old root
      * stays in RAM until [wipe], for rows read just before. Returns a function that undoes the swap, for a rotation whose
      * transaction didn't commit.

@@ -9,6 +9,8 @@ import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.TheaterComedy
 import app.goldfishsend.ui.components.PinEntryDialog
 import app.goldfishsend.security.AppLock
+import app.goldfishsend.security.isHiddenPin
+import app.goldfishsend.core.HiddenChats
 import app.goldfishsend.core.PanicResponse
 import app.goldfishsend.core.DuressAction
 import android.content.Intent
@@ -135,7 +137,8 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     var disconnectPanic by remember { mutableStateOf(false) }
     // Feature flags live inside the profile's encrypted DB, so a decoy session sees (and sets) its own.
     val duressOn by rememberQuery(s, v) { q -> q.repo.kvString(AppLock.KV_DURESS_ON) == "1" }
-    val hiddenOn by rememberQuery(s, v) { q -> q.repo.kvString(AppLock.KV_HIDDEN_ON) == "1" }
+    // Nothing records whether hidden chats exist: all the screen can know is whether they're shown now.
+    val hiddenShown by s.hiddenRevealed.collectAsState()
     val notifyHidden by rememberQuery(s, v) { q -> q.repo.kvString(AppLock.KV_NOTIFY_HIDDEN) == "1" }
     var secretsChanged by remember { androidx.compose.runtime.mutableIntStateOf(0) }
     // Sealed in the vault (or the decoy's DB): read off the main thread.
@@ -322,22 +325,25 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                 SectionHeader("Hidden chats")
                 SettingRow(
                     "Hidden chats",
-                    if (hiddenOn == true) "On · long-press \"Chats\" and enter your hidden-chats PIN to show them" else "Off · keep chosen chats out of the list behind a separate PIN",
+                    if (hiddenShown) {
+                        "Shown now · change their PIN, or turn them off"
+                    } else {
+                        "Chats encrypted under a separate PIN. To show them, long-press \"Chats\" and enter it"
+                    },
                     Icons.Rounded.VisibilityOff,
                     onClick = { reauth.require("Changing hidden chats.") { hiddenPinDialog = true } },
                 )
-                if (hiddenOn == true) {
-                    SwitchRow(
-                        "Notify for hidden chats",
-                        "A notification with no name or text. Off means hidden chats stay silent while unlocked; to keep " +
-                            "them silent while locked too, turn on \"Silent while locked\".",
-                        Icons.Rounded.NotificationsOff,
-                        notifyHidden == true,
-                    ) { on ->
-                        scope.launch(Dispatchers.IO) {
-                            s.repo.kvPutString(AppLock.KV_NOTIFY_HIDDEN, if (on) "1" else null)
-                            s.db.notifyChanged()
-                        }
+                // Always shown, whether or not hidden chats exist, so that it says nothing about them.
+                SwitchRow(
+                    "Notify for hidden chats",
+                    "A notification with no name or text. Off means hidden chats stay silent while unlocked; to keep " +
+                        "them silent while locked too, turn on \"Silent while locked\".",
+                    Icons.Rounded.NotificationsOff,
+                    notifyHidden == true,
+                ) { on ->
+                    scope.launch(Dispatchers.IO) {
+                        s.repo.kvPutString(AppLock.KV_NOTIFY_HIDDEN, if (on) "1" else null)
+                        s.db.notifyChanged()
                     }
                 }
             }
@@ -515,7 +521,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
         }
     }
     if (hiddenPinDialog) {
-        HiddenChatsDialog(s, hiddenOn == true) { hiddenPinDialog = false }
+        HiddenChatsDialog(s, hiddenShown) { hiddenPinDialog = false }
     }
     if (disconnectPanic) {
         ConfirmDialog(
@@ -758,34 +764,37 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
     }
 }
 
-/** Sets or removes the hidden-chats PIN (the profile's own, as for [DuressDialog]). Removing it un-hides every hidden chat. */
+/**
+ * Hidden chats' PIN (the profile's own, as for [DuressDialog]). Nothing records whether hidden chats exist, so what it
+ * offers depends only on whether they're [shown]: then their PIN can be changed, or they can be turned off (they become
+ * ordinary chats). Otherwise it sets a PIN: entering the current one just shows them, and any other replaces hidden chats
+ * not shown for good (without their PIN they can't be opened, so they can't be kept either).
+ */
 @Composable
-private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
+private fun HiddenChatsDialog(s: Session, shown: Boolean, onDismiss: () -> Unit) {
     val work = rememberWork()
     val secrets = s.secrets
-    fun save(block: () -> Unit) {
+    fun save(block: suspend () -> Unit) {
         work.run {
-            withContext(Dispatchers.Default) { block() }
+            withContext(Dispatchers.IO) { block() }
             onDismiss()
         }
     }
     PinEntryDialog(
-        if (on) "Change hidden-chats PIN" else "Hidden chats",
-        "Choose a PIN for hidden chats. Hide a chat from its contact info. To see hidden chats, long-press \"Chats\" and enter this PIN. " +
-            "They're hidden again when GoldfishSend locks.",
+        if (shown) "Change hidden-chats PIN" else "Hidden chats",
+        if (shown) {
+            "Choose a new PIN for your hidden chats. \"Turn off\" makes them ordinary chats again."
+        } else {
+            "Choose a PIN for hidden chats. They're encrypted under it, and only listed after you long-press \"Chats\" and " +
+                "enter it. While they're shown, hide a chat from its info. They're put away again when GoldfishSend locks. " +
+                "To change the PIN of hidden chats you already have, show them first: a new PIN set here replaces them for good."
+        },
         onDismiss = onDismiss,
-        removeLabel = if (on) "Turn off" else null,
+        removeLabel = if (shown) "Turn off" else null,
         busy = work.busy,
         busyText = "Saving…",
         onRemove = {
-            save {
-                secrets.setHiddenPin(null)
-                for (id in s.repo.hiddenContactIds()) {
-                    s.repo.setHidden(id, false)
-                }
-                s.repo.kvPutString(AppLock.KV_HIDDEN_ON, null)
-                s.db.notifyChanged()
-            }
+            save { HiddenChats.turnOff(s) }
         },
         validate = { pin ->
             val copy = pin.copyOf()
@@ -795,10 +804,16 @@ private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         },
     ) { pin ->
         save {
-            secrets.setHiddenPin(pin)
-            pin.fill('\u0000')
-            s.repo.kvPutString(AppLock.KV_HIDDEN_ON, "1")
-            s.db.notifyChanged()
+            try {
+                when {
+                    shown -> HiddenChats.changePin(s, pin)
+                    // Their current PIN: keep them, and show them.
+                    HiddenChats.reveal(s, pin) -> Unit
+                    else -> HiddenChats.setNewPin(s, pin)
+                }
+            } finally {
+                pin.fill('\u0000')
+            }
         }
     }
 }

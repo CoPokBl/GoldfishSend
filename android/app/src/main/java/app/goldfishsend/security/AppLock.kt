@@ -35,10 +35,12 @@ object AppLock {
     @Volatile
     private var backgroundedAt: Long? = null
 
-    const val KV_HIDDEN_ON = "hidden_on"
     const val KV_DURESS_ON = "duress_on"
 
-    /** Whether hidden chats post (generic) notifications. In each profile's database, like the other hidden-chat state. */
+    /**
+     * Whether hidden chats post (generic) notifications. In each profile's database. A plain setting everyone has, shown
+     * whether or not hidden chats exist (nothing records whether they do: core/HiddenChats), so its value says little.
+     */
     const val KV_NOTIFY_HIDDEN = "notify_hidden"
 
     private val lockable: Boolean

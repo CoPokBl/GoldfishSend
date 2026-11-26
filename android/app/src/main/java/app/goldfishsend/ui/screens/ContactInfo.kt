@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -284,11 +285,12 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                         scope.launch(Dispatchers.IO) { s.repo.setVerified(contactId, v, shown); s.db.notifyChanged() }
                     },
                 )
-                val hiddenOn by rememberQuery(s) { q -> q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
-                if (hiddenOn == true) {
+                // Only while hidden chats are shown: nothing else knows whether they exist, and hiding needs their key.
+                val hiddenShown by s.hiddenRevealed.collectAsState()
+                if (hiddenShown || c.hidden) {
                     SwitchRow(
                         "Hide this chat",
-                        "Keeps it out of the chat list until you enter your hidden-chats PIN",
+                        "Encrypted under your hidden-chats PIN and out of the chat list once hidden chats are put away again",
                         Icons.Rounded.VisibilityOff,
                         checked = c.hidden,
                         onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setHidden(contactId, v); s.db.notifyChanged() } },

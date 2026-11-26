@@ -68,8 +68,19 @@ class Session(
     /** Serialises libsignal and DB mutations: libsignal stores aren't safe for concurrent ratchet updates. */
     val lock = Mutex()
 
-    /** Hidden chats are only listed after the hidden-chats PIN was entered in this session. Resets on lock. */
+    /**
+     * Hidden chats are shown ([HiddenChats.reveal]): their PIN was entered in this session, and they're in the tables until
+     * they're put away again ("Hide", or the app locking). Mirrors [hidden] for the UI.
+     */
     val hiddenRevealed = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /** The key the shown hidden chats are sealed to, while they're shown. Wiped when they're put away. */
+    @Volatile
+    var hidden: app.goldfishsend.crypto.HiddenKey? = null
+
+    /** Pushes parked for hidden chats are being delivered: they post no notifications (the user is here, showing them). */
+    @Volatile
+    var replayingHidden = false
 
     fun masterKeyCopy(): ByteArray = mk.copyOf()
 
@@ -84,13 +95,17 @@ class Session(
     var closed = false
         private set
 
-    fun close() {
+    /** [beforeClose] runs once the session's work is cancelled, with the database still open (hidden chats go away). */
+    fun close(beforeClose: (() -> Unit)? = null) {
         closed = true
         // Stop the work first: whatever is still running then finds the job cancelled, not a closed database.
         scope.cancel()
+        beforeClose?.let { runCatching(it) }
         db.close()
         mk.wipe()
         messages.wipe()
+        hidden?.wipe()
+        hidden = null
     }
 }
 
@@ -260,6 +275,8 @@ object Graph {
         match.salt.wipe()
         match.secretTag.wipe()
         val s = Session(db, decoyKey, MessageVault(mrk), decoy = true, prefs = decoyPrefs, secrets = secrets)
+        // The decoy's hidden chats work exactly like the real profile's, in its own database.
+        runCatching { HiddenChats.prepare(s) }
         publish(s, since)
         s
     }
@@ -365,6 +382,8 @@ object Graph {
                 )
             }
         }
+        // Before anything can show them: hidden chats a crash left out are put away (no PIN needed, and no extra KDF run).
+        runCatching { HiddenChats.prepare(s) }
         publish(s, since)
         s
     }
@@ -407,10 +426,11 @@ object Graph {
     fun inboxPrivateKey(s: Session): ECPrivateKey = ECPrivateKey(s.repo.kvGet("inbox_priv")!!)
 
     /**
-     * Locks: closes the DB, stops the session's work and wipes keys from memory. An unlock still in progress when this
-     * is called doesn't open afterwards ([lockEpoch]).
+     * Locks: closes the DB, stops the session's work and wipes keys from memory. Hidden chats shown are put away first,
+     * unless [putAwayHidden] is false (a wipe follows, and destroys them anyway). An unlock still in progress when this is
+     * called doesn't open afterwards ([lockEpoch]).
      */
-    fun lock() {
+    fun lock(putAwayHidden: Boolean = true) {
         // The invite on screen belongs to this profile only (a wipe or a decoy may follow in this same process).
         Invites.forgetCachedQr()
         val s = synchronized(sessionLock) {
@@ -419,7 +439,8 @@ object Graph {
         } ?: return
         Actions.ended(s.scope)
         Mailboxes.ended()
-        s.close()
+        // On the thread that locks (often the main one): it's database work, but no key derivation or Keystore call.
+        s.close { if (putAwayHidden) HiddenChats.onLock(s) }
         ClipboardGuard.onLock(app, s.prefs)
         if (s.prefs.wipeMemoryOnLock) {
             MemoryScrubber.scrubAsync()

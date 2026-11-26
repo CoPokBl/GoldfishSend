@@ -181,7 +181,7 @@ class Db private constructor(private val sql: SQLiteDatabase) {
 }
 
 internal object Schema {
-    const val VERSION = 8
+    const val VERSION = 9
 
     fun migrate(db: Db, sql: SQLiteDatabase) {
         val v = sql.version
@@ -229,9 +229,40 @@ internal object Schema {
                     db.exec(s)
                 }
             }
+            if (v < 9) {
+                for (s in V9) {
+                    db.exec(s)
+                }
+            }
             sql.version = VERSION
         }
     }
+
+    /** Hidden chats sealed under their own PIN (core/HiddenChats), and group held messages sealed like message bodies. */
+    internal val V9 = listOf(
+        // Rebuilt: held group blobs were sealed only by the DB key, so wipes and timers didn't reach them. Nothing was released.
+        "DROP TABLE group_held",
+        // A group message waiting for its sender's roster: the blob (or content read from one, see GroupEngine), sealed
+        // like a message body ([MessageVault], label "gheld/<ref>") with an expiry, so erasing messages, the restart wipe
+        // and the group's timer destroy it too.
+        """CREATE TABLE group_held (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cid INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            ref TEXT NOT NULL,
+            hint_key BLOB NOT NULL,
+            blob BLOB NOT NULL,
+            key BLOB NOT NULL,
+            bucket INTEGER,
+            received_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        )""",
+        // Pushes for a mailbox this profile doesn't know (a put-away hidden chat's, or a stale one), each sealed to the
+        // hidden chats' public key at one fixed size. No time, no tag: only their number and order show.
+        "CREATE TABLE hidden_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, blob BLOB NOT NULL)",
+        // Hidden chats used to be a flag only. They'd now be sealed to a key nobody has on the first unlock: show them instead.
+        "UPDATE contacts SET hidden = 0",
+        "DELETE FROM kv WHERE k = 'hidden_on'",
+    )
 
     /** Held messages sealed like message bodies, tombstones for removed messages, and mailboxes still to delete. */
     internal val V8 = listOf(

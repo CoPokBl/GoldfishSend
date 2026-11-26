@@ -142,6 +142,17 @@ const val KV_SHRED_PENDING = "shred_pending"
 /** Messages held behind a changed safety number, per contact. */
 const val MAX_HELD_PER_CONTACT = 200L
 
+/** Group messages held until their sender's roster arrives, per group, and the longest one is kept. */
+const val MAX_GROUP_HELD = 200L
+const val GROUP_HELD_MAX_MS = 7 * 86_400_000L
+
+/**
+ * kv: the hidden chats' message root (core/HiddenChats), sealed under the profile's message root. Hidden chats' message
+ * keys are wrapped by it while they're put away, so erasing messages (which replaces it) and the restart wipe (which
+ * destroys the root it's sealed under) reach them too, without their PIN.
+ */
+const val KV_HIDDEN_ROOT = "hidden_root"
+
 /** How long after sending an unreceipted message may be re-sent automatically. */
 const val RESEND_WINDOW_MS = 7 * 86_400_000L
 
@@ -338,6 +349,35 @@ class Repo(val db: Db, private val vault: MessageVault) {
     }.filterNotNull()
 
     fun clearHeldIncoming(contactId: Long) = db.exec("DELETE FROM held_incoming WHERE contact_id = ?", contactId)
+
+    /**
+     * Keeps a group message (blob, or content already read from one) until its sender's roster arrives. Sealed like a
+     * message body, with an expiry, as [holdIncoming] is: erasing messages, the restart wipe and the group's timer reach it.
+     */
+    fun holdGroupMessage(cid: Long, hintKey: ByteArray, blob: ByteArray, expiresAt: Long) {
+        // Bounded: a flood from a hostile member can't fill storage.
+        if (db.long("SELECT COUNT(*) FROM group_held WHERE cid = ?", cid) >= MAX_GROUP_HELD) {
+            return
+        }
+        val ref = B64.enc(Rand.bytes(16))
+        db.tx {
+            val sealed = vault.seal("gheld/$ref", blob, expiresAt)
+            db.exec(
+                "INSERT INTO group_held (cid, ref, hint_key, blob, key, bucket, received_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                cid, ref, hintKey, sealed.ciphertext, sealed.wrappedKey, sealed.bucket, System.currentTimeMillis(), expiresAt,
+            )
+        }
+    }
+
+    /** A group's held messages, oldest first. Expired ones, and ones whose key was destroyed, are left out. */
+    fun heldGroupMessages(cid: Long, now: Long): List<app.goldfishsend.group.HeldBlob> = db.query(
+        "SELECT id, ref, hint_key, blob, key, bucket FROM group_held WHERE cid = ? AND expires_at > ? ORDER BY id", cid, now,
+    ) { c ->
+        runCatching {
+            val blob = vault.open("gheld/" + c.getString(1), c.getBlob(4), c.getBlob(3), if (c.isNull(5)) null else c.getLong(5))
+            app.goldfishsend.group.HeldBlob(c.getLong(0), c.getBlob(2), blob)
+        }.getOrNull()
+    }.filterNotNull()
 
     // --- hidden chats ---
 
@@ -617,6 +657,14 @@ class Repo(val db: Db, private val vault: MessageVault) {
                 for ((id, wk) in held) {
                     vault.rewrapUnder(next, "held/$id", wk)?.let { db.exec("UPDATE held_incoming SET key = ? WHERE id = ?", it, id) }
                 }
+                val groupHeld = db.query("SELECT id, ref, key FROM group_held WHERE bucket IS NULL") { Triple(it.getLong(0), it.getString(1), it.getBlob(2)) }
+                for ((id, ref, wk) in groupHeld) {
+                    vault.rewrapUnder(next, "gheld/$ref", wk)?.let { db.exec("UPDATE group_held SET key = ? WHERE id = ?", it, id) }
+                }
+                // The hidden chats' root is sealed under this one: it moves along, or put-away hidden messages would be lost.
+                kvGet(KV_HIDDEN_ROOT)?.let { blob ->
+                    vault.resealUnder(next, KV_HIDDEN_ROOT, blob)?.let { kvPut(KV_HIDDEN_ROOT, it) }
+                }
                 val outbox = db.query("SELECT seq, content FROM outbox WHERE content IS NOT NULL") { it.getLong(0) to it.getBlob(1) }
                 for ((seq, content) in outbox) {
                     vault.resealUnder(next, "outbox", content)?.let { db.exec("UPDATE outbox SET content = ? WHERE seq = ?", it, seq) }
@@ -649,6 +697,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
         db.exec("DELETE FROM chunks WHERE created_at < ?", now - 7 * 24 * 3600_000L)
         // Held messages go on the chat's timer like any other.
         db.exec("DELETE FROM held_incoming WHERE expires_at <= ?", now)
+        db.exec("DELETE FROM group_held WHERE expires_at <= ?", now)
         db.exec("DELETE FROM gone_incoming WHERE until <= ?", now)
         if (ids.size >= 20) {
             markNeedsVacuum()
@@ -658,7 +707,7 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun nextExpiry(): Long? = db.queryOne(
         "SELECT MIN(e) FROM (SELECT MIN(expires_at) AS e FROM messages WHERE expires_at IS NOT NULL " +
-            "UNION ALL SELECT MIN(expires_at) AS e FROM held_incoming)",
+            "UNION ALL SELECT MIN(expires_at) AS e FROM held_incoming UNION ALL SELECT MIN(expires_at) AS e FROM group_held)",
     ) {
         if (it.isNull(0)) null else it.getLong(0)
     }
@@ -695,6 +744,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
             db.exec("DELETE FROM chunks")
             // Undelivered group messages that arrived before their sender's roster are messages too.
             db.exec("DELETE FROM group_held")
+            // So are hidden chats' messages, put away or not yet opened: a new hidden root leaves the put-away ones
+            // unreadable (that needs no PIN), and the parked pushes go.
+            db.exec("DELETE FROM hidden_inbox")
+            kvPut(KV_HIDDEN_ROOT, null)
             // Group membership traffic (rosters, cards) isn't a message: keep it so the groups stay consistent.
             db.exec("DELETE FROM outbox WHERE kind = ? AND (member_key IS NULL OR message_id IS NOT NULL)", OutboxKind.CONTENT)
             db.exec("UPDATE contacts SET unread = 0")
@@ -893,13 +946,20 @@ class Repo(val db: Db, private val vault: MessageVault) {
      * transaction: they're deleted there later, retried until it confirms ([DoomedMailbox]).
      */
     fun doomMailboxes(boxes: List<Mailbox>, server: String, serverKey: String?) = db.tx {
-        val now = System.currentTimeMillis()
+        doomSecrets(boxes.map { it.sendSecret to it.ownerSecret }, server, serverKey)
         for (b in boxes) {
+            db.exec("DELETE FROM mailboxes WHERE id = ?", b.id)
+        }
+    }
+
+    /** Records mailboxes (send secret, owner secret) that have no row (any more) as doomed, like [doomMailboxes]. */
+    fun doomSecrets(secrets: List<Pair<ByteArray, ByteArray>>, server: String, serverKey: String?) {
+        val now = System.currentTimeMillis()
+        for ((send, owner) in secrets) {
             db.exec(
                 "INSERT OR REPLACE INTO doomed_mailboxes (send_secret, owner_secret, server, server_key, created_at) VALUES (?, ?, ?, ?, ?)",
-                b.sendSecret, b.ownerSecret, server, serverKey, now,
+                send, owner, server, serverKey, now,
             )
-            db.exec("DELETE FROM mailboxes WHERE id = ?", b.id)
         }
     }
 

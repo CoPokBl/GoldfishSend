@@ -174,10 +174,11 @@ class KeyVault(private val context: Context) {
 
     // --- duress PIN and hidden-chats PIN ---
     //
-    // Both slots always hold data of the same shape. When a feature is off, the slot contains random bytes that no PIN
-    // opens, so the files on disk don't reveal whether a duress PIN or hidden chats exist. Whether they're on is
-    // recorded only inside the encrypted database (see Repo kv "duress_on"/"hidden_on"), and what the duress PIN does is
-    // sealed under the device key ([duressAction]), so no plain preference records either.
+    // Both slots always hold data of the same shape, sealed under a Keystore key. When a feature is off, the slot holds
+    // filler that no PIN opens, so the files on disk don't reveal whether a duress PIN or hidden chats exist. Whether a
+    // duress PIN is on is recorded only inside the encrypted database (Repo kv "duress_on"), and what it does is sealed
+    // under the device key ([duressAction]). Whether hidden chats exist isn't recorded anywhere: not even the open real
+    // profile can tell without their PIN (core/HiddenChats).
 
     /**
      * What a matching duress PIN opened: the decoy profile's database key, and [salt] and [secretTag]
@@ -290,33 +291,64 @@ class KeyVault(private val context: Context) {
         plain.wipe()
     }
 
-    /** Hidden-chats PIN: a plain Argon2id check (the app is already unlocked when it's entered). */
-    fun isHiddenPin(pin: CharArray): Boolean {
-        val stored = prefs.getString(P_HIDDEN, null)?.let { B64.dec(it) } ?: return false
-        val salt = prefs.getString(P_HIDDEN_SALT, null)?.let { B64.dec(it) } ?: return false
-        val h = argon2(pin, salt)
-        val eq = MessageDigest.isEqual(h, stored)
-        h.wipe()
-        return eq
+    /**
+     * The hidden-chats slot holds `hiddenKey(HiddenSlot(secretKek(pin, salt), secret))`: the PIN goes through the same
+     * Keystore HMAC and Argon2 as the app secret, and the result is sealed under a Keystore key of its own ("gf_hidden",
+     * unlocked-device-required). So a copy of the files can't be tested offline, and whether the slot is filler or real
+     * can't be told. Its own key, not the device key: it must outlive changes of the unlock method, including to the
+     * phone's screen lock, which has no device key. Returns the hidden-chats secret (the caller wipes it) or null, always
+     * after the same single Argon2 run.
+     */
+    fun openHidden(pin: CharArray): ByteArray? {
+        val blob = prefs.getString(P_HIDDEN, null)?.let { B64.dec(it) }
+        val salt = prefs.getString(P_HIDDEN_SALT, null)?.let { B64.dec(it) } ?: Rand.bytes(16)
+        val kek = runCatching { secretKek(pin, salt) }.getOrNull() ?: return null
+        try {
+            val inner = blob?.let { runCatching { keystoreOpen(ALIAS_HIDDEN, it) }.getOrNull() } ?: return null
+            try {
+                return HiddenSlot.open(kek, inner)
+            } finally {
+                inner.wipe()
+            }
+        } finally {
+            kek.wipe()
+        }
     }
 
-    fun setHiddenPin(pin: CharArray?) {
+    /** Seals [secret] under [pin], or (both null) replaces the slot with filler that no PIN opens. */
+    fun setHidden(pin: CharArray?, secret: ByteArray?) {
         val salt = Rand.bytes(16)
-        val h = if (pin != null) argon2(pin, salt) else Rand.bytes(32)
-        prefs.edit().putString(P_HIDDEN, B64.enc(h)).putString(P_HIDDEN_SALT, B64.enc(salt)).commit()
-        h.wipe()
+        ensureHiddenKey()
+        val inner = if (pin != null && secret != null) {
+            ensurePinKey()
+            val kek = secretKek(pin, salt)
+            HiddenSlot.seal(kek, secret).also { kek.wipe() }
+        } else {
+            HiddenSlot.filler()
+        }
+        val blob = if (keyStore.containsAlias(ALIAS_HIDDEN)) keystoreSeal(ALIAS_HIDDEN, inner) else Rand.bytes(inner.size + 28)
+        inner.wipe()
+        prefs.edit().putString(P_HIDDEN, B64.enc(blob)).putString(P_HIDDEN_SALT, B64.enc(salt)).commit()
+    }
+
+    private fun ensureHiddenKey() {
+        if (!keyStore.containsAlias(ALIAS_HIDDEN)) {
+            createKey(ALIAS_HIDDEN, preferStrongBox = false, biometric = false)
+        }
     }
 
     /** Fills the slots with decoy data, if they're empty (setup, upgrade). */
     fun ensureDecoySlots() {
+        // The hidden-chats PIN can be set with any unlock method: its KDF key must exist even without an app secret.
+        runCatching { ensurePinKey() }
         if (!prefs.contains(P_DURESS) || !prefs.contains(P_DURESS_SALT)) {
             setDuress(null)
         }
         if (!prefs.contains(P_DURESS_ACTION)) {
             duressAction = DuressAction.WIPE_ALL
         }
-        if (!prefs.contains(P_HIDDEN) || !prefs.contains(P_HIDDEN_SALT)) {
-            setHiddenPin(null)
+        if (!prefs.contains(P_HIDDEN) || !prefs.contains(P_HIDDEN_SALT) || !keyStore.containsAlias(ALIAS_HIDDEN)) {
+            setHidden(null, null)
         }
     }
 
@@ -622,7 +654,7 @@ class KeyVault(private val context: Context) {
     /** Destroys every key: everything encrypted becomes unrecoverable. */
     fun destroyAll() {
         val extra = listOfNotNull(prefs.getString(P_DEVICE_ALIAS, null), prefs.getString(P_NEXT_ALIAS, null))
-        for (alias in listOf(ALIAS_DEVICE, ALIAS_BIO, ALIAS_SYSLOCK, ALIAS_PIN) + extra) {
+        for (alias in listOf(ALIAS_DEVICE, ALIAS_BIO, ALIAS_SYSLOCK, ALIAS_PIN, ALIAS_HIDDEN) + extra) {
             runCatching { keyStore.deleteEntry(alias) }
         }
         destroyMessageKey()
@@ -741,6 +773,7 @@ class KeyVault(private val context: Context) {
         private const val ALIAS_BIO = "gf_bio"
         private const val ALIAS_SYSLOCK = "gf_syslock"
         private const val ALIAS_PIN = "gf_pin"
+        private const val ALIAS_HIDDEN = "gf_hidden"
         private const val P_SCREENLOCK = "screenlock"
         private const val P_SECRET_KIND = "secret_kind"
         private const val KIND_PIN = "pin"

@@ -119,7 +119,7 @@ object Wiper {
         // Every wipe, not only the panic ones that end the process: nothing started before it may go on talking to a
         // server (perhaps no longer through Tor, once the settings are gone) or write settings back afterwards.
         Graph.stopBackground()
-        Graph.lock()
+        Graph.lock(putAwayHidden = false)
         Graph.vault.destroyAll()
         app.goldfishsend.crypto.BucketKeys.destroyAll()
         // Anything copied from a chat goes too.

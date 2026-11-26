@@ -72,6 +72,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.goldfishsend.ui.ContentReady
 import app.goldfishsend.core.Graph
+import app.goldfishsend.core.HiddenChats
 import app.goldfishsend.core.traced
 import app.goldfishsend.core.Mailboxes
 import app.goldfishsend.core.Session
@@ -157,6 +158,7 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
     // Hidden chats stay out of the list until the hidden-chats PIN was entered in this session.
     val chats = remember(allChats, revealed) { allChats?.filter { !it.hidden || revealed } }
     var askHiddenPin by remember { mutableStateOf(false) }
+    val hideScope = rememberCoroutineScope()
     val focus = androidx.compose.ui.platform.LocalFocusManager.current
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     // Filters by name only: searching message text would mean decrypting every message.
@@ -217,7 +219,10 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
             // First setup: the mailbox pool is being filled. The app is usable meanwhile; invites wait for the first one.
             val preparing = pushOk && busy && chats.isNullOrEmpty()
             MailboxWait(preparing, Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
-            StatusLine(revealed, "Showing hidden chats", action = "Hide") { s.hiddenRevealed.value = false }
+            StatusLine(revealed, "Showing hidden chats", action = "Hide") {
+                // Put away again: sealed under their PIN, and gone from the database until it's entered.
+                hideScope.launch(Dispatchers.IO) { runCatching { HiddenChats.hide(s) } }
+            }
             AnimatedVisibility(searching, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                 SecureTextField(
                     query, { query = it },
@@ -268,12 +273,14 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
         ) { pin ->
             // The dialog closes the same way whether or not the PIN matched (or hidden chats exist).
             work.run {
-                val ok = withContext(Dispatchers.Default) {
-                    // The profile's own hidden-chats PIN: a decoy checks its own, at the same cost, never the real one.
-                    s.secrets.isHiddenPin(pin).also { pin.fill('\u0000') }
-                }
-                if (ok) {
-                    s.hiddenRevealed.value = true
+                withContext(Dispatchers.IO) {
+                    // The profile's own hidden-chats PIN: a decoy checks its own, at the same cost, never the real one. The
+                    // right one brings the hidden chats back into the database.
+                    try {
+                        runCatching { HiddenChats.reveal(s, pin) }
+                    } finally {
+                        pin.fill('\u0000')
+                    }
                 }
                 askHiddenPin = false
             }

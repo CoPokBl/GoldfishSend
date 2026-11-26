@@ -136,15 +136,15 @@ class RepoGroupStore(private val repo: Repo) : GroupStore {
 
     override fun hold(gid: String, hintKey: ByteArray, blob: ByteArray) {
         val cid = cidOf(gid) ?: return
-        if (db.long("SELECT COUNT(*) FROM group_held WHERE cid = ?", cid) >= 200) {
-            return
-        }
-        db.insert("INSERT INTO group_held (cid, hint_key, blob, received_at) VALUES (?, ?, ?, ?)", cid, hintKey, blob, System.currentTimeMillis())
+        // Gone on the group's timer like its messages, and after a week at most.
+        val timer = repo.contact(cid)?.timerSecs ?: 0
+        val keep = if (timer > 0) minOf(timer * 1000, GROUP_HELD_MAX_MS) else GROUP_HELD_MAX_MS
+        repo.holdGroupMessage(cid, hintKey, blob, System.currentTimeMillis() + keep)
     }
 
     override fun held(gid: String): List<HeldBlob> {
         val cid = cidOf(gid) ?: return emptyList()
-        return db.query("SELECT id, hint_key, blob FROM group_held WHERE cid = ? ORDER BY id", cid) { HeldBlob(it.getLong(0), it.getBlob(1), it.getBlob(2)) }
+        return repo.heldGroupMessages(cid, System.currentTimeMillis())
     }
 
     override fun dropHeld(id: Long) = db.exec("DELETE FROM group_held WHERE id = ?", id)
