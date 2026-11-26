@@ -1,7 +1,9 @@
-# Optional, off unless you add this file: per-Tor-circuit gateway flood buckets for the onion service.
+# Optional, off unless you add this file: per-Tor-circuit gateway flood buckets for the onion service with Caddy.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.onion-circuits.yml --profile onion up -d --build
-#   # behind Traefik: -f docker-compose.yml -f docker-compose.traefik.yml -f docker-compose.onion-circuits.yml
+#
+# Behind Traefik (docker-compose.traefik.yml) this is built in and on: there the api already has a fixed onion address
+# and Tor already skips the reverse proxy, so it costs nothing. Adding this file there as well changes nothing.
 #
 # Without it, every onion client reaches the api from the Tor container's address, so they all share one gateway
 # flood-guard bucket, and any one of them can use it up for everyone. With it, Tor starts each connection with a PROXY
@@ -13,7 +15,8 @@
 #   - Onion traffic goes straight to the api's onion listener instead of through Caddy. The api's own limits apply, and
 #     that listener serves only /v1/gw and /v1/key.
 #   - The api needs a fixed address on the onion network (GOLDFISH_ONION_API_IP), so it can't be scaled with
-#     `--scale api=N` while this is on.
+#     `--scale api=N` while this is on. That's why it isn't the default here: compose can't give the api that address
+#     only when the onion profile runs, so it would hold for every deployment, onion or not.
 
 services:
   api:

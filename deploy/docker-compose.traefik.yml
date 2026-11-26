@@ -14,6 +14,8 @@
 #     address, escaping rate limits or exhausting someone else's. Without it, every client looks like Traefik and shares
 #     one rate limit, and the api logs a warning saying so.
 #   - The api keeps outbound internet (for verification pushes) through the egress network.
+#   - The optional onion service (`--profile onion`) forwards straight to the api's onion listener, with a flood-guard
+#     bucket per Tor circuit (as docker-compose.onion-circuits.yml does for the Caddy setup, which is built in here).
 #
 # Requirements on YOUR Traefik (static configuration). See server/README.md, "Running behind Traefik":
 #   - A fixed address on GOLDFISH_TRAEFIK_NETWORK, so GOLDFISH_TRAEFIK_IP stays right when the Traefik container is
@@ -46,6 +48,9 @@ services:
       Goldfish__Network__TrustedProxies__1: "${GOLDFISH_TRAEFIK_IP6:-}"
       Goldfish__Network__TrustedProxies__2: "${GOLDFISH_UPSTREAM_PROXIES:-}"
       Goldfish__Network__ForwardLimit: "${GOLDFISH_FORWARD_LIMIT:-1}"
+      # The onion listener with Tor circuit ids (see the tor service below). Bound to the api's address on the onion
+      # network, where only Tor can reach it: whoever connects there can name any circuit. Idle without the onion profile.
+      Goldfish__Network__OnionCircuitEndpoint: "${GOLDFISH_ONION_API_IP:-172.30.251.3}:8081"
     labels:
       traefik.enable: "true"
       traefik.docker.network: "${GOLDFISH_TRAEFIK_NETWORK:-traefik}"
@@ -78,13 +83,16 @@ services:
       traefik.http.services.goldfish.loadbalancer.healthcheck.timeout: "3s"
 
   # The optional onion service (profile "onion") can't go through Caddy here, so it forwards straight to the api, which
-  # gets a fixed address on the onion network. The api treats Tor's address as the client (it isn't a trusted proxy), so
-  # onion clients share one rate-limit address, as with Caddy. Kestrel's own limits apply on this path, and /healthz and
-  # /readyz are reachable from the onion (they reveal only "ok"/"ready").
+  # gets a fixed address on the onion network. It goes to the api's onion listener, not its main one: Tor starts each
+  # connection with a PROXY line naming its circuit (HiddenServiceExportCircuitID), and the gateway flood guard gives each
+  # circuit its own bucket inside one onion-wide bucket, so one onion client can't use up the bucket they all share.
+  # Nothing is lost by that here: the api already has a fixed onion address, and the listener serves only /v1/gw and
+  # /v1/key. Past the flood guard, all onion clients are still one rate-limit address, as with Caddy.
   tor:
     depends_on: !reset []
     environment:
-      GOLDFISH_ONION_TARGET: "${GOLDFISH_ONION_API_IP:-172.30.251.3}:8080"
+      GOLDFISH_ONION_CIRCUIT_IDS: "1"
+      GOLDFISH_ONION_TARGET: "${GOLDFISH_ONION_API_IP:-172.30.251.3}:8081"
 
 networks:
   traefik:
