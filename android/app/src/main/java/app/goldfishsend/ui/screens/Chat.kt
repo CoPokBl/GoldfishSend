@@ -733,8 +733,10 @@ private fun chatGroup(s: Session, cid: Long): ChatGroup? {
     val me = app.goldfishsend.core.Groups.me(s)
     // Members now, plus anyone who sent a message here and has since left (their name is remembered from their card).
     val senders = s.repo.db.query("SELECT DISTINCT sender_key FROM messages WHERE contact_id = ? AND sender_key IS NOT NULL", cid) { it.getString(0) }
-    val names = (r.members.map { it.id } + senders).toSet().associateWith { app.goldfishsend.core.Groups.memberName(s, m, it).name }
-    val inviter = m.invitedBy?.let { app.goldfishsend.core.Groups.memberName(s, m, it).name } ?: "Someone"
+    // Named together, so that names that look alike are told apart; a name someone chose themselves is marked as theirs.
+    val ids = (r.members.map { it.id } + senders + listOfNotNull(m.invitedBy)).toSet()
+    val names = app.goldfishsend.core.Groups.memberNames(s, m, ids).mapValues { it.value.label }
+    val inviter = m.invitedBy?.let { names[it] } ?: "Someone"
     val active = r.members.count { it.role != app.goldfishsend.proto.Role.INVITED }
     val invited = r.members.size - active
     val count = "$active ${if (active == 1) "member" else "members"}" + if (invited > 0) ", $invited invited" else ""

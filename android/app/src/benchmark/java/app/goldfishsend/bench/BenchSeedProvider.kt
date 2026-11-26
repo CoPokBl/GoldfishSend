@@ -225,6 +225,7 @@ class BenchSeedProvider : ContentProvider() {
                 kyberId, B64.enc(kyber.publicKey.serialize()), B64.enc(kyberSig),
             ),
             seq = 1,
+            since = 1,
         )
         val invitees = members.map { B64.enc(s.repo.contact(it)!!.identityKey!!) }
         s.lock.lock()

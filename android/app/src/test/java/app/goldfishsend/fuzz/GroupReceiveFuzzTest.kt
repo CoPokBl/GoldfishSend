@@ -162,6 +162,7 @@ class GroupReceiveFuzzTest {
             hintKey = if (data.consumeBoolean()) B64.enc(ByteArray(32) { 4 }) else data.str(45),
             bundle = bundle,
             seq = data.consumeLong(),
+            since = if (data.consumeBoolean()) data.consumeLong(0, 12) else data.consumeLong(),
         )
         val signed = GroupCrypto.signCard(signer.privateKey, card)
         return cardState(signed)
@@ -205,15 +206,16 @@ class GroupReceiveFuzzTest {
 
         val bobHint = ByteArray(32) { 2 }
 
-        fun card(k: IdentityKeyPair, hint: ByteArray = ByteArray(32) { 5 }): SignedCard = GroupEngine.makeCard(
+        fun card(k: IdentityKeyPair, hint: ByteArray = ByteArray(32) { 5 }, since: Long = 1): SignedCard = GroupEngine.makeCard(
             k,
             GroupCard(
                 g = gid, id = id(k), name = "n", inbox = CardInbox("https://h.example", fp, B64.enc(ByteArray(32) { 6 })),
-                hintKey = B64.enc(hint), bundle = bundles.getValue(id(k)), seq = 1,
+                hintKey = B64.enc(hint), bundle = bundles.getValue(id(k)), seq = 1, since = since,
             ),
         )
 
-        val cards = listOf(alice, mallory, carol, ivan, sam, dave).associate { id(it) to card(it) }
+        /** Carol's for her second stint (invited back at v5), everyone else's for their first. */
+        val cards = listOf(alice, mallory, carol, ivan, sam, dave).associate { id(it) to card(it, since = if (it == carol) 5 else 1) }
         val bobCard = card(bob, bobHint)
 
         fun store(k: IdentityKeyPair): LastResortStore = LastResortStore(k, 7).also { s ->

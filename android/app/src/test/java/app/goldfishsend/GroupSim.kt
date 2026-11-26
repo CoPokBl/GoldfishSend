@@ -291,7 +291,8 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
         return secret to hint
     }
 
-    fun card(gid: String, seq: Long = 1, reuse: CardBundle? = null): SignedCard {
+    /** A card for our stint in [gid] (as our model has it, else the first), like the app's. */
+    fun card(gid: String, seq: Long = 1, reuse: CardBundle? = null, since: Long = store.load(gid)?.since?.takeIf { it > 0 } ?: 1): SignedCard {
         val (secret, hint) = newInbox(gid)
         val bundle = reuse ?: run {
             val spkId = keyId++
@@ -310,7 +311,7 @@ class Peer(val name: String, private val net: GroupNet, val identity: IdentityKe
         val card = GroupCard(
             g = gid, id = id, name = name,
             inbox = CardInbox("https://$name.example", B64.enc(ByteArray(32) { 7 }), secret),
-            hintKey = B64.enc(hint), bundle = bundle, seq = seq,
+            hintKey = B64.enc(hint), bundle = bundle, seq = seq, since = since,
         )
         return GroupEngine.makeCard(identity, card)
     }

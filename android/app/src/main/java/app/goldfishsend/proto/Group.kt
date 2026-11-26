@@ -25,6 +25,11 @@ data class CardBundle(
     val kyberPreKeySig: String,
 )
 
+/**
+ * A member's card. [since] names the stint it's for (their roster entry's): members take it only for that stint, so a
+ * card from an earlier one, whose inbox and keys are gone, can't stand in for a newer one, whatever its [seq]. [seq]
+ * grows with each new card in a stint, and the highest wins.
+ */
 @Serializable
 data class GroupCard(
     val v: Int = 1,
@@ -35,6 +40,7 @@ data class GroupCard(
     val hintKey: String,
     val bundle: CardBundle,
     val seq: Long,
+    val since: Long,
 )
 
 /** Signed bytes as they travel inside another document: b64u bytes and b64u signature. */
@@ -253,7 +259,7 @@ object GroupCrypto {
         } catch (e: Exception) {
             return null
         }
-        if (c.v != 1 || c.seq < 1 || !verify(c.id, CARD_LABEL, bytes, sig)) {
+        if (c.v != 1 || c.seq < 1 || c.since < 1 || !verify(c.id, CARD_LABEL, bytes, sig)) {
             return null
         }
         val ok = try {

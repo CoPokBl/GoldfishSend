@@ -283,10 +283,11 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
 
 private fun loadChats(q: Session): List<ChatEntry> = traced("gf.chatList") {
     val groups = q.repo.groupRefs().associateBy { it.cid }
+    val people by lazy { q.repo.people() }
     q.repo.chatSummaries(System.currentTimeMillis()).map { c ->
         val ref = groups[c.contact.id]
         val sender = if (ref != null && !c.lastOutgoing && c.lastSender != null) {
-            Groups.memberName(q, Groups.model(q, ref.cid), c.lastSender).name
+            Groups.memberName(q, Groups.model(q, ref.cid), c.lastSender, people).label
         } else {
             null
         }
