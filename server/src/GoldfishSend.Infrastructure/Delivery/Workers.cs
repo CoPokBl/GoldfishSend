@@ -165,6 +165,17 @@ public sealed class StreamDeliveryWorker : PumpWorker<QueueEntry> {
         }
     }
 
+    /// <summary>
+    /// A message parked while its mailbox was verified, rotated or recovered would miss that change's wake-up and sleep
+    /// until it expires, so every park is followed by another look at the mailbox.
+    /// </summary>
+    internal static async Task RecheckHeldAsync(
+        PendingMessageRepository pending, DeliverySignal signal, DeliveryJob job, DeliveryOutcome outcome, CancellationToken ct) {
+        if (outcome.HeldEndpoint is { } endpoint && await pending.RecheckHeldAsync(job.Id, job.MailboxId, endpoint, ct)) {
+            await signal.NotifyRetryAsync();
+        }
+    }
+
     protected override async Task HandleAsync(QueueEntry entry, CancellationToken ct) {
         if (entry.Job is not { } job) {
             await _queue.CompleteAsync(entry.EntryId);
@@ -175,6 +186,9 @@ public sealed class StreamDeliveryWorker : PumpWorker<QueueEntry> {
         if (outcome.Kind is DeliveryOutcomeKind.Retry or DeliveryOutcomeKind.Hold) {
             var attempts = outcome.Kind == DeliveryOutcomeKind.Retry && outcome.CountsAsAttempt ? job.Attempts + 1 : job.Attempts;
             await _pending.UpsertAsync(job.Id, job.MailboxId, job.KeyEpoch, job.Blob, attempts, outcome.NextAttemptAt, job.ExpiresAt, ct);
+            if (outcome.Kind == DeliveryOutcomeKind.Hold) {
+                await RecheckHeldAsync(_pending, _signal, job, outcome, ct);
+            }
         }
         await _queue.CompleteAsync(entry.EntryId);
     }
@@ -233,6 +247,7 @@ public sealed class RetryWorker : PumpWorker<PendingMessageRow> {
                 break;
             case DeliveryOutcomeKind.Hold:
                 await _pending.RescheduleAsync(row.Id, row.Attempts, outcome.NextAttemptAt, ct);
+                await StreamDeliveryWorker.RecheckHeldAsync(_pending, _signal, job, outcome, ct);
                 break;
         }
     }
@@ -240,12 +255,13 @@ public sealed class RetryWorker : PumpWorker<PendingMessageRow> {
 
 /// <summary>
 /// Housekeeping. Every node rotates its epoch-key cache and prunes local guard state. The cluster-wide
-/// sweeps (expired messages, purged mailboxes, departed stream consumers) run on one node at a time,
-/// under a Redis lease.
+/// sweeps (expired messages, purged mailboxes, departed stream consumers, AOF compaction) run on one node at a time,
+/// under Redis leases.
 /// </summary>
 public sealed class MaintenanceWorker : BackgroundService {
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
     private const string LockKey = "gf:lock:maintenance";
+    private const string AofLockKey = "gf:lock:aof-rewrite";
 
     private readonly EpochKeyring _keyring;
     private readonly MailboxRepository _mailboxes;
@@ -253,19 +269,56 @@ public sealed class MaintenanceWorker : BackgroundService {
     private readonly MessageQueue _queue;
     private readonly DeliverySignal _signal;
     private readonly IConnectionMultiplexer _redis;
+    private readonly RedisPersistence _persistence;
     private readonly ILogger<MaintenanceWorker> _logger;
     private readonly string _token = Guid.NewGuid().ToString("N");
+    private readonly TimeSpan _aofRewriteInterval;
+    private bool _aofRewriteRefused;
 
     public MaintenanceWorker(
         EpochKeyring keyring, MailboxRepository mailboxes, PendingMessageRepository pending, MessageQueue queue, DeliverySignal signal,
-        IConnectionMultiplexer redis, ILogger<MaintenanceWorker> logger) {
+        IConnectionMultiplexer redis, RedisPersistence persistence, GoldfishOptions options, ILogger<MaintenanceWorker> logger) {
         _keyring = keyring;
         _mailboxes = mailboxes;
         _pending = pending;
         _queue = queue;
         _signal = signal;
         _redis = redis;
+        _persistence = persistence;
         _logger = logger;
+        _aofRewriteInterval = TimeSpan.FromMinutes(Math.Max(0, options.Messages.AofRewriteMinutes));
+    }
+
+    /// <summary>
+    /// Has the main Redis rewrite its AOF, at most once per interval across the cluster. Until then every queue entry
+    /// since the last rewrite is still in the log, delivered or not, and for a message delivered straight away that's
+    /// the only copy of its seal key on disk. Only when the AOF is known to be on: asked of a Redis without one,
+    /// BGREWRITEAOF would write the whole dataset to disk.
+    /// </summary>
+    internal async Task CompactAofAsync() {
+        if (_aofRewriteInterval <= TimeSpan.Zero) {
+            return;
+        }
+        var db = _redis.GetDatabase();
+        // Slightly short of the interval, so the once-a-minute loop doesn't skip a whole extra minute.
+        var lease = _aofRewriteInterval - TimeSpan.FromSeconds(5);
+        if (await _persistence.AofEnabledAsync() != true || !await db.StringSetAsync(AofLockKey, _token, lease, When.NotExists)) {
+            return;
+        }
+        try {
+            await _persistence.RewriteAofAsync();
+            _aofRewriteRefused = false;
+        } catch (RedisServerException ex) when (ex.Message.Contains("in progress", StringComparison.OrdinalIgnoreCase)) {
+            // One is already running (Redis's own, or a slow previous one): just as good.
+        } catch (RedisServerException ex) {
+            if (!_aofRewriteRefused) {
+                _aofRewriteRefused = true;
+                _logger.LogWarning(
+                    "Redis refused BGREWRITEAOF ({Error}). Delivered messages' queue entries stay in its AOF until Redis " +
+                    "rewrites it by itself. Allow the command for the application user (+bgrewriteaof, see deploy/redis.conf).",
+                    ex.Message);
+            }
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct) {
@@ -294,6 +347,12 @@ public sealed class MaintenanceWorker : BackgroundService {
                 break;
             } catch (Exception ex) {
                 _logger.LogError(ex, "Maintenance pass failed");
+            }
+            // Separately, so a MySQL outage doesn't also leave the AOF growing.
+            try {
+                await CompactAofAsync();
+            } catch (Exception ex) {
+                _logger.LogWarning("AOF compaction skipped: {Error}", ex.GetType().Name);
             }
             try {
                 await Task.Delay(Interval, ct);

@@ -69,6 +69,13 @@ public sealed class MessageOptions {
     /// (due immediately). They also go there if Redis refuses the write (out of memory). Messages are delivered either way.
     /// </summary>
     public int MaxStreamLength { get; set; } = 50_000;
+    /// <summary>
+    /// How often, in minutes, a worker has the main Redis rewrite its append-only file. The AOF is a log: a queue entry
+    /// (mailbox id, arrival time to the millisecond, and the blob holding the message's endpoint seal key) stays on disk
+    /// after delivery until the next rewrite, and Redis alone only rewrites once the file has doubled, which on a quiet
+    /// server takes days. Skipped if that Redis has no AOF. 0 leaves rewrites to Redis.
+    /// </summary>
+    public int AofRewriteMinutes { get; set; } = 5;
 }
 
 public sealed class MailboxOptions {

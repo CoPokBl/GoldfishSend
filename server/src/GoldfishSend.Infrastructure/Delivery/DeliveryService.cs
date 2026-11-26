@@ -27,7 +27,12 @@ public enum DeliveryOutcomeKind {
 /// <param name="CountsAsAttempt">
 /// False for local deferrals (pacing, caps, circuit open, mailbox busy). Those mustn't escalate the message's backoff.
 /// </param>
-public readonly record struct DeliveryOutcome(DeliveryOutcomeKind Kind, DateTime NextAttemptAt = default, bool CountsAsAttempt = true);
+/// <param name="HeldEndpoint">
+/// For <see cref="DeliveryOutcomeKind.Hold"/>: the sealed endpoint the mailbox had when this attempt read it. Whoever
+/// parks the message checks it against the mailbox afterwards (<see cref="PendingMessageRepository.RecheckHeldAsync"/>).
+/// </param>
+public readonly record struct DeliveryOutcome(
+    DeliveryOutcomeKind Kind, DateTime NextAttemptAt = default, bool CountsAsAttempt = true, byte[]? HeldEndpoint = null);
 
 /// <summary>One delivery attempt. It's shared by the hot-queue worker and the retry worker.</summary>
 public sealed class DeliveryService {
@@ -72,7 +77,7 @@ public sealed class DeliveryService {
             return new DeliveryOutcome(DeliveryOutcomeKind.Dropped);
         }
         if (mailbox.State == MailboxState.PendingVerification) {
-            return Park(job);
+            return Park(job, mailbox);
         }
 
         var epochKey = await _keyring.GetAsync(job.KeyEpoch, ct);
@@ -124,8 +129,10 @@ public sealed class DeliveryService {
                     }
                     return new DeliveryOutcome(DeliveryOutcomeKind.Delivered);
                 case PushStatus.Gone:
+                    // A no-op if the endpoint was replaced meanwhile. The parked message is then woken by the recheck
+                    // that follows parking, since the mailbox no longer has the endpoint that failed.
                     await _mailboxes.MarkEndpointGoneAsync(mailbox.Id, mailbox.SealedEndpoint, ct);
-                    return Park(job);
+                    return Park(job, mailbox);
                 case PushStatus.Rejected:
                     return new DeliveryOutcome(DeliveryOutcomeKind.Dropped);
                 case PushStatus.Deferred:
@@ -143,8 +150,12 @@ public sealed class DeliveryService {
         }
     }
 
-    /// <summary>Parked until expiry. Something else (verification, rotation, re-probe) wakes it if the mailbox recovers.</summary>
-    private static DeliveryOutcome Park(DeliveryJob job) => new(DeliveryOutcomeKind.Hold, job.ExpiresAt);
+    /// <summary>
+    /// Parked until expiry. Something else (verification, rotation, re-probe) wakes it if the mailbox recovers, and the
+    /// recheck after parking catches a recovery that committed while this attempt was running.
+    /// </summary>
+    private static DeliveryOutcome Park(DeliveryJob job, MailboxRow mailbox) =>
+        new(DeliveryOutcomeKind.Hold, job.ExpiresAt, HeldEndpoint: mailbox.SealedEndpoint);
 
     /// <summary>A local deferral: it retries soon, without counting as an attempt.</summary>
     private static DeliveryOutcome Defer(DeliveryJob job, DateTime now, TimeSpan delay) {
