@@ -52,9 +52,23 @@ the device tests on an emulator.
 - publishes the server image to `ghcr.io/<owner>/goldfishsend` as `latest`, `<version>` and `sha-<commit>`, for
   `linux/amd64` and `linux/arm64`, with a build provenance attestation;
 - if anything under `android/` or `.github/` changed since the last `v*` tag (or when you run it by hand with
-  **force**), builds the signed APK, checks it was signed with the expected certificate, attests its build provenance,
-  and creates a GitHub release `v<version>` with `goldfishsend-<version>.apk` and its SHA-256. The release notes list
-  the commits since the previous release, the signing fingerprint, and the exact command to reproduce the build.
+  **force**), builds the unsigned APK, signs it with `apksigner`, checks it was signed with the expected certificate,
+  attests its build provenance, and creates a GitHub release `v<version>` with `goldfishsend-<version>.apk` and its
+  SHA-256. The release notes list the commits since the previous release, the signing fingerprint, and the exact
+  command to reproduce the build.
+
+The APK is built and signed in separate jobs. The build job (`app-build`) has no access to the signing secrets and a
+read-only token, so nothing that runs during the build (actions, Gradle plugins, dependencies) can read the key. The
+signing job (`app`) checks that the APK it downloads has the digest the build job reported, then signs it. It runs
+no Gradle and only `actions/*` actions. It signs with v3 only and keeps the APK's alignment, so the published APK is
+exactly the unsigned build plus zero padding and a signing block (section 7 relies on that).
+
+Neither the publishing jobs nor the APK build restore any cache. CI jobs on `main` write the shared Gradle, NuGet and
+Docker caches, and a poisoned cache entry would otherwise run inside a build that gets signed or published. Those
+builds start cold, which makes them slower. Every action is pinned to a full commit SHA (with its tag in a comment),
+because a tag can be moved to different code. To update an action, look up the commit for the new tag
+(`git ls-remote https://github.com/<owner>/<repo> refs/tags/<tag>`, using the `^{}` line for an annotated tag) and
+review the change before bumping the pin.
 
 The version is `0.1.<number of commits on main>`, and the version code is that commit count, so every release is
 higher than the last. Change `VERSION_BASE` in `release.yml` for a new minor or major version.
@@ -79,14 +93,18 @@ and these **variables** (to the environment, or as repository variables):
 | `GF_DEFAULT_SERVER_KEY` | that server's identity fingerprint (`docker compose run --rm --no-deps api fingerprint` on the server; see "Server identity" in `server/README.md`). Leave it empty to trust the server's key on first use; the release then warns. |
 | `GF_KEY_ALIAS` | optional, default `goldfishsend` |
 
-The release job fails with a list of what's missing until all of these are set. Server image publishing needs no setup.
+The `app-config` job fails with a list of what's missing until all of these are set. It's the only other job that
+uses the `release` environment: it passes the default server variables on to the build job and runs no actions. Server image publishing needs no setup.
 After the first image push, the package is private: under the package's settings, make it public if others should
 pull it.
 
-Putting the key in GitHub means anyone who takes over the GitHub account, or a compromised action in the release job,
-could sign an update. The environment's branch rule keeps the secrets away from pull requests and other branches. Turn
-on two-factor authentication. If you'd rather keep the key offline, delete the `app` job from `release.yml` and build
-and upload releases by hand (section 4).
+Putting the key in GitHub means anyone who takes over the GitHub account, or a compromised action in the signing job
+(`actions/checkout`, `actions/download-artifact`, `actions/attest-build-provenance`, at the pinned commits), could
+sign an update. A compromised action or dependency in the build job can't read the key, but it could change the APK
+that gets signed. Reproducing the build (section 7) catches that. The environment's branch rule keeps the secrets
+away from pull requests and other branches. Turn on two-factor authentication. If you'd rather keep the key offline,
+delete the `app-config`, `app-build` and `app` jobs from `release.yml` and build and upload releases by hand
+(section 4).
 
 ### Installing with Obtainium
 

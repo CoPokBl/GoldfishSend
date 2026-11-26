@@ -1,5 +1,10 @@
 # Every push to main: run CI, then publish the server image to GHCR and, if the app changed since the last release,
 # a signed APK as a GitHub release (Obtainium picks it up). See docs/RELEASING.md for the secrets and variables.
+#
+# The jobs that publish or sign restore no caches: CI jobs on main (third-party actions included) write the caches,
+# and a poisoned Gradle home or build cache would run inside the publishing build. The APK is built by a job with
+# no secrets and signed by one that runs no build, so nothing the build runs can reach the signing key. Actions are
+# pinned to commit SHAs (tag in the comment) because a tag can be moved to different code.
 name: Release
 
 on:
@@ -23,6 +28,8 @@ permissions:
 env:
   # versionName is <base>.<commit count>, versionCode is the commit count. Bump the base for a minor/major release.
   VERSION_BASE: "0.1"
+  # apksigner comes from the same build-tools version the app pins in app/build.gradle.kts.
+  BUILD_TOOLS: "37.0.0"
 
 jobs:
   ci:
@@ -37,9 +44,10 @@ jobs:
       previous: ${{ steps.v.outputs.previous }}
       app-changed: ${{ steps.v.outputs.app-changed }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: v
         run: |
           code=$(git rev-list --count HEAD)
@@ -70,10 +78,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # No QEMU: the Dockerfile builds on the runner's own platform and the arm64 runtime stage runs nothing (no RUN),
+      # so nothing needs emulating. Add docker/setup-qemu-action back if the runtime stage ever gets a RUN.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          cache-binary: false
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -82,7 +95,7 @@ jobs:
         # Registry paths must be lower case; GitHub owner names needn't be.
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/goldfishsend" >> "$GITHUB_OUTPUT"
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
@@ -90,49 +103,42 @@ jobs:
             type=raw,value=${{ needs.version.outputs.name }}
             type=sha,format=long
       - id: push
-        uses: docker/build-push-action@v6
+        # No cache-from: the published image is built from scratch (see the top of this file).
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: server
           platforms: linux/amd64,linux/arm64
           push: true
+          no-cache: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-  app:
-    name: Publish the app
-    needs: [ci, version]
+  app-config:
+    name: Check the release configuration
+    needs: version
     if: needs.version.outputs.app-changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    # Signing secrets live in this environment, so only this job (on main) can read them.
+    timeout-minutes: 5
+    # Reads the environment's variables for the build job, which gets no environment so it never sees the secrets.
+    # This job runs no actions at all.
     environment: release
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    env:
-      CODE: ${{ needs.version.outputs.code }}
-      NAME: ${{ needs.version.outputs.name }}
-      PREVIOUS: ${{ needs.version.outputs.previous }}
-      DEFAULT_SERVER: ${{ vars.GF_DEFAULT_SERVER }}
-      DEFAULT_SERVER_KEY: ${{ vars.GF_DEFAULT_SERVER_KEY }}
-      CERT_SHA256: ${{ vars.GF_SIGNING_CERT_SHA256 }}
+    permissions: {}
+    outputs:
+      default-server: ${{ steps.check.outputs.default-server }}
+      default-server-key: ${{ steps.check.outputs.default-server-key }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/android-setup
-      - name: Check the release configuration
+      - id: check
         env:
           KEYSTORE_BASE64: ${{ secrets.GF_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.GF_KEYSTORE_PASSWORD }}
+          DEFAULT_SERVER: ${{ vars.GF_DEFAULT_SERVER }}
+          DEFAULT_SERVER_KEY: ${{ vars.GF_DEFAULT_SERVER_KEY }}
+          CERT_SHA256: ${{ vars.GF_SIGNING_CERT_SHA256 }}
         run: |
           missing=""
           [ -n "$KEYSTORE_BASE64" ] || missing="$missing GF_KEYSTORE_BASE64(secret)"
@@ -146,38 +152,132 @@ jobs:
           if [ -z "$DEFAULT_SERVER_KEY" ]; then
             echo "::warning::GF_DEFAULT_SERVER_KEY is not set: the app will trust the default server's key on first use."
           fi
-      - name: Build the signed APK
+          {
+            echo "default-server=$DEFAULT_SERVER"
+            echo "default-server-key=$DEFAULT_SERVER_KEY"
+          } >> "$GITHUB_OUTPUT"
+
+  app-build:
+    name: Build the release APK
+    needs: [version, app-config]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # No environment and a read-only token: whatever runs in the build (actions, Gradle plugins, dependencies) can't
+    # reach the signing key or publish anything. It starts from an empty Gradle home, so a poisoned cache can't
+    # change the APK either.
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.apk.outputs.sha256 }}
+    env:
+      CODE: ${{ needs.version.outputs.code }}
+      NAME: ${{ needs.version.outputs.name }}
+      DEFAULT_SERVER: ${{ needs.app-config.outputs.default-server }}
+      DEFAULT_SERVER_KEY: ${{ needs.app-config.outputs.default-server-key }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/android-setup
+        with:
+          cache: false
+      - name: Build the unsigned APK
         working-directory: android
-        env:
-          KEYSTORE_BASE64: ${{ secrets.GF_KEYSTORE_BASE64 }}
-          GF_KEYSTORE_PASSWORD: ${{ secrets.GF_KEYSTORE_PASSWORD }}
-          GF_KEY_PASSWORD: ${{ secrets.GF_KEY_PASSWORD || secrets.GF_KEYSTORE_PASSWORD }}
-          GF_KEY_ALIAS: ${{ vars.GF_KEY_ALIAS || 'goldfishsend' }}
+        # The same command the release notes give for reproducing the build.
         run: |
-          export GF_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
-          umask 077
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$GF_KEYSTORE_FILE"
-          trap 'rm -f "$GF_KEYSTORE_FILE"' EXIT
           ./gradlew --no-build-cache --no-configuration-cache clean :app:assembleRelease \
             "-Pgf.defaultServer=$DEFAULT_SERVER" \
             "-Pgf.defaultServerKey=$DEFAULT_SERVER_KEY" \
             "-Pgf.versionCode=$CODE" \
             "-Pgf.versionName=$NAME"
+      - id: apk
+        # The signing job checks this digest, so a different APK uploaded under the same name by another job in the run
+        # isn't signed.
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          echo "sha256=$(sha256sum "$apk" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: app-release-unsigned
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  app:
+    name: Sign and publish the app
+    needs: [ci, version, app-config, app-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Signing secrets live in this environment, so only the jobs that name it (on main) can read them. This one runs
+    # no build and only actions/* actions.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      CODE: ${{ needs.version.outputs.code }}
+      NAME: ${{ needs.version.outputs.name }}
+      PREVIOUS: ${{ needs.version.outputs.previous }}
+      # The values the APK was built with, for the reproduction command in the notes.
+      DEFAULT_SERVER: ${{ needs.app-config.outputs.default-server }}
+      DEFAULT_SERVER_KEY: ${{ needs.app-config.outputs.default-server-key }}
+      CERT_SHA256: ${{ vars.GF_SIGNING_CERT_SHA256 }}
+    steps:
+      # For the release notes' commit list; gh uses GH_TOKEN, so git needs no credentials.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: app-release-unsigned
+          path: ${{ runner.temp }}/unsigned
+      - name: Install apksigner
+        run: |
+          if [ ! -x "$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "build-tools;$BUILD_TOOLS"
+          fi
+      - name: Sign the APK
+        env:
+          EXPECTED_SHA256: ${{ needs.app-build.outputs.sha256 }}
+          KEYSTORE_BASE64: ${{ secrets.GF_KEYSTORE_BASE64 }}
+          GF_KEYSTORE_PASSWORD: ${{ secrets.GF_KEYSTORE_PASSWORD }}
+          GF_KEY_PASSWORD: ${{ secrets.GF_KEY_PASSWORD || secrets.GF_KEYSTORE_PASSWORD }}
+          GF_KEY_ALIAS: ${{ vars.GF_KEY_ALIAS || 'goldfishsend' }}
+        run: |
+          unsigned="$RUNNER_TEMP/unsigned/app-release-unsigned.apk"
+          actual=$(sha256sum "$unsigned" | cut -d' ' -f1)
+          if [ -z "$EXPECTED_SHA256" ] || [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "::error::The downloaded APK ($actual) isn't the one the build job made ($EXPECTED_SHA256)."
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/release.jks"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+          trap 'rm -f "$keystore"' EXIT
+          mkdir -p dist
+          # v3 only, as the Gradle signing config produces (minSdk 29 means every device verifies v3). Alignment is
+          # kept, so the signed APK is the unsigned one plus zero padding and a signing block: apksigcopier can copy
+          # the signature onto a verifier's own unsigned build.
+          "$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" sign \
+            --ks "$keystore" --ks-pass env:GF_KEYSTORE_PASSWORD \
+            --ks-key-alias "$GF_KEY_ALIAS" --key-pass env:GF_KEY_PASSWORD \
+            --v1-signing-enabled false --v2-signing-enabled false --v3-signing-enabled true \
+            --v4-signing-enabled false --alignment-preserved true \
+            --in "$unsigned" --out "dist/goldfishsend-$NAME.apk"
       - name: Verify the signature
         run: |
-          apk=android/app/build/outputs/apk/release/app-release.apk
-          apksigner="$ANDROID_HOME/build-tools/37.0.0/apksigner"
-          "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          apk="dist/goldfishsend-$NAME.apk"
+          "$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
           actual=$(grep -m1 'certificate SHA-256 digest' "$RUNNER_TEMP/certs.txt" | awk '{print $NF}')
           expected=$(echo "$CERT_SHA256" | tr -d ': ' | tr 'A-F' 'a-f')
           if [ "$actual" != "$expected" ]; then
             echo "::error::Signed with $actual, expected $expected (GF_SIGNING_CERT_SHA256)."
             exit 1
           fi
-          mkdir -p dist
-          cp "$apk" "dist/goldfishsend-$NAME.apk"
           (cd dist && sha256sum "goldfishsend-$NAME.apk" > "goldfishsend-$NAME.apk.sha256")
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: dist/goldfishsend-${{ needs.version.outputs.name }}.apk
       - name: Write the release notes

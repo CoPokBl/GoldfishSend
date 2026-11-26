@@ -1,4 +1,8 @@
 # Tests for pull requests and feature branches. release.yml also calls this before publishing from main.
+#
+# These jobs hold no secrets, so they may use caches (Gradle home, NuGet, buildx). Runs on main write the caches every
+# other run can read, so the release jobs that publish or sign never restore them. Actions are pinned to commit SHAs
+# (tag in the comment): a tag can be moved to different code, a commit can't.
 name: CI
 
 on:
@@ -51,8 +55,10 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: "10.0.x"
           cache: true
@@ -67,7 +73,7 @@ jobs:
         run: dotnet test GoldfishSend.slnx -c Release --no-build --logger "trx" --results-directory TestResults
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: server-test-results
           path: server/TestResults
@@ -99,8 +105,10 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: "10.0.x"
           cache: true
@@ -128,7 +136,7 @@ jobs:
           exit $status
       - name: Upload the results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: server-load-test
           path: |
@@ -141,9 +149,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: server
           push: false
@@ -158,7 +168,9 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/android-setup
       - name: Unit tests, lint and builds
         # The release build is unsigned here; it checks R8 and resource shrinking.
@@ -171,7 +183,7 @@ jobs:
         run: ./gradlew --stacktrace :app:compileBenchmarkReleaseKotlin :baselineprofile:compileBenchmarkReleaseKotlin
       - name: Upload reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: android-reports
           path: |
@@ -184,7 +196,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/android-setup
       - name: Enable KVM
         run: |
@@ -195,7 +209,7 @@ jobs:
         working-directory: android
         run: ./gradlew -Pgf.abis=x86_64 :app:assembleDebug :app:assembleDebugAndroidTest
       - name: Run device tests
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 35
           target: google_apis
@@ -211,7 +225,7 @@ jobs:
             grep -rqs '<testcase' app/build/outputs/androidTest-results/connected || (echo "::error::No device tests ran." && exit 1)
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: android-device-reports
           path: |
