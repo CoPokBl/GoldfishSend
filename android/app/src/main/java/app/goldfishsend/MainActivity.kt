@@ -19,17 +19,20 @@ import app.goldfishsend.ui.FirstFrame
 import app.goldfishsend.ui.screens.ChatListPreload
 import app.goldfishsend.ui.theme.GoldfishTheme
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
     private val pendingLink = MutableStateFlow<String?>(null)
 
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         applySecureFlag()
         lifecycleScope.launch {
-            Graph.prefs.version.collect { applySecureFlag() }
+            // The open session's settings: a decoy has its own.
+            Graph.session.flatMapLatest { (it?.prefs ?: Graph.prefs).version }.collect { applySecureFlag() }
         }
         handleIntent(intent)
         if (savedInstanceState == null) {
@@ -44,8 +47,9 @@ class MainActivity : FragmentActivity() {
             FirstFrame.drawn = true
         }
         setContent {
-            val v by Graph.prefs.version.collectAsState()
-            val p = Graph.prefs
+            val session by Graph.session.collectAsState()
+            val p = session?.prefs ?: Graph.prefs
+            val v by p.version.collectAsState()
             v.let {
                 GoldfishTheme(p.themeMode, p.amoled, p.dynamicColor) {
                     AppRoot(pendingLink)
@@ -94,7 +98,7 @@ class MainActivity : FragmentActivity() {
 
     /** FLAG_SECURE blocks screenshots and screen recording, and blanks the recent-apps preview. It's on by default. */
     private fun applySecureFlag() {
-        if (Graph.prefs.screenshotProtection) {
+        if (Graph.uiPrefs.screenshotProtection) {
             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         } else {
             window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)

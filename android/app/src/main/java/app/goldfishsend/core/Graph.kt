@@ -1,6 +1,9 @@
 package app.goldfishsend.core
 
 import app.goldfishsend.security.MemoryScrubber
+import app.goldfishsend.security.ProfileSecrets
+import app.goldfishsend.security.VaultSecrets
+import app.goldfishsend.security.DecoySecrets
 import android.app.Application
 import app.goldfishsend.crypto.BucketKeys
 import app.goldfishsend.crypto.KeyVault
@@ -20,6 +23,7 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -29,23 +33,40 @@ import okhttp3.OkHttpClient
 import org.signal.libsignal.protocol.ecc.ECKeyPair
 import org.signal.libsignal.protocol.ecc.ECPrivateKey
 
-/** Everything that exists while the app is unlocked. Closing it wipes the keys from RAM. */
-class Session(val db: Db, private var mk: ByteArray, val messages: MessageVault) {
+/**
+ * Everything that exists while the app is unlocked. Closing it wipes the keys from RAM and stops its background work.
+ *
+ * [decoy]: opened with the duress PIN in the decoy mode. It has its own settings ([prefs]) and PIN checks ([secrets]),
+ * so nothing done in it reads or changes the real profile's.
+ */
+class Session(
+    val db: Db,
+    private var mk: ByteArray,
+    val messages: MessageVault,
+    val decoy: Boolean = false,
+    prefs: Prefs? = null,
+    secrets: ProfileSecrets? = null,
+) {
     val signal = SignalStore(db)
     val repo = Repo(db, messages)
+
+    /** This profile's settings: the device's own for the real profile, the decoy's own copy for a decoy. */
+    val prefs: Prefs = prefs ?: Graph.prefs
+
+    /** This profile's PIN checks and slots. */
+    val secrets: ProfileSecrets = secrets ?: VaultSecrets
+
+    /**
+     * Work that belongs to this session (catch-up after unlock, group create/join, the mailbox pool). It's cancelled when
+     * the session closes, so nothing started for the real profile carries on, or reports back, once it's locked.
+     */
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + Graph.errors)
 
     /** Serialises libsignal and DB mutations: libsignal stores aren't safe for concurrent ratchet updates. */
     val lock = Mutex()
 
     /** Hidden chats are only listed after the hidden-chats PIN was entered in this session. Resets on lock. */
     val hiddenRevealed = kotlinx.coroutines.flow.MutableStateFlow(false)
-
-    /**
-     * Opened with the duress PIN in a non-erasing mode. Hidden chats can't be revealed, and hidden-chat and duress settings
-     * read as off.
-     */
-    @Volatile
-    var decoy = false
 
     fun masterKeyCopy(): ByteArray = mk.copyOf()
 
@@ -56,11 +77,16 @@ class Session(val db: Db, private var mk: ByteArray, val messages: MessageVault)
     }
 
     fun close() {
+        // Stop the work first: whatever is still running then finds the job cancelled, not a closed database.
+        scope.cancel()
         db.close()
         mk.wipe()
         messages.wipe()
     }
 }
+
+/** A lock arrived while an unlock was in progress: the session it opened was closed again, and the app stays locked. */
+class UnlockInterrupted : Exception("locked while unlocking")
 
 /** Process-wide service locator. Kept deliberately small, with no DI framework. */
 object Graph {
@@ -70,13 +96,29 @@ object Graph {
     val prefs: Prefs by lazy { Prefs(app) }
     val vault: KeyVault by lazy { KeyVault(app) }
 
-    private val errors = CoroutineExceptionHandler { _, e -> android.util.Log.w("GoldfishSend", "background task failed: ${e.javaClass.simpleName}") }
+    internal val errors = CoroutineExceptionHandler { _, e -> android.util.Log.w("GoldfishSend", "background task failed: ${e.javaClass.simpleName}") }
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + errors)
 
     private val _session = MutableStateFlow<Session?>(null)
     val session: StateFlow<Session?> = _session
 
     private val unlockMutex = Mutex()
+
+    /** Guards publishing a session against [lock], so a lock can't slip in between the check and the publish. */
+    private val sessionLock = Any()
+
+    /**
+     * Bumped by every [lock], with or without an open session. An unlock reads it before it starts (before the slow key
+     * derivation) and only publishes its session if no lock came in meanwhile: a lock on screen-off during an unlock is
+     * never lost.
+     */
+    @Volatile
+    var lockEpoch = 0L
+        private set
+
+    /** The settings of whatever is open: the decoy's own while a decoy session is, the device's otherwise. */
+    val uiPrefs: Prefs
+        get() = _session.value?.prefs ?: prefs
 
     @Volatile
     private var http: OkHttpClient? = null
@@ -150,38 +192,72 @@ object Graph {
         get() = _session.value?.takeUnless { it.decoy }
 
     /**
-     * Opens the decoy profile with a key derived only from the duress PIN. It has its own database, Signal identity and
-     * message root (kept inside the decoy DB, never under the real Keystore aliases), and persists across duress unlocks.
+     * Opens the decoy profile with the key the duress slot holds ([KeyVault.openDuress]). It has its own database, Signal
+     * identity, message root, settings and PINs (all kept inside the decoy DB, never under the real Keystore aliases or
+     * preference files), and persists across duress unlocks until the duress PIN changes. Takes ownership of [match].
+     * Throws [UnlockInterrupted] if the app was locked after [since].
      */
-    suspend fun openDecoySession(decoyKey: ByteArray): Session = withContext(Dispatchers.IO) { openDecoy(decoyKey) }
+    suspend fun openDecoySession(match: KeyVault.DuressMatch, since: Long = lockEpoch): Session =
+        withContext(Dispatchers.IO) { openDecoy(match, since) }
 
-    private suspend fun openDecoy(decoyKey: ByteArray): Session = unlockMutex.withLock {
+    private suspend fun openDecoy(match: KeyVault.DuressMatch, since: Long): Session = unlockMutex.withLock {
         _session.value?.let {
-            decoyKey.wipe()
+            match.wipe()
             return it
         }
+        val decoyKey = match.decoyKey
         val db = try {
             Db.open(app, decoyKey, Db.DECOY_NAME)
         } catch (e: Exception) {
-            // A different duress PIN than the one that made this decoy: start a fresh one.
+            // Unreadable (it can only have been made with this key): start a fresh one.
             Db.deleteFiles(app, Db.DECOY_NAME)
             Db.open(app, decoyKey, Db.DECOY_NAME)
         }
         val boot = Repo(db, MessageVault(ByteArray(32)))
+        val kv = RepoKv(boot)
         val mrk = boot.kvGet("decoy_mrk") ?: Rand.bytes(32).also { boot.kvPut("decoy_mrk", it) }
-        val s = Session(db, decoyKey, MessageVault(mrk))
-        s.decoy = true
-        _session.value = s
+        val secrets = DecoySecrets(kv, secretKdf = vault::secretKek)
+        secrets.rememberSecret(match.salt, match.secretTag)
+        val decoyPrefs = DecoyPrefs.open(kv) { decoySeed() }
+        match.salt.wipe()
+        match.secretTag.wipe()
+        val s = Session(db, decoyKey, MessageVault(mrk), decoy = true, prefs = decoyPrefs, secrets = secrets)
+        publish(s, since)
         s
+    }
+
+    /** What a new decoy's settings start as (see [DecoyPrefs]): only what's visible from the lock screen anyway. */
+    private fun decoySeed(): Map<String, Any?> = DecoyPrefs.mirror(
+        app.getSharedPreferences(Prefs.FILE, android.content.Context.MODE_PRIVATE).all,
+        mapOf(
+            "biometric" to (prefs.biometricUnlock && vault.hasBiometric),
+            "decoy_proxy_mode" to NetPrefs.proxyMode.name,
+        ),
+    )
+
+    /** Publishes [s] unless a lock came in after [since]; otherwise closes it and throws [UnlockInterrupted]. */
+    private fun publish(s: Session, since: Long) {
+        val ok = synchronized(sessionLock) {
+            (lockEpoch == since).also {
+                if (it) {
+                    _session.value = s
+                }
+            }
+        }
+        if (!ok) {
+            s.close()
+            throw UnlockInterrupted()
+        }
     }
 
     /**
      * Opens the DB with MK. Takes ownership of [mk]. Runs on the IO dispatcher whoever calls it: opening (and on first use
-     * creating) the database must never block the UI thread.
+     * creating) the database must never block the UI thread. Throws [UnlockInterrupted] if the app was locked after
+     * [since] (read it before the secret is checked, so a lock during the key derivation counts too).
      */
-    suspend fun openSession(mk: ByteArray): Session = withContext(Dispatchers.IO) { open(mk) }
+    suspend fun openSession(mk: ByteArray, since: Long = lockEpoch): Session = withContext(Dispatchers.IO) { open(mk, since) }
 
-    private suspend fun open(mk: ByteArray): Session = unlockMutex.withLock {
+    private suspend fun open(mk: ByteArray, since: Long): Session = unlockMutex.withLock {
         _session.value?.let {
             mk.wipe()
             return it
@@ -235,7 +311,7 @@ object Graph {
                 )
             }
         }
-        _session.value = s
+        publish(s, since)
         s
     }
 
@@ -276,13 +352,19 @@ object Graph {
 
     fun inboxPrivateKey(s: Session): ECPrivateKey = ECPrivateKey(s.repo.kvGet("inbox_priv")!!)
 
-    /** Locks: closes the DB and wipes keys from memory. */
+    /**
+     * Locks: closes the DB, stops the session's work and wipes keys from memory. An unlock still in progress when this
+     * is called doesn't open afterwards ([lockEpoch]).
+     */
     fun lock() {
-        val s = _session.value ?: return
-        _session.value = null
-        Actions.clearFailures()
+        val s = synchronized(sessionLock) {
+            lockEpoch++
+            _session.value.also { _session.value = null }
+        } ?: return
+        Actions.ended(s.scope)
+        Mailboxes.ended()
         s.close()
-        if (prefs.wipeMemoryOnLock) {
+        if (s.prefs.wipeMemoryOnLock) {
             MemoryScrubber.scrubAsync()
         }
     }

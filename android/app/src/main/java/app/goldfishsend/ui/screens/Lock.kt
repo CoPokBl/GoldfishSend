@@ -74,7 +74,20 @@ fun LockScreen() {
     val bioEnabled = !screenLock && Graph.prefs.biometricUnlock && vault.hasBiometric && biometricAvailable(activity)
     val haptics = LocalHapticFeedback.current
 
+    /** Opens the session with a key from a system prompt shown at [since] (see Graph.lockEpoch). */
+    fun unlockWith(mk: ByteArray, since: Long) {
+        busy = true
+        scope.launch {
+            val r = runCatching { AppLock.unlockWithMasterKey(mk, since) }.getOrNull()
+            if (r != UnlockResult.Ok) {
+                busy = false
+                error = if (r == UnlockResult.Interrupted) null else "Couldn't unlock. Try again."
+            }
+        }
+    }
+
     fun tryScreenLock() {
+        val since = Graph.lockEpoch
         val cipher = try {
             vault.screenLockDecryptCipher()
         } catch (e: Exception) {
@@ -87,8 +100,7 @@ fun LockScreen() {
         promptScreenLock(activity, "Unlock GoldfishSend", cipher, onSuccess = { c ->
             val mk = vault.unwrapWithScreenLock(c)
             if (mk != null) {
-                busy = true
-                scope.launch { AppLock.unlockWithMasterKey(mk) }
+                unlockWith(mk, since)
             } else {
                 error = "Couldn't unlock. Try again."
             }
@@ -96,6 +108,7 @@ fun LockScreen() {
     }
 
     fun tryBiometric() {
+        val since = Graph.lockEpoch
         val cipher = Graph.vault.biometricDecryptCipher() ?: run {
             error = "Fingerprint unlock was reset. Use your passphrase."
             return
@@ -103,8 +116,7 @@ fun LockScreen() {
         promptBiometric(activity, "Unlock GoldfishSend", cipher, onSuccess = { c ->
             val mk = Graph.vault.unwrapWithBiometric(c)
             if (mk != null) {
-                busy = true
-                scope.launch { AppLock.unlockWithMasterKey(mk) }
+                unlockWith(mk, since)
             }
         }, onError = { msg -> if (msg != null) error = msg })
     }
@@ -134,6 +146,8 @@ fun LockScreen() {
                     error = "Unlock your phone first."
                     busy = false
                 }
+                // Locked again (screen off) while unlocking: it stays locked, ready for another try.
+                UnlockResult.Interrupted -> busy = false
             }
         }
     }

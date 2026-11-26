@@ -96,6 +96,8 @@ import app.goldfishsend.ui.components.SettingRow
 import app.goldfishsend.ui.components.SwitchRow
 import app.goldfishsend.ui.components.biometricAvailable
 import app.goldfishsend.ui.components.promptBiometric
+import app.goldfishsend.ui.components.promptBiometricOnly
+import app.goldfishsend.proto.Rand
 import app.goldfishsend.ui.components.rememberQuery
 import app.goldfishsend.ui.components.BusyDialog
 import app.goldfishsend.ui.components.ButtonKind
@@ -114,8 +116,10 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     val ctx = LocalContext.current
     val activity = ctx as FragmentActivity
     val scope = rememberCoroutineScope()
-    val v by Graph.prefs.version.collectAsState()
-    val p = Graph.prefs
+    // This profile's settings. A decoy session has its own copy of every one (DecoyPrefs): changes there look real and
+    // stay in the decoy, and nothing here reads or writes the real profile's from a decoy.
+    val p = s.prefs
+    val v by p.version.collectAsState()
     val vault = Graph.vault
     val name by rememberQuery(s) { it.repo.displayName }
     var picker by remember { mutableStateOf<Picker?>(null) }
@@ -128,9 +132,13 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     val reauth = rememberReAuth(s, activity)
     var hiddenPinDialog by remember { mutableStateOf(false) }
     var disconnectPanic by remember { mutableStateOf(false) }
-    // Feature flags live inside the encrypted DB. In a decoy session they always read as off.
-    val duressOn by rememberQuery(s, v) { q -> !q.decoy && q.repo.kvString(AppLock.KV_DURESS_ON) == "1" }
-    val hiddenOn by rememberQuery(s, v) { q -> !q.decoy && q.repo.kvString(AppLock.KV_HIDDEN_ON) == "1" }
+    // Feature flags live inside the profile's encrypted DB, so a decoy session sees (and sets) its own.
+    val duressOn by rememberQuery(s, v) { q -> q.repo.kvString(AppLock.KV_DURESS_ON) == "1" }
+    val hiddenOn by rememberQuery(s, v) { q -> q.repo.kvString(AppLock.KV_HIDDEN_ON) == "1" }
+    val notifyHidden by rememberQuery(s, v) { q -> q.repo.kvString(AppLock.KV_NOTIFY_HIDDEN) == "1" }
+    var secretsChanged by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    // Sealed in the vault (or the decoy's DB): read off the main thread.
+    val duressAction by rememberQuery(s, secretsChanged) { q -> q.secrets.duressAction }
     var confirmWipeMessages by remember { mutableStateOf(false) }
     val wiping = rememberWork()
     var confirmPanic by remember { mutableStateOf(false) }
@@ -238,10 +246,18 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                         "Fingerprint unlock",
                         if (bioAvailable) "Unlock with biometrics instead of typing" else "No strong biometrics set up on this phone",
                         Icons.Rounded.Fingerprint,
-                        checked = p.biometricUnlock && vault.hasBiometric,
+                        checked = p.biometricUnlock && (s.decoy || vault.hasBiometric),
                         enabled = bioAvailable,
                     ) { on ->
-                        if (!on) {
+                        if (s.decoy) {
+                            // The decoy's own setting. The prompt is the same, but the real biometric key and its copy of
+                            // the master key are never touched (and the decoy's key never goes near them).
+                            if (!on) {
+                                p.biometricUnlock = false
+                            } else {
+                                promptBiometricOnly(activity, "Enable fingerprint unlock", onSuccess = { p.biometricUnlock = true })
+                            }
+                        } else if (!on) {
                             vault.disableBiometric()
                             p.biometricUnlock = false
                         } else {
@@ -256,14 +272,15 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     }
                     SettingRow(
                         "Erase after failed attempts",
-                        if (p.maxFailedAttempts == 0 || s.decoy) "Off" else "After ${p.maxFailedAttempts} wrong ${if (vault.secretIsPin) "PINs" else "passphrases"}",
+                        if (p.maxFailedAttempts == 0) "Off" else "After ${p.maxFailedAttempts} wrong ${if (vault.secretIsPin) "PINs" else "passphrases"}",
                         Icons.Rounded.Warning,
                         onClick = { reauth.require("Changing when everything is erased.") { picker = Picker.FAILED } },
                     )
                     SettingRow(
                         "Duress PIN",
                         if (duressOn == true) {
-                            "On · " + when (p.duressAction) {
+                            "On · " + when (duressAction) {
+                                null -> ""
                                 DuressAction.WIPE_ALL -> "silently erases everything"
                                 DuressAction.DECOY -> "opens a separate decoy profile"
                             }
@@ -276,7 +293,8 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     if (duressOn == true) {
                         SettingRow(
                             "When the duress PIN is entered",
-                            when (p.duressAction) {
+                            when (duressAction) {
+                                null -> ""
                                 DuressAction.WIPE_ALL -> "Erase everything"
                                 DuressAction.DECOY -> "Open a decoy profile. Your real chats stay locked and untouched."
                             },
@@ -299,15 +317,20 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                         "Notify for hidden chats",
                         "A notification with no name or text. Off means hidden chats stay completely silent.",
                         Icons.Rounded.NotificationsOff,
-                        p.notifyHiddenChats,
-                    ) { p.notifyHiddenChats = it }
+                        notifyHidden == true,
+                    ) { on ->
+                        scope.launch(Dispatchers.IO) {
+                            s.repo.kvPutString(AppLock.KV_NOTIFY_HIDDEN, if (on) "1" else null)
+                            s.db.notifyChanged()
+                        }
+                    }
                 }
             }
             item {
                 SectionHeader("Panic button")
                 SettingRow(
                     "Response to a panic app",
-                    when (if (s.decoy) PanicResponse.OFF else p.panicResponse) {
+                    when (p.panicResponse) {
                         PanicResponse.OFF -> "Off"
                         PanicResponse.LOCK -> "Lock GoldfishSend"
                         PanicResponse.WIPE_MESSAGES -> "Lock and erase all messages"
@@ -350,11 +373,11 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                     "Erase messages on restart",
                     "All messages are destroyed whenever your phone reboots",
                     Icons.Rounded.RestartAlt,
-                    p.wipeOnReboot && !s.decoy,
-                ) { v -> reauth.require("Changing erase settings.") { if (!s.decoy) p.wipeOnReboot = v } }
+                    p.wipeOnReboot,
+                ) { v -> reauth.require("Changing erase settings.") { p.wipeOnReboot = v } }
                 SettingRow(
                     "Erase everything if unused",
-                    if (p.inactivityWipeDays == 0 || s.decoy) "Off" else "If not unlocked for ${p.inactivityWipeDays} days",
+                    if (p.inactivityWipeDays == 0) "Off" else "If not unlocked for ${p.inactivityWipeDays} days",
                     Icons.Rounded.DeleteSweep,
                     onClick = { reauth.require("Changing erase settings.") { picker = Picker.INACTIVITY } },
                 )
@@ -363,12 +386,13 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                 SectionHeader("Network")
                 SettingRow(
                     "Push service",
-                    PushHub.current(ctx)?.let { PushHub.label(ctx, it) } ?: "Not set up",
+                    pushChoice(ctx, s)?.let { PushHub.label(ctx, it) } ?: "Not set up",
                     Icons.Rounded.NotificationsActive,
                     onClick = { pushPicker = true },
                 )
-                SettingRow("Connection", connectionSummary(), Icons.Rounded.VpnLock, onClick = { reauth.require("Changing how GoldfishSend connects.") { networkSettings = true } })
-                SettingRow("Server", p.serverUrl, Icons.Rounded.Dns, onClick = { editServer = true })
+                SettingRow("Connection", connectionSummary(s), Icons.Rounded.VpnLock, onClick = { reauth.require("Changing how GoldfishSend connects.") { networkSettings = true } })
+                // Switching servers moves new mailboxes (and what they reveal) to another operator: confirm it's the owner.
+                SettingRow("Server", p.serverUrl, Icons.Rounded.Dns, onClick = { reauth.require("Changing your server.") { editServer = true } })
             }
             item {
                 SectionHeader("Danger zone")
@@ -389,7 +413,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     }
 
     if (networkSettings) {
-        NetworkSettingsDialog { networkSettings = false }
+        NetworkSettingsDialog(s) { networkSettings = false }
     }
     when (picker) {
         Picker.NOTIF -> ChoiceDialog(
@@ -413,19 +437,24 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
         Picker.FAILED -> ChoiceDialog(
             "Erase after failed attempts", listOf(0 to "Off", 5 to "5 attempts", 10 to "10 attempts", 20 to "20 attempts"),
             p.maxFailedAttempts, { picker = null },
-        ) { if (!s.decoy) p.maxFailedAttempts = it }
+        ) { p.maxFailedAttempts = it }
         Picker.INACTIVITY -> ChoiceDialog(
             "Erase everything if unused", listOf(0 to "Off", 3 to "3 days", 7 to "7 days", 14 to "14 days", 30 to "30 days", 90 to "90 days"),
             p.inactivityWipeDays, { picker = null },
-        ) { if (!s.decoy) p.inactivityWipeDays = it }
+        ) { p.inactivityWipeDays = it }
         Picker.DURESS_ACTION -> ChoiceDialog(
             "When the duress PIN is entered",
             listOf(
                 DuressAction.WIPE_ALL to "Erase everything",
                 DuressAction.DECOY to "Open a separate decoy profile (your real chats stay locked)",
             ),
-            p.duressAction, { picker = null },
-        ) { if (!s.decoy) p.duressAction = it }
+            duressAction ?: DuressAction.WIPE_ALL, { picker = null },
+        ) { a ->
+            scope.launch {
+                withContext(Dispatchers.IO) { s.secrets.duressAction = a }
+                secretsChanged++
+            }
+        }
         Picker.PANIC -> ChoiceDialog(
             "Response to a panic app",
             listOf(
@@ -435,7 +464,7 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
                 PanicResponse.WIPE_EVERYTHING to "Erase everything",
             ),
             p.panicResponse, { picker = null },
-        ) { if (!s.decoy) p.panicResponse = it }
+        ) { p.panicResponse = it }
         Picker.ROTATION -> ChoiceDialog(
             "Rotate mailboxes", listOf(0 to "Never", 7 to "Every 7 days", 14 to "Every 14 days", 30 to "Every 30 days", 90 to "Every 90 days"),
             p.mailboxRotationDays, { picker = null },
@@ -468,10 +497,13 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
         ServerDialog(s) { editServer = false }
     }
     if (pushPicker) {
-        PushPickerDialog { pushPicker = false }
+        PushPickerDialog(s) { pushPicker = false }
     }
     if (duress) {
-        DuressDialog(s, duressOn == true) { duress = false }
+        DuressDialog(s, duressOn == true) {
+            duress = false
+            secretsChanged++
+        }
     }
     if (hiddenPinDialog) {
         HiddenChatsDialog(s, hiddenOn == true) { hiddenPinDialog = false }
@@ -484,7 +516,17 @@ fun SettingsScreen(s: Session, openPassphrase: () -> Unit) {
     }
     if (confirmWipeMessages) {
         ConfirmDialog("Erase all messages?", "Every message in every chat is destroyed. This can't be undone.", "Erase", true, { confirmWipeMessages = false }) {
-            wiping.run { withContext(Dispatchers.IO) { Wiper.wipeMessages() } }
+            wiping.run {
+                withContext(Dispatchers.IO) {
+                    if (s.decoy) {
+                        // The decoy's own messages. The real ones (and their key) belong to the real profile.
+                        s.repo.wipeAllMessages()
+                        s.db.notifyChanged()
+                    } else {
+                        Wiper.wipeMessages()
+                    }
+                }
+            }
         }
     }
     BusyDialog(wiping.busy, "Erasing messages…")
@@ -507,11 +549,15 @@ private fun lockLabel(secs: Int): String = when (secs) {
     else -> "After $secs seconds"
 }
 
+/** The push app shown for this profile: a decoy's own pick if it made one, otherwise the device's. */
+fun pushChoice(ctx: android.content.Context, s: Session): String? =
+    (if (s.decoy) s.prefs.decoyPushDistributor else null) ?: PushHub.current(ctx)
+
 @Composable
-fun PushPickerDialog(onDismiss: () -> Unit) {
+fun PushPickerDialog(s: Session, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
     val dists = remember { PushHub.distributors(ctx) }
-    val current = remember { PushHub.current(ctx) }
+    val current = remember { pushChoice(ctx, s) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Push service") },
@@ -529,8 +575,13 @@ fun PushPickerDialog(onDismiss: () -> Unit) {
                     for (d in dists) {
                         Row(Modifier.fillMaxWidth()) {
                             TextButton(onClick = {
-                                PushHub.select(ctx, d.packageName)
-                                Graph.scope.launchSafe { PushHub.register(ctx) }
+                                if (s.decoy) {
+                                    // The decoy's own choice. The device's push registration belongs to the real profile.
+                                    s.prefs.decoyPushDistributor = d.packageName
+                                } else {
+                                    PushHub.select(ctx, d.packageName)
+                                    Graph.scope.launchSafe { PushHub.register(ctx) }
+                                }
                                 onDismiss()
                             }) {
                                 Text(d.label + if (d.packageName == current) "  ✓" else "")
@@ -548,7 +599,8 @@ fun PushPickerDialog(onDismiss: () -> Unit) {
 private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
     val work = rememberWork()
-    var url by remember { mutableStateOf(Graph.prefs.serverUrl) }
+    val p = s.prefs
+    var url by remember { mutableStateOf(p.serverUrl) }
     var fingerprint by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     val hasContacts by rememberQuery(s) { it.repo.contacts().isNotEmpty() }
@@ -587,6 +639,13 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                 }
                 val target = url.trim().trimEnd('/')
                 work.run {
+                    if (s.decoy) {
+                        // The decoy is offline: it never contacts a server (one could link it to the real profile), and it
+                        // never touches the real profile's server settings. It fails the way an unreachable server does.
+                        kotlinx.coroutines.delay(1200L + Rand.int(1500))
+                        error = "Couldn't reach that server."
+                        return@run
+                    }
                     // Verify the server before switching: against the typed fingerprint, the built-in one, or the key it
                     // presents now (remembered from here on).
                     var learned: String? = null
@@ -623,19 +682,17 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
 }
 
 /**
- * Sets or removes the duress PIN, on GoldfishSend's own keypad. In a decoy session it pretends to work but changes
- * nothing, so the real duress PIN and hidden chats stay intact.
+ * Sets or removes the duress PIN, on GoldfishSend's own keypad. It goes through the profile's own secrets: in a decoy
+ * session that's the decoy's, so it works there like the real thing (same checks, same cost) and changes nothing real.
  */
 @Composable
 private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
     val work = rememberWork()
-    val vault = Graph.vault
-    // Setting or removing it runs Argon2 and deletes the decoy profile: the dialog stays, busy, until that's done.
+    val secrets = s.secrets
+    // Setting or removing it runs Argon2 (and for the real profile deletes the decoy): the dialog stays, busy, until done.
     fun save(block: () -> Unit) {
         work.run {
-            if (!s.decoy) {
-                withContext(Dispatchers.Default) { block() }
-            }
+            withContext(Dispatchers.Default) { block() }
             onDismiss()
         }
     }
@@ -650,44 +707,38 @@ private fun DuressDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         busyText = "Saving…",
         onRemove = {
             save {
-                vault.setDuress(null)
-                app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
+                secrets.setDuress(null)
                 s.repo.kvPutString(AppLock.KV_DURESS_ON, null)
                 s.db.notifyChanged()
             }
         },
         validate = { pin ->
-            // Must differ from the real secret and from the hidden-chats PIN.
+            // Must differ from this profile's app secret and hidden-chats PIN (a decoy's are its own).
             val copy = pin.copyOf()
-            val clash = runCatching { vault.unlockWithPassphrase(copy) }.getOrNull()?.also { it.fill(0) } != null || vault.isHiddenPin(pin)
+            val clash = runCatching { secrets.checkSecret(copy) }.getOrDefault(false) || secrets.isHiddenPin(pin)
             copy.fill('\u0000')
             if (clash) "This must be different from your other PINs." else null
         },
     ) { pin ->
-        if (s.decoy) {
-            pin.fill('\u0000')
-        }
         save {
-            // A verifier only: the duress PIN can't decrypt anything real. A new PIN starts a fresh decoy profile.
-            vault.setDuress(pin)
+            // For the real profile, a verifier only: the duress PIN can't decrypt anything real. A new PIN also starts a
+            // fresh decoy profile.
+            secrets.setDuress(pin)
             pin.fill('\u0000')
-            app.goldfishsend.db.Db.deleteFiles(Graph.app, app.goldfishsend.db.Db.DECOY_NAME)
             s.repo.kvPutString(AppLock.KV_DURESS_ON, "1")
             s.db.notifyChanged()
         }
     }
 }
 
-/** Sets or removes the hidden-chats PIN. Removing it un-hides every hidden chat. */
+/** Sets or removes the hidden-chats PIN (the profile's own, as for [DuressDialog]). Removing it un-hides every hidden chat. */
 @Composable
 private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
     val work = rememberWork()
-    val vault = Graph.vault
+    val secrets = s.secrets
     fun save(block: () -> Unit) {
         work.run {
-            if (!s.decoy) {
-                withContext(Dispatchers.Default) { block() }
-            }
+            withContext(Dispatchers.Default) { block() }
             onDismiss()
         }
     }
@@ -701,7 +752,7 @@ private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         busyText = "Saving…",
         onRemove = {
             save {
-                vault.setHiddenPin(null)
+                secrets.setHiddenPin(null)
                 for (id in s.repo.hiddenContactIds()) {
                     s.repo.setHidden(id, false)
                 }
@@ -711,17 +762,13 @@ private fun HiddenChatsDialog(s: Session, on: Boolean, onDismiss: () -> Unit) {
         },
         validate = { pin ->
             val copy = pin.copyOf()
-            val clash = runCatching { vault.unlockWithPassphrase(copy) }.getOrNull()?.also { it.fill(0) } != null ||
-                vault.isDuress(pin)
+            val clash = runCatching { secrets.checkSecret(copy) }.getOrDefault(false) || secrets.isDuress(pin)
             copy.fill('\u0000')
             if (clash) "This must be different from your other PINs." else null
         },
     ) { pin ->
-        if (s.decoy) {
-            pin.fill('\u0000')
-        }
         save {
-            vault.setHiddenPin(pin)
+            secrets.setHiddenPin(pin)
             pin.fill('\u0000')
             s.repo.kvPutString(AppLock.KV_HIDDEN_ON, "1")
             s.db.notifyChanged()

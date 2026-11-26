@@ -18,11 +18,15 @@ import app.goldfishsend.core.PanicResponse
  * - DISCONNECT: the approved app removes itself.
  *
  * Nothing happens unless the user has set a response (OFF by default). No permissions are needed.
+ *
+ * Connecting and disconnecting change the open profile's settings: while a decoy session is open, the decoy's own copy,
+ * so a coercer can't quietly disarm (or re-point) the real profile's panic response. A trigger always acts on the real
+ * profile's settings.
  */
 class PanicResponderActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val prefs = Graph.prefs
+        val prefs = Graph.uiPrefs
         val caller = callingActivity?.packageName
         when (intent?.action) {
             ACTION_TRIGGER -> {
@@ -69,13 +73,14 @@ class PanicResponderActivity : Activity() {
             .getOrDefault(caller)
         val options = arrayOf("Lock GoldfishSend", "Lock and erase all messages", "Erase everything")
         val values = arrayOf(PanicResponse.LOCK, PanicResponse.WIPE_MESSAGES, PanicResponse.WIPE_EVERYTHING)
-        var choice = values.indexOf(Graph.prefs.panicResponse).coerceAtLeast(0)
+        val prefs = Graph.uiPrefs
+        var choice = values.indexOf(prefs.panicResponse).coerceAtLeast(0)
         AlertDialog.Builder(this)
             .setTitle("Let $label trigger GoldfishSend?")
             .setSingleChoiceItems(options, choice) { _, which -> choice = which }
             .setPositiveButton("Allow") { _, _ ->
-                Graph.prefs.panicTrigger = caller
-                Graph.prefs.panicResponse = values[choice]
+                prefs.panicTrigger = caller
+                prefs.panicResponse = values[choice]
                 setResult(RESULT_OK)
                 finish()
             }

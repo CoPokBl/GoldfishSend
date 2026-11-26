@@ -219,7 +219,7 @@ fun PassphraseScreen(s: Session, back: () -> Unit) {
                     Spacer(Modifier.height(6.dp))
                     Text(error ?: "Longer is stronger.", color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(20.dp))
-                    PinPad(pin, scrambled = Graph.prefs.scramblePinPad, busyText = if (busy) "Saving…" else null, onSubmit = {
+                    PinPad(pin, scrambled = Graph.uiPrefs.scramblePinPad, busyText = if (busy) "Saving…" else null, onSubmit = {
                         if (step == Step.PIN_NEW) {
                             firstPin = pin.take()
                             error = null

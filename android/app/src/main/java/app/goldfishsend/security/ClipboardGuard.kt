@@ -25,7 +25,7 @@ object ClipboardGuard {
             }
         }
         cm.setPrimaryClip(clip)
-        val secs = Graph.prefs.clipboardClearSecs
+        val secs = Graph.uiPrefs.clipboardClearSecs
         if (secs > 0) {
             handler.removeCallbacksAndMessages(null)
             handler.postDelayed({ clear(ctx, text) }, secs * 1000L)

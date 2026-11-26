@@ -269,8 +269,8 @@ fun ChatList(s: Session, openChat: (Long) -> Unit, addContact: () -> Unit, newGr
             // The dialog closes the same way whether or not the PIN matched (or hidden chats exist).
             work.run {
                 val ok = withContext(Dispatchers.Default) {
-                    // Never revealed in a decoy session (opened with the duress PIN).
-                    (!s.decoy && Graph.vault.isHiddenPin(pin)).also { pin.fill('\u0000') }
+                    // The profile's own hidden-chats PIN: a decoy checks its own, at the same cost, never the real one.
+                    s.secrets.isHiddenPin(pin).also { pin.fill('\u0000') }
                 }
                 if (ok) {
                     s.hiddenRevealed.value = true

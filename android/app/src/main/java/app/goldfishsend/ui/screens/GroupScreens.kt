@@ -180,7 +180,7 @@ fun NewGroupScreen(s: Session, back: () -> Unit, openChat: (Long) -> Unit) {
                     val members = picked.toList()
                     val groupName = name.trim()
                     // A failure is shown app-wide (AppRoot), so the user sees it even if they've left this screen.
-                    val job = Actions.start(Actions.groupCreate(), describe = { e -> "Couldn't create “$groupName”. ${groupError(e, "Try again.")}" }) {
+                    val job = Actions.start(s.scope, Actions.groupCreate(), describe = { e -> "Couldn't create “$groupName”. ${groupError(e, "Try again.")}" }) {
                         Groups.create(s, name, members)
                     }
                     scope.launch {
@@ -358,7 +358,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
                     enabled = canEdit,
                     onClick = { timer = true },
                 )
-                val hiddenOn by rememberQuery(s) { q -> !q.decoy && q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
+                val hiddenOn by rememberQuery(s) { q -> q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
                 if (hiddenOn == true) {
                     SwitchRow(
                         "Hide this chat",
@@ -606,7 +606,7 @@ fun GroupInvitationBar(s: Session, cid: Long, groupName: String, inviter: String
                 }, modifier = Modifier.weight(1f)) { Text("Decline") }
                 ProgressButton(busy = joining, enabled = !busy && !joining, onClick = {
                     // A failure is shown app-wide (AppRoot), so the user sees it even if they've left the chat.
-                    Actions.start(joinKey, describe = { e -> "Couldn't join “$groupName”. ${groupError(e, "Try again.")}" }) {
+                    Actions.start(s.scope, joinKey, describe = { e -> "Couldn't join “$groupName”. ${groupError(e, "Try again.")}" }) {
                         Groups.join(s, cid)
                     }
                 }, modifier = Modifier.weight(1f).blockWhenObscured()) {

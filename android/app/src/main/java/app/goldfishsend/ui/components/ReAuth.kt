@@ -26,10 +26,10 @@ import androidx.fragment.app.FragmentActivity
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Session
 import app.goldfishsend.crypto.UnlockMethod
+import app.goldfishsend.security.AppLock
+import app.goldfishsend.security.UnlockResult
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Re-authentication before security-relevant changes (unlock method, duress PIN, erasing, panic response, connection
@@ -38,8 +38,11 @@ import kotlinx.coroutines.withContext
  * - App PIN or passphrase: the current secret, on GoldfishSend's own keypad (or the passphrase field).
  * - Phone screen lock, or no app lock: the system prompt (phone PIN, pattern, password or strong biometric). With no
  *   screen lock on the phone at all there's nothing to check against, so the change goes ahead.
- * - In a decoy session (opened with the duress PIN), the check passes, as it would for the real owner. The dialogs
- *   themselves refuse anything harmful.
+ * - In a decoy session (opened with the duress PIN), the same PIN dialog asks for the decoy's own secret, the duress PIN
+ *   itself, exactly as a real session asks for the real one. It's never checked against a real secret.
+ *
+ * Wrong answers count like wrong unlocks on the lock screen (AppLock.reauthenticate): the same counter, the same
+ * "attempts left" warning and the same erase, so the prompt can't be used to guess the secret without limit.
  */
 @Stable
 class ReAuth internal constructor(
@@ -54,12 +57,9 @@ class ReAuth internal constructor(
     internal var checking by mutableStateOf(false)
 
     fun require(why: String, cancel: () -> Unit = {}, action: () -> Unit) {
-        if (s.decoy) {
-            action()
-            return
-        }
         onCancel = cancel
-        when (Graph.vault.unlockMethod) {
+        // A decoy only ever opens from the app-secret keypad, so it always takes the app-secret path.
+        when (if (s.decoy) UnlockMethod.APP_SECRET else Graph.vault.unlockMethod) {
             UnlockMethod.APP_SECRET -> {
                 reason = why
                 error = null
@@ -113,25 +113,28 @@ class ReAuth internal constructor(
         }
         checking = true
         scope.launch {
-            val ok = withContext(Dispatchers.Default) {
-                try {
-                    Graph.vault.unlockWithPassphrase(secret)?.also { it.fill(0) } != null
-                } catch (e: Exception) {
-                    false
-                } finally {
-                    secret.fill('\u0000')
-                }
-            }
+            val r = AppLock.reauthenticate(s, secret)
             checking = false
             if (pending !== action) {
                 // Cancelled while the secret was being checked.
                 return@launch
             }
-            if (ok) {
-                pending = null
-                action()
-            } else {
-                error = "That's not right. Try again."
+            when (r) {
+                UnlockResult.Ok -> {
+                    pending = null
+                    action()
+                }
+                is UnlockResult.Wrong -> {
+                    val left = r.attemptsLeft
+                    error = if (left != null && left <= 3) {
+                        "That's not right. $left attempt${if (left == 1) "" else "s"} left before everything is erased."
+                    } else {
+                        "That's not right. Try again."
+                    }
+                }
+                UnlockResult.DeviceLocked -> error = "Unlock your phone first."
+                // Erased: the app is starting over, nothing more to do here.
+                UnlockResult.Wiped, UnlockResult.Interrupted -> pending = null
             }
         }
     }

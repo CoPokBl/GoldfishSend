@@ -253,7 +253,7 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
                     checked = c.verified,
                     onChange = { v -> scope.launch(Dispatchers.IO) { s.repo.setVerified(contactId, v); s.db.notifyChanged() } },
                 )
-                val hiddenOn by rememberQuery(s) { q -> !q.decoy && q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
+                val hiddenOn by rememberQuery(s) { q -> q.repo.kvString(app.goldfishsend.security.AppLock.KV_HIDDEN_ON) == "1" }
                 if (hiddenOn == true) {
                     SwitchRow(
                         "Hide this chat",

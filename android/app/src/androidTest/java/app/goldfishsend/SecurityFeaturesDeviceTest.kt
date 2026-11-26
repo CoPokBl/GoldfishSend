@@ -67,7 +67,7 @@ class SecurityFeaturesDeviceTest {
         assertFalse(Graph.vault.isDuress("123456".toCharArray()))
         assertNull(Graph.vault.unlockWithPassphrase("4321".toCharArray()))
         // Nothing derived from the duress PIN is the master key, and the real database refuses it.
-        val decoyKey = Graph.vault.decoyKey("4321".toCharArray())
+        val decoyKey = Graph.vault.openDuress("4321".toCharArray())!!.decoyKey
         assertFalse(decoyKey.contentEquals(mk))
         try {
             Db.open(ctx, decoyKey)
@@ -97,7 +97,7 @@ class SecurityFeaturesDeviceTest {
         val real = s.repo.createContact("Real friend", false, 0, "https://x.example", ByteArray(32))
         Graph.lock()
 
-        Graph.prefs.duressAction = DuressAction.DECOY
+        Graph.vault.duressAction = DuressAction.DECOY
         assertEquals(UnlockResult.Ok, AppLock.unlock("4321".toCharArray()))
         val decoy = Graph.session.value!!
         assertTrue(decoy.decoy)
@@ -126,7 +126,7 @@ class SecurityFeaturesDeviceTest {
         Graph.vault.setDuress("4321".toCharArray())
         Graph.openSession(mk)
         Graph.lock()
-        Graph.prefs.duressAction = DuressAction.DECOY
+        Graph.vault.duressAction = DuressAction.DECOY
         assertEquals(UnlockResult.Ok, AppLock.unlock("4321".toCharArray()))
         assertTrue(Graph.session.value!!.decoy)
 
