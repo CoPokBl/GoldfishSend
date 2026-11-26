@@ -611,7 +611,13 @@ private fun ServerDialog(s: Session, onDismiss: () -> Unit) {
                         }
                     }
                     Graph.prefs.serverUrl = target
-                    Graph.prefs.serverKey = fp ?: learned
+                    val tofu = learned
+                    if (fp == null && tofu != null) {
+                        // Only trusted on first use: a key built in for this server later takes over (see Prefs.serverKey).
+                        Graph.prefs.learnServerKey(tofu)
+                    } else {
+                        Graph.prefs.serverKey = fp
+                    }
                     Graph.prefs.serverKeyChanged = null
                     Graph.scope.launchSafe { PushHub.register(ctx) }
                     onDismiss()

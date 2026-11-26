@@ -89,13 +89,18 @@ object Graph {
             application.getSharedPreferences(f, android.content.Context.MODE_PRIVATE)
         }
         ServerApi.defaultState = NetPrefs.gatewayState
+        NetPrefs.pruneToOwnServer(prefs.serverKey)
     }
 
     fun httpClient(): OkHttpClient = http ?: synchronized(this) {
         http ?: ServerApi.buildClient().also { http = it }
     }
 
-    /** Drops pooled connections (for example after switching to or from Tor) so none are reused on the old route. */
+    /**
+     * Drops idle pooled connections (for example after switching to or from Tor). Connections busy at the time, and those
+     * of clients that callers still hold, are caught by [app.goldfishsend.net.NetStack.PinInterceptor], which refuses any
+     * connection that isn't on the current route.
+     */
     fun resetHttp() {
         http?.let { runCatching { it.connectionPool.evictAll() } }
         http = null
@@ -115,7 +120,7 @@ object Graph {
         onFirstUse = { fp ->
             synchronized(this) {
                 if (prefs.serverUrl == url && prefs.serverKey == null) {
-                    prefs.serverKey = fp
+                    prefs.learnServerKey(fp)
                 }
             }
         },

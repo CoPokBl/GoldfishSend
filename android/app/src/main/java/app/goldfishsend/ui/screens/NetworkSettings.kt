@@ -14,6 +14,7 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.VpnLock
 import androidx.compose.material3.AlertDialog
@@ -54,13 +55,15 @@ import app.goldfishsend.ui.components.SettingRow
 import androidx.compose.foundation.layout.size
 import app.goldfishsend.ui.components.Spinner
 import app.goldfishsend.ui.components.SwitchRow
+import app.goldfishsend.ui.components.blockWhenObscured
 
 /** One-line summary for the Settings row. */
 fun connectionSummary(): String = when (NetPrefs.proxyMode) {
     ProxyMode.DIRECT -> "Direct connection"
     ProxyMode.EMBEDDED_TOR -> "Built-in Tor"
     ProxyMode.ORBOT -> "Tor through Orbot"
-} + if (NetPrefs.pinServers) " · TLS keys pinned" else ""
+} + (if (NetPrefs.proxyMode != ProxyMode.DIRECT && NetPrefs.torOnlyForContacts) " for other people's servers" else "") +
+    if (NetPrefs.pinServers) " · TLS keys pinned" else ""
 
 private fun modeTitle(m: ProxyMode) = when (m) {
     ProxyMode.DIRECT -> "Direct"
@@ -136,8 +139,19 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
                     SettingRow("Tor status", status, Icons.Rounded.VpnLock, trailing = if (connecting) ({ Spinner(Modifier.size(20.dp)) }) else null)
                 }
                 if (NetPrefs.proxyMode != ProxyMode.DIRECT) {
+                    SwitchRow(
+                        "Tor only for other people's servers",
+                        "Connect to your own server directly, which is faster. It sees your IP address. Contacts' and group " +
+                            "members' servers are still reached through Tor, so they don't.",
+                        Icons.Rounded.Dns,
+                        NetPrefs.torOnlyForContacts,
+                    ) {
+                        NetPrefs.torOnlyForContacts = it
+                        Graph.resetHttp()
+                    }
                     Text(
-                        "Tor covers your connections to GoldfishSend servers. Notifications still arrive through your push " +
+                        (if (NetPrefs.torOnlyForContacts) "Tor covers your connections to other people's servers. " else "Tor covers your connections to GoldfishSend servers. ") +
+                            "Notifications still arrive through your push " +
                             "service (for example ntfy), which can see when you get a message but never what it says.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -244,9 +258,12 @@ fun NetworkSettingsDialog(onDismiss: () -> Unit) {
     trust?.let { (hostKey, pin) -> ConfirmTrustDialog(hostKey, pin) { trust = null } }
 }
 
-/** Shown over the whole app as soon as a pinned server presents a different key. */
+/**
+ * Shown over the unlocked app (or setup) as soon as a pinned server presents a different key. [authorise] runs the trust
+ * step after re-authentication: someone holding the phone mustn't be able to accept a key for the owner.
+ */
 @Composable
-fun PinMismatchDialog() {
+fun PinMismatchDialog(authorise: (action: () -> Unit) -> Unit) {
     val m by NetPrefs.mismatch.collectAsState()
     var confirm by remember { mutableStateOf<PinMismatch?>(null) }
     m?.let { mismatch ->
@@ -277,11 +294,12 @@ fun PinMismatchDialog() {
             )
         }
     }
-    confirm?.let { c -> ConfirmTrustDialog(c.hostKey, c.presented) { confirm = null } }
+    confirm?.let { c -> ConfirmTrustDialog(c.hostKey, c.presented, authorise) { confirm = null } }
 }
 
+/** [authorise] wraps the trust itself (re-authentication); the Connection screen is only opened after one already. */
 @Composable
-private fun ConfirmTrustDialog(hostKey: String, pin: String, onDone: () -> Unit) {
+private fun ConfirmTrustDialog(hostKey: String, pin: String, authorise: (action: () -> Unit) -> Unit = { it() }, onDone: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDone,
         title = { Text("Trust the new key?") },
@@ -292,11 +310,16 @@ private fun ConfirmTrustDialog(hostKey: String, pin: String, onDone: () -> Unit)
             )
         },
         confirmButton = {
-            TextButton(onClick = {
-                NetPrefs.trustNewKey(hostKey, pin)
-                Graph.resetHttp()
-                onDone()
-            }) { Text("Trust") }
+            TextButton(
+                onClick = {
+                    authorise {
+                        NetPrefs.trustNewKey(hostKey, pin)
+                        Graph.resetHttp()
+                        onDone()
+                    }
+                },
+                modifier = Modifier.blockWhenObscured(),
+            ) { Text("Trust") }
         },
         dismissButton = { TextButton(onClick = onDone) { Text("Cancel") } },
     )

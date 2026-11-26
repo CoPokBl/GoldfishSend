@@ -52,6 +52,7 @@ class MaintenanceWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
         runCatching { Mailboxes.rotateContacts(s) }
         runCatching { app.goldfishsend.core.Groups.maintain(s) }
         runCatching { Messenger.resendUnreceipted(s) }
+        runCatching { app.goldfishsend.core.NetPrefs.pruneOtherPins(s.repo) }
         runCatching { s.repo.vacuumIfNeeded() }
         return Result.success()
     }

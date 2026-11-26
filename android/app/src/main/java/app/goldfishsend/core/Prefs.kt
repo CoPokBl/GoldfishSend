@@ -94,11 +94,21 @@ class Prefs(context: Context) {
 
     /**
      * The pinned identity fingerprint (b64u) of our own server. For the built-in default server it's built into the app;
-     * otherwise it's trusted on first use or typed in at setup. Null until known.
+     * otherwise it's trusted on first use or typed in at setup. Null until known. Setting it records a key the user
+     * chose; [learnServerKey] records one trusted on first use, which a built-in key overrides ([effectiveServerKey]).
      */
     var serverKey: String?
-        get() = str("server_key") ?: builtInServerKey(serverUrl)
-        set(v) = setStr("server_key", v)
+        get() = effectiveServerKey(str("server_key"), bool("server_key_tofu", false), builtInServerKey(serverUrl))
+        set(v) {
+            sp.edit().putString("server_key", v).remove("server_key_tofu").apply()
+            changed()
+        }
+
+    /** Records [fp] as our server's key, trusted on first use (nobody chose it: it's whatever answered first). */
+    fun learnServerKey(fp: String) {
+        sp.edit().putString("server_key", fp).putBoolean("server_key_tofu", true).apply()
+        changed()
+    }
 
     /**
      * A different fingerprint our server presented, waiting for the user to decide (docs/protocol.md "Server key"). While
@@ -231,6 +241,14 @@ class Prefs(context: Context) {
         get() = str("push_host")
         set(v) = setStrIfChanged("push_host", v)
 
+    /**
+     * Host of the previous push endpoint while the server hasn't confirmed the switch away from it (the rotation's
+     * verification push hasn't been answered), or null. Until then the server still wakes us through it.
+     */
+    var pushHostUnconfirmed: String?
+        get() = str("push_host_unconfirmed")
+        set(v) = setStrIfChanged("push_host_unconfirmed", v)
+
     // --- Security features (each one optional, see android/README.md, "Optional security features") ---
 
     /** Shuffle the in-app PIN keypad's digits each time it's shown. Off by default because it slows entry. */
@@ -312,5 +330,16 @@ class Prefs(context: Context) {
         /** The fingerprint built in with `-Pgf.defaultServerKey`, which applies only to the built-in default server. */
         fun builtInServerKey(url: String): String? =
             BuildConfig.DEFAULT_SERVER_KEY.takeIf { it.isNotEmpty() && url.trimEnd('/') == BuildConfig.DEFAULT_SERVER_URL.trimEnd('/') }
+
+        /**
+         * Which fingerprint pins our server. A key the user chose (typed at setup, or a change they trusted after
+         * re-authenticating) wins. A key merely trusted on first use, by a build that had no key built in, doesn't: once a
+         * build ships the default server's key, that governs, and if the server still presents the other key the usual
+         * "identity changed" prompt shows instead of the old key being used quietly.
+         */
+        fun effectiveServerKey(stored: String?, storedOnFirstUse: Boolean, builtIn: String?): String? = when {
+            builtIn != null && (stored == null || storedOnFirstUse) -> builtIn
+            else -> stored
+        }
     }
 }
