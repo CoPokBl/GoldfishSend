@@ -1,5 +1,6 @@
 package app.goldfishsend.core
 
+import app.goldfishsend.security.ClipboardGuard
 import app.goldfishsend.security.MemoryScrubber
 import android.app.Application
 import app.goldfishsend.crypto.BucketKeys
@@ -7,6 +8,7 @@ import app.goldfishsend.crypto.KeyVault
 import app.goldfishsend.crypto.MessageVault
 import app.goldfishsend.crypto.SignalStore
 import app.goldfishsend.db.Db
+import app.goldfishsend.db.KV_SHRED_PENDING
 import app.goldfishsend.db.MsgKind
 import app.goldfishsend.db.MsgStatus
 import app.goldfishsend.db.Repo
@@ -20,6 +22,7 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -32,7 +35,7 @@ import org.signal.libsignal.protocol.ecc.ECPrivateKey
 /** Everything that exists while the app is unlocked. Closing it wipes the keys from RAM. */
 class Session(val db: Db, private var mk: ByteArray, val messages: MessageVault) {
     val signal = SignalStore(db)
-    val repo = Repo(db, messages)
+    val repo = Repo(db, messages).also { r -> r.onMessagesDeleted = { Shredder.schedule(this) } }
 
     /** Serialises libsignal and DB mutations: libsignal stores aren't safe for concurrent ratchet updates. */
     val lock = Mutex()
@@ -107,7 +110,31 @@ object Graph {
      */
     fun api(): ServerApi {
         val url = prefs.serverUrl
-        return ServerApi(url, httpClient(), ownPin(url))
+        return ServerApi(url, httpClient(), ownPin(url), live = liveness())
+    }
+
+    /** Bumped by every wipe ([stopBackground]). A [ServerApi] made before then refuses to send anything. */
+    @Volatile
+    private var installEpoch = 0L
+
+    private fun liveness(): () -> Boolean {
+        val epoch = installEpoch
+        return { installEpoch == epoch }
+    }
+
+    /**
+     * Before a wipe clears anything: stops everything that could still reach a server or write settings for the install
+     * being wiped. Coroutines in [scope] and WorkManager jobs are cancelled, calls in flight are cancelled, and every
+     * [ServerApi] made so far stops sending (a job busy computing a proof of work only notices its cancellation when it
+     * next suspends). Otherwise such a job could make its next request after the wipe has reset the connection mode, so
+     * directly instead of through Tor, and write the server's key back into the wiped network settings.
+     */
+    fun stopBackground() {
+        installEpoch++
+        scope.coroutineContext.cancelChildren()
+        runCatching { androidx.work.WorkManager.getInstance(app).cancelAllWork() }
+        http?.let { runCatching { it.dispatcher.cancelAll() } }
+        resetHttp()
     }
 
     private fun ownPin(url: String) = ServerPin(
@@ -132,7 +159,7 @@ object Graph {
     )
 
     /** Some other server (a contact's, or one being checked before switching), with an explicit [pin]. */
-    fun api(server: String, pin: ServerPin): ServerApi = ServerApi(server, httpClient(), pin)
+    fun api(server: String, pin: ServerPin): ServerApi = ServerApi(server, httpClient(), pin, live = liveness())
 
     /** Our own server's fingerprint, fetching it (trust on first use) if it isn't known yet. */
     suspend fun ownServerKey(): String = prefs.serverKey ?: api().identity()
@@ -168,7 +195,7 @@ object Graph {
             Db.open(app, decoyKey, Db.DECOY_NAME)
         }
         val boot = Repo(db, MessageVault(ByteArray(32)))
-        val mrk = boot.kvGet("decoy_mrk") ?: Rand.bytes(32).also { boot.kvPut("decoy_mrk", it) }
+        val mrk = boot.kvGet(Shredder.KV_DECOY_ROOT) ?: Rand.bytes(32).also { boot.kvPut(Shredder.KV_DECOY_ROOT, it) }
         val s = Session(db, decoyKey, MessageVault(mrk))
         s.decoy = true
         _session.value = s
@@ -209,16 +236,31 @@ object Graph {
         val tmpVault = MessageVault(ByteArray(32))
         val bootstrapRepo = Repo(db, tmpVault)
         var shredded = false
-        val wrapped = bootstrapRepo.kvGet("mrk")
-        var mrk = wrapped?.let { vault.unwrapMessageRoot(it) }
-        if (mrk == null) {
-            if (wrapped != null) {
-                // The message key was destroyed (restart wipe / panic): clear the now-unreadable rows.
-                bootstrapRepo.wipeAllMessages()
-                shredded = true
+        val wrapped = bootstrapRepo.kvGet(Shredder.KV_ROOT)
+        val alias = bootstrapRepo.kvString(Shredder.KV_ROOT_ALIAS)
+        val stored = wrapped?.let { vault.unwrapMessageRoot(it, alias) }
+        val mrk: ByteArray = synchronized(Shredder) {
+            if (stored == null) {
+                if (wrapped != null) {
+                    // The message key was destroyed (restart wipe / panic): clear the now-unreadable rows.
+                    bootstrapRepo.wipeAllMessages()
+                    shredded = true
+                }
+                val fresh = Rand.bytes(32)
+                val w = vault.wrapMessageRoot(fresh)
+                db.tx {
+                    bootstrapRepo.kvPut(Shredder.KV_ROOT, w.blob)
+                    bootstrapRepo.kvPutString(Shredder.KV_ROOT_ALIAS, w.alias)
+                    // A fresh root has nothing stale under it.
+                    bootstrapRepo.kvPutString(KV_SHRED_PENDING, null)
+                }
+                vault.keepOnlyMessageKey(w.alias)
+                fresh
+            } else {
+                // A rotation that died before or after its commit can leave a spare key: only the stored root's stays.
+                vault.keepOnlyMessageKey(alias)
+                stored
             }
-            mrk = Rand.bytes(32)
-            bootstrapRepo.kvPut("mrk", vault.wrapMessageRoot(mrk))
         }
         // Locked-inbox key pair: pushes arriving while locked are sealed to the public key.
         if (bootstrapRepo.kvGet("inbox_priv") == null || prefs.inboxPublicKey == null) {
@@ -282,6 +324,7 @@ object Graph {
         _session.value = null
         Actions.clearFailures()
         s.close()
+        ClipboardGuard.onLock(app)
         if (prefs.wipeMemoryOnLock) {
             MemoryScrubber.scrubAsync()
         }

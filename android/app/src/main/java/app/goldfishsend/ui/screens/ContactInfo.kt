@@ -46,7 +46,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.goldfishsend.core.Graph
 import app.goldfishsend.core.Messenger
-import app.goldfishsend.core.Notifier
 import app.goldfishsend.core.Session
 import app.goldfishsend.core.TIMER_CHOICES
 import app.goldfishsend.core.timerLabel
@@ -306,11 +305,7 @@ fun ContactInfoScreen(s: Session, contactId: Long, back: () -> Unit, onDeleted: 
     if (confirmClear) {
         ConfirmDialog("Clear chat?", "All messages in this chat will be permanently erased from this phone.", "Clear", true, { confirmClear = false }) {
             erasing.run {
-                withContext(Dispatchers.IO) {
-                    s.repo.clearConversation(contactId)
-                    s.db.notifyChanged()
-                    Notifier.cancel(Graph.app)
-                }
+                withContext(Dispatchers.IO) { Messenger.clearChat(s, contactId) }
             }
         }
     }

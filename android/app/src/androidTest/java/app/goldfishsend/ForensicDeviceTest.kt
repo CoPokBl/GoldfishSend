@@ -475,10 +475,10 @@ class ForensicDeviceTest {
         before.close()
         Wiper.wipeMessages()
         assertTrue(LockedInbox.isEmpty)
-        assertTrue(aliases().none { it.startsWith("gf_mb_") || it == "gf_msg" })
+        assertTrue(aliases().none { it.startsWith("gf_mb_") || it.startsWith("gf_msg") })
         // Until the next unlock the rows are still there, but nothing can open their keys any more.
         val shredded = Db.open(ctx, mk)
-        assertNull(Graph.vault.unwrapMessageRoot(shredded.queryOne("SELECT v FROM kv WHERE k = 'mrk'") { it.getBlob(0) }!!))
+        assertNull(Graph.vault.unwrapMessageRoot(shredded.queryOne("SELECT v FROM kv WHERE k = 'mrk'") { it.getBlob(0) }!!, shredded.queryOne("SELECT v FROM kv WHERE k = 'mrk_alias'") { String(it.getBlob(0)) }))
         shredded.close()
 
         s = Graph.openSession(mk.copyOf())

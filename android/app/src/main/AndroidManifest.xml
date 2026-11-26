@@ -38,13 +38,13 @@
 
         <!--
           PanicKit responder: panic trigger apps (for example Ripple) can lock GoldfishSend, and, if the user approved that
-          app and chose it in Settings, erase it. Does nothing until a response is chosen.
+          app and chose it in Settings, erase it. Does nothing until a response is chosen. Not noHistory: approving a
+          connection asks for the phone's credential, and that screen mustn't finish the activity underneath it.
         -->
         <activity
             android:name=".security.PanicResponderActivity"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:noHistory="true"
             android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>

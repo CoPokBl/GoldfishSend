@@ -282,6 +282,12 @@ class ServerApi(
     private val pin: ServerPin = ServerPin(null),
     private val state: GatewayState = defaultState,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /**
+     * False once the install this client was made for has been wiped. From then on nothing is sent and nothing is
+     * written back (pins, the cached server key): a job still running from before the wipe could otherwise go out
+     * directly, after the wipe reset the connection mode, and leave the server's key in the wiped settings.
+     */
+    private val live: () -> Boolean = { true },
 ) {
     private val base: HttpUrl = parseBase(baseUrl)
     private val serverId: String = base.toString()
@@ -464,6 +470,7 @@ class ServerApi(
             } catch (e: GatewayCodec.FormatException) {
                 throw ApiException("bad_server", 502, retryAfterSeconds = 60, cause = e)
             }
+            checkLive()
             // The response opened under the pinned key, so it really came from the server.
             pin.onVerified()
             if (resp.status == 400 && !skewRetried) {
@@ -511,6 +518,8 @@ class ServerApi(
             readCapped(r, MAX_KEY_BYTES)
         }
         val key = ServerKey.parse(blob) ?: throw ApiException("bad_server", 502, retryAfterSeconds = 300)
+        // A wipe may have happened while the key was on its way: then nothing of it is recorded.
+        checkLive()
         val fp = key.fingerprintB64
         if (expected == null) {
             learned = fp
@@ -523,8 +532,15 @@ class ServerApi(
         return key
     }
 
+    private fun checkLive() {
+        if (!live()) {
+            throw ApiException("stopped", 0)
+        }
+    }
+
     /** Runs one plain HTTP request, mapping transport failures. */
     private fun <T> call(req: Request, onResponse: (Response) -> T): T {
+        checkLive()
         val resp = try {
             http.newCall(req).execute()
         } catch (e: BlockedRequestException) {

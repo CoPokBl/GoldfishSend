@@ -7,6 +7,7 @@ import app.goldfishsend.core.Graph
 import app.goldfishsend.core.LockedInbox
 import app.goldfishsend.core.Mailboxes
 import app.goldfishsend.core.NetPrefs
+import app.goldfishsend.core.Shredder
 import app.goldfishsend.net.TorManager
 import app.goldfishsend.core.Notifier
 import app.goldfishsend.db.Db
@@ -20,13 +21,16 @@ object Wiper {
     /**
      * Erases all messages, including pushes waiting in the locked inbox. While locked this works by destroying the message
      * root key (an instant crypto-shred) and the per-expiry bucket keys. The inbox key pair is replaced at the next unlock,
-     * so remnants of old sealed pushes can never be opened again.
+     * so remnants of old sealed pushes can never be opened again. While unlocked the rows are deleted and the message root
+     * key is replaced too, so stale copies of them left in flash can't be opened either.
      */
     fun wipeMessages() {
         val s = Graph.realSession
         LockedInbox.clear()
         if (s != null) {
             s.repo.wipeAllMessages()
+            // If it can't happen now (the phone itself is locked), it's still pending and happens at the next chance.
+            runCatching { Shredder.rotate(s) }
             LockedInbox.rotateKeys(s)
             s.db.notifyChanged()
         } else {
@@ -58,8 +62,17 @@ object Wiper {
         }
     }
 
-    /** Records that the user is here (interactive unlock, or the app is in the foreground while unlocked). */
+    /**
+     * Records that the user is here (interactive unlock, or the app is in the foreground while unlocked). The inactivity
+     * limit is checked first ([Presence.onPresent]): once it has passed, being here erases instead of resetting the clock.
+     */
     fun recordPresence(ctx: Context = Graph.app) {
+        if (!checkInactivity(ctx)) {
+            mark(ctx)
+        }
+    }
+
+    private fun mark(ctx: Context) {
         Graph.prefs.presence = Presence.Mark(
             System.currentTimeMillis(),
             android.os.SystemClock.elapsedRealtime(),
@@ -67,22 +80,28 @@ object Wiper {
         )
     }
 
-    /** Dead-man switch: wipe everything if the user hasn't been present for N days. Background wake-ups don't count. */
-    fun checkInactivity(ctx: Context) {
+    /**
+     * Dead-man switch: wipe everything if the user hasn't been present for N days. Background wake-ups don't count.
+     * Returns true if it wiped.
+     */
+    fun checkInactivity(ctx: Context): Boolean {
         val days = Graph.prefs.inactivityWipeDays
         if (days <= 0 || !Graph.prefs.onboarded) {
-            return
+            return false
         }
         val last = Graph.prefs.presence
         if (last == null) {
             // First run with the feature (or an upgrade): start the clock now rather than erasing.
-            recordPresence(ctx)
-            return
+            mark(ctx)
+            return false
         }
         val boot = Settings.Global.getInt(ctx.contentResolver, Settings.Global.BOOT_COUNT, -1)
-        if (Presence.shouldWipe(last, days, System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime(), boot)) {
+        val now = Presence.onPresent(last, days, System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime(), boot)
+        if (now == Presence.OnPresent.WIPE) {
             wipeEverything(ctx)
+            return true
         }
+        return false
     }
 
     /**
@@ -97,6 +116,9 @@ object Wiper {
         // Captured before the settings go: the deletes still verify the server's identity. Without a pin they're skipped
         // (they'd only reveal the secrets to whoever answers).
         val serverKey = Graph.prefs.serverKey
+        // Every wipe, not only the panic ones that end the process: nothing started before it may go on talking to a
+        // server (perhaps no longer through Tor, once the settings are gone) or write settings back afterwards.
+        Graph.stopBackground()
         Graph.lock()
         Graph.vault.destroyAll()
         app.goldfishsend.crypto.BucketKeys.destroyAll()
@@ -110,6 +132,7 @@ object Wiper {
         LockedInbox.clear()
         PushHub.unregister(ctx)
         Notifier.cancelAll(ctx)
+        // Again, for anything enqueued while the above ran.
         runCatching { WorkManager.getInstance(ctx).cancelAllWork() }
         // Store the connection mode explicitly, so the best-effort deletes below still go through Tor or Orbot
         // after the main preferences (which hold the legacy Orbot flag) are cleared. Network state goes last.

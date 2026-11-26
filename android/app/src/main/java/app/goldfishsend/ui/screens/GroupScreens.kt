@@ -70,7 +70,6 @@ import app.goldfishsend.core.Graph
 import app.goldfishsend.core.GroupException
 import app.goldfishsend.core.Groups
 import app.goldfishsend.core.Messenger
-import app.goldfishsend.core.Notifier
 import app.goldfishsend.core.Session
 import app.goldfishsend.core.TIMER_CHOICES
 import app.goldfishsend.core.timerLabel
@@ -504,11 +503,7 @@ fun GroupInfoScreen(s: Session, cid: Long, back: () -> Unit, onDeleted: () -> Un
     if (confirmClear) {
         ConfirmDialog("Clear chat?", "All messages in this group will be permanently erased from this phone.", "Clear", true, { confirmClear = false }) {
             erasing.run {
-                withContext(Dispatchers.IO) {
-                    s.repo.clearConversation(cid)
-                    s.db.notifyChanged()
-                    Notifier.cancel(Graph.app)
-                }
+                withContext(Dispatchers.IO) { Messenger.clearChat(s, cid) }
             }
         }
     }
