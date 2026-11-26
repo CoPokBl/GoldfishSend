@@ -389,6 +389,6 @@ public sealed class GatewayTests {
         Assert.Empty(persistent);
         Assert.NotEmpty(ephemeral);
         var ttl = await mux.GetDatabase(1).KeyTimeToLiveAsync(ephemeral[0]);
-        Assert.InRange(ttl!.Value.TotalSeconds, 1, 1200);
+        Assert.InRange(ttl!.Value.TotalSeconds, 1, GatewayReplayGuard.Retention.TotalSeconds);
     }
 }

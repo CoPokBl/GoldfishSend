@@ -15,7 +15,7 @@ namespace GoldfishSend.Api;
 /// </summary>
 public sealed class GatewayMiddleware {
     public const int MaxOuterBody = 20 * 1024;
-    public const int TimestampWindowSeconds = 600;
+    public const int TimestampWindowSeconds = GatewayReplayGuard.TimestampWindowSeconds;
 
     private static readonly HashSet<string> OuterHeadersToKeep = new(StringComparer.OrdinalIgnoreCase) {
         "Cache-Control", "X-Content-Type-Options", "Referrer-Policy", "Content-Security-Policy",
