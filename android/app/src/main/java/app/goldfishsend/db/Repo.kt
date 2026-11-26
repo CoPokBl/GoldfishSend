@@ -153,6 +153,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
 
     fun kvPutString(k: String, v: String?) = kvPut(k, v?.toByteArray(Charsets.UTF_8))
 
+    /** Every kv key that starts with [prefix]. */
+    fun kvKeys(prefix: String): List<String> =
+        db.query("SELECT k FROM kv WHERE substr(k, 1, ?) = ?", prefix.length, prefix) { it.getString(0) }
+
     var displayName: String?
         get() = kvString("display_name")?.takeIf { it.isNotBlank() }
         set(v) {
@@ -812,6 +816,10 @@ class Repo(val db: Db, private val vault: MessageVault) {
     fun deleteRotation(tag: ByteArray) = db.exec("DELETE FROM rotations WHERE tag = ?", tag)
 
     fun clearRotations() = db.exec("DELETE FROM rotations")
+
+    /** When the newest rotation still waiting for its verification push was sent, or null if none is waiting. */
+    fun rotationsPendingSince(): Long? =
+        db.queryOne("SELECT MAX(created_at) FROM rotations") { c -> if (c.isNull(0)) null else c.getLong(0) }
 
     // --- outbox ---
 

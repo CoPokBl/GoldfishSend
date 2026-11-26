@@ -34,7 +34,7 @@ object DecoyPrefs {
     /** gf_prefs keys copied into a new decoy. Everything else (wipe triggers, panic app, timers…) starts at its default. */
     val MIRRORED = setOf(
         "theme", "amoled", "dynamic_color", "flag_secure", "scramble_pin", "lock_timeout", "lock_screen_off", "max_failed",
-        "wipe_memory_on_lock", "server_url", "server_key",
+        "wipe_memory_on_lock", "server_url", "server_key", "server_key_tofu",
     )
 
     /**

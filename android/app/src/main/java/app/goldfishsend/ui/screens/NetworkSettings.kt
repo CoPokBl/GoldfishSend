@@ -14,6 +14,7 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.VpnLock
 import androidx.compose.material3.AlertDialog
@@ -55,6 +56,7 @@ import app.goldfishsend.ui.components.SettingRow
 import androidx.compose.foundation.layout.size
 import app.goldfishsend.ui.components.Spinner
 import app.goldfishsend.ui.components.SwitchRow
+import app.goldfishsend.ui.components.blockWhenObscured
 
 /**
  * What the Connection screen shows and changes. The real profile (and onboarding) uses the device's network settings. A
@@ -63,6 +65,7 @@ import app.goldfishsend.ui.components.SwitchRow
  */
 private interface ConnectionSettings {
     var mode: ProxyMode
+    var torOnlyForContacts: Boolean
     var pinServers: Boolean
 
     fun pins(): Map<String, Set<String>>
@@ -78,6 +81,13 @@ private class DeviceConnection(private val ctx: android.content.Context) : Conne
         set(m) {
             NetPrefs.proxyMode = m
             NetStack.apply(ctx)
+            Graph.resetHttp()
+        }
+
+    override var torOnlyForContacts: Boolean
+        get() = NetPrefs.torOnlyForContacts
+        set(v) {
+            NetPrefs.torOnlyForContacts = v
             Graph.resetHttp()
         }
 
@@ -106,6 +116,12 @@ private class DecoyConnection(private val p: app.goldfishsend.core.Prefs) : Conn
             p.decoyProxyMode = m.name
         }
 
+    override var torOnlyForContacts: Boolean
+        get() = p.decoyTorOnlyForContacts
+        set(v) {
+            p.decoyTorOnlyForContacts = v
+        }
+
     override var pinServers: Boolean
         get() = p.decoyPinServers
         set(v) {
@@ -130,7 +146,8 @@ fun connectionSummary(s: Session? = null): String {
         ProxyMode.DIRECT -> "Direct connection"
         ProxyMode.EMBEDDED_TOR -> "Built-in Tor"
         ProxyMode.ORBOT -> "Tor through Orbot"
-    } + if (c.pinServers) " · TLS keys pinned" else ""
+    } + (if (c.mode != ProxyMode.DIRECT && c.torOnlyForContacts) " for other people's servers" else "") +
+        if (c.pinServers) " · TLS keys pinned" else ""
 }
 
 private fun modeTitle(m: ProxyMode) = when (m) {
@@ -211,8 +228,18 @@ fun NetworkSettingsDialog(s: Session? = null, onDismiss: () -> Unit) {
                     SettingRow("Tor status", status, Icons.Rounded.VpnLock, trailing = if (connecting) ({ Spinner(Modifier.size(20.dp)) }) else null)
                 }
                 if (conn.mode != ProxyMode.DIRECT) {
+                    SwitchRow(
+                        "Tor only for other people's servers",
+                        "Connect to your own server directly, which is faster. It sees your IP address. Contacts' and group " +
+                            "members' servers are still reached through Tor, so they don't.",
+                        Icons.Rounded.Dns,
+                        conn.torOnlyForContacts,
+                    ) {
+                        conn.torOnlyForContacts = it
+                    }
                     Text(
-                        "Tor covers your connections to GoldfishSend servers. Notifications still arrive through your push " +
+                        (if (conn.torOnlyForContacts) "Tor covers your connections to other people's servers. " else "Tor covers your connections to GoldfishSend servers. ") +
+                            "Notifications still arrive through your push " +
                             "service (for example ntfy), which can see when you get a message but never what it says.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -316,11 +343,12 @@ fun NetworkSettingsDialog(s: Session? = null, onDismiss: () -> Unit) {
 }
 
 /**
- * Shown over the whole app as soon as a pinned server presents a different key. Not in a decoy session: the pins are the
- * real profile's (and so is the decision), so the question waits for the real profile.
+ * Shown over the unlocked app (or setup) as soon as a pinned server presents a different key. [authorise] runs the trust
+ * step after re-authentication: someone holding the phone mustn't be able to accept a key for the owner. Not in a decoy
+ * session: the pins are the real profile's (and so is the decision), so the question waits for the real profile.
  */
 @Composable
-fun PinMismatchDialog() {
+fun PinMismatchDialog(authorise: (action: () -> Unit) -> Unit) {
     val session by Graph.session.collectAsState()
     if (session?.decoy == true) {
         return
@@ -355,11 +383,12 @@ fun PinMismatchDialog() {
             )
         }
     }
-    confirm?.let { c -> ConfirmTrustDialog(c.hostKey, c.presented) { confirm = null } }
+    confirm?.let { c -> ConfirmTrustDialog(c.hostKey, c.presented, authorise) { confirm = null } }
 }
 
+/** [authorise] wraps the trust itself (re-authentication); the Connection screen is only opened after one already. */
 @Composable
-private fun ConfirmTrustDialog(hostKey: String, pin: String, onDone: () -> Unit) {
+private fun ConfirmTrustDialog(hostKey: String, pin: String, authorise: (action: () -> Unit) -> Unit = { it() }, onDone: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDone,
         title = { Text("Trust the new key?") },
@@ -370,11 +399,16 @@ private fun ConfirmTrustDialog(hostKey: String, pin: String, onDone: () -> Unit)
             )
         },
         confirmButton = {
-            TextButton(onClick = {
-                NetPrefs.trustNewKey(hostKey, pin)
-                Graph.resetHttp()
-                onDone()
-            }) { Text("Trust") }
+            TextButton(
+                onClick = {
+                    authorise {
+                        NetPrefs.trustNewKey(hostKey, pin)
+                        Graph.resetHttp()
+                        onDone()
+                    }
+                },
+                modifier = Modifier.blockWhenObscured(),
+            ) { Text("Trust") }
         },
         dismissButton = { TextButton(onClick = onDone) { Text("Cancel") } },
     )

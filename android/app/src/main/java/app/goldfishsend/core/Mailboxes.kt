@@ -55,6 +55,9 @@ object Mailboxes {
     private const val ROTATIONS_PER_PASS = 3
     private const val BUSY_RETRIES = 4
 
+    /** Longer than the server keeps a staged endpoint waiting for its verification (10 minutes by default, plus jitter). */
+    private const val ROTATION_VERIFY_WINDOW_MS = 30 * 60_000L
+
     /** Before the first measurement: a guess at Argon2 calls per second (a mid-range phone at 16 MiB, 4 threads). */
     private const val DEFAULT_CALLS_PER_SECOND = 25.0
 
@@ -264,6 +267,12 @@ object Mailboxes {
                 }
             }
             s.repo.deleteRotation(tag)
+            // Under the rotation lock: while rotateAll is still sending later batches, none pending doesn't mean done.
+            rotateMutex.withLock {
+                if (s.repo.rotationsPendingSince() == null && s.repo.kvString("rotation_needed") == "1") {
+                    rotationDone(s)
+                }
+            }
             return
         }
         val mb = s.repo.mailboxByTag(tag) ?: return
@@ -375,9 +384,15 @@ object Mailboxes {
         val old = endpoint(s)
         s.repo.kvPutString("push_endpoint", ProtoJson.encodeToString(PushEndpointData.serializer(), data))
         Graph.prefs.pushStatus = "ok"
-        Graph.prefs.pushHost = runCatching { java.net.URI(data.url).host }.getOrNull()
+        val host = runCatching { java.net.URI(data.url).host }.getOrNull()
+        Graph.prefs.pushHost = host
         if (old != null && old != data) {
             s.repo.kvPutString("rotation_needed", "1")
+            val oldHost = runCatching { java.net.URI(old.url).host }.getOrNull()
+            if (oldHost != null && oldHost != host && Graph.prefs.pushHostUnconfirmed == null) {
+                // Until the server confirms the new endpoint, it still wakes us through the old push service.
+                Graph.prefs.pushHostUnconfirmed = oldHost
+            }
             rotateAll(s)
         }
         ensurePool(s)
@@ -422,7 +437,17 @@ object Mailboxes {
                 }
             }
         }
+        // The server only stages the new endpoint until its verification push is answered. rotation_needed stays set until
+        // every batch is verified ([onVerification]), so a push that's lost or comes too late is retried by [cleanup].
+        if (s.repo.rotationsPendingSince() == null) {
+            rotationDone(s)
+        }
+    }
+
+    /** Every mailbox is confirmed on the current endpoint. */
+    private fun rotationDone(s: Session) {
         s.repo.kvPutString("rotation_needed", null)
+        Graph.prefs.pushHostUnconfirmed = null
     }
 
     /**
@@ -431,6 +456,10 @@ object Mailboxes {
      */
     private suspend fun replaceGone(s: Session, m: Mailbox) {
         s.repo.deleteMailboxRow(m.id)
+        // One already replaced (draining after a rotation) needs nothing new: the contact or group has a newer one.
+        if (m.replacedAt != null) {
+            return
+        }
         val cid = m.contactId ?: return
         if (m.purpose == Mailbox.PURPOSE_GROUP) {
             // A group inbox: a new one goes out to the members in a new card.
@@ -539,7 +568,11 @@ object Mailboxes {
         }
     }
 
-    /** Extends any mailbox expiring within 60 days. */
+    /**
+     * Extends any mailbox expiring within 60 days. The server refuses a whole batch (404) if it doesn't know one mailbox in
+     * it, so that batch is refreshed one by one and the gone ones are replaced: otherwise one lost mailbox would keep every
+     * other one in its batch (and all later batches) from being refreshed until they all expire.
+     */
     suspend fun refreshAll(s: Session) {
         if (s.decoy) {
             return
@@ -548,7 +581,29 @@ object Mailboxes {
         val due = s.repo.activeMailboxes().filter { it.expiresAt == null || it.expiresAt < soon }
         val api = Graph.api()
         for (batch in due.chunked(100)) {
-            val r = api.refresh(batch.map(::item))
+            val r = try {
+                api.refresh(batch.map(::item))
+            } catch (e: ApiException) {
+                if (e.status != 404) {
+                    throw e
+                }
+                for (m in batch) {
+                    val one = try {
+                        api.refresh(listOf(item(m)))
+                    } catch (e2: ApiException) {
+                        if (e2.status != 404) {
+                            throw e2
+                        }
+                        replaceGone(s, m)
+                        continue
+                    }
+                    if (one.endpointGone) {
+                        onEndpointGone(s)
+                    }
+                    s.repo.setMailboxExpiry(m.id, one.expiresAt)
+                }
+                continue
+            }
             if (r.endpointGone) {
                 onEndpointGone(s)
             }
@@ -558,13 +613,33 @@ object Mailboxes {
         }
     }
 
+    /**
+     * Deletes mailboxes on our server. One that's already gone counts as deleted: the server refuses a whole batch (404)
+     * if it doesn't know one mailbox in it, for example after a delete whose response was lost, so such a batch is
+     * deleted one by one instead. Otherwise the local rows would never go, and would block refreshes too.
+     */
     suspend fun deleteRemote(items: List<MailboxItem>) {
         if (items.isEmpty()) {
             return
         }
         val api = Graph.api()
         for (batch in items.chunked(100)) {
-            api.delete(batch)
+            try {
+                api.delete(batch)
+            } catch (e: ApiException) {
+                if (e.status != 404) {
+                    throw e
+                }
+                for (i in batch) {
+                    try {
+                        api.delete(listOf(i))
+                    } catch (e2: ApiException) {
+                        if (e2.status != 404) {
+                            throw e2
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -592,7 +667,10 @@ object Mailboxes {
         for (m in s.repo.staleCreating(now - 15 * 60_000L)) {
             s.repo.deleteMailboxRow(m.id)
         }
-        if (s.repo.kvString("rotation_needed") == "1") {
+        // A rotation never verified (the push was lost, came after the server's deadline, or verify failed): start again,
+        // unless one is still within its verification window.
+        val pending = s.repo.rotationsPendingSince()
+        if (s.repo.kvString("rotation_needed") == "1" && (pending == null || pending < now - ROTATION_VERIFY_WINDOW_MS)) {
             runCatching { rotateAll(s) }
         }
     }

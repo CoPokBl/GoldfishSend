@@ -16,7 +16,6 @@ import app.goldfishsend.net.ServerApi
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.E2eBlob
-import app.goldfishsend.proto.Rand
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.sync.withLock
 
@@ -160,7 +159,7 @@ object GroupOutbox {
                 singles(api, items)
             } else {
                 try {
-                    withPow(api, batch) { pow -> api.sendBatch(items, pow) }
+                    withPow(s, server, api, batch) { pow -> api.sendBatch(items, pow) }
                 } catch (e: BatchUnsupportedException) {
                     noBatch[server] = System.currentTimeMillis() + 6 * 3600_000L
                     singles(api, items)
@@ -170,6 +169,16 @@ object GroupOutbox {
             // The whole batch failed (client rate limit, server or network): retry it whole, same idempotency keys.
             for (r in batch) {
                 backoff(s, r.item, e.retryAfterSeconds ?: if (e.status == 404) 3600 else null)
+            }
+            return false
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Anything else still backs this batch off. Escaping, it would skip the other servers' batches in this pass and
+            // leave these rows due, to be retried about once a second.
+            Log.w(TAG, "batch send failed: ${e.javaClass.simpleName}")
+            for (r in batch) {
+                backoff(s, r.item, null)
             }
             return false
         }
@@ -192,16 +201,14 @@ object GroupOutbox {
         return progress
     }
 
-    /** Pays a per-IP or per-network limit with a proof of work and tries once more, like single sends. */
-    private suspend fun <T> withPow(api: ServerApi, batch: List<Ready>, call: suspend (String?) -> T): T = try {
+    /** Pays a per-IP or per-network limit with a proof of work and tries once more, like single sends (same budget). */
+    private suspend fun <T> withPow(s: Session, server: String, api: ServerApi, batch: List<Ready>, call: suspend (String?) -> T): T = try {
         call(null)
     } catch (e: ApiException) {
         if (!e.powCanHelp || batch.maxOf { it.item.attempts } >= 3) {
             throw e
         }
-        val ch = api.powChallenge(forSend = true)
-        val nonce = Outbox.solvePow(ch)
-        call(Outbox.powHeader(ch, nonce))
+        Outbox.payPow(s, server, api) { pow -> call(pow) }
     }
 
     /** A server without the batch endpoint: one request per item, with the same per-item results. */
@@ -238,10 +245,7 @@ object GroupOutbox {
 
     private fun backoff(s: Session, item: OutboxItem, retryAfter: Long?) {
         val attempts = item.attempts + 1
-        val base = (5_000L shl attempts.coerceAtMost(9)).coerceAtMost(30 * 60_000L)
-        val jitter = (base * (Rand.int(40) - 20)) / 100
-        val delay = maxOf(base + jitter, (retryAfter ?: 0) * 1000)
-        s.repo.outboxBackoff(item.seq, attempts, System.currentTimeMillis() + delay)
+        s.repo.outboxBackoff(item.seq, attempts, System.currentTimeMillis() + Outbox.backoffDelayMs(attempts, retryAfter))
         if (attempts == 1) {
             s.db.notifyChanged()
         }

@@ -11,6 +11,7 @@ import app.goldfishsend.db.OutboxKind
 import app.goldfishsend.db.isGroup
 import app.goldfishsend.net.ApiException
 import app.goldfishsend.net.PowChallenge
+import app.goldfishsend.net.ServerApi
 import app.goldfishsend.net.ServerPin
 import app.goldfishsend.proto.B64
 import app.goldfishsend.proto.Content
@@ -169,9 +170,7 @@ object Outbox {
                 if (!e.powCanHelp || item.attempts >= 3) {
                     throw e
                 }
-                val ch = api.powChallenge(forSend = true)
-                val nonce = solvePow(ch)
-                api.sendMessage(secret, blob, item.idem, null, powHeader(ch, nonce))
+                payPow(s, server, api) { pow -> api.sendMessage(secret, blob, item.idem, null, pow) }
             }
             s.repo.outboxDelete(item.seq)
             item.messageId?.let { id ->
@@ -213,6 +212,14 @@ object Outbox {
                     return true
                 }
             }
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Anything else (a bug, or something a hostile server provoked) still backs the row off. Left due, it would be
+            // retried about once a second for as long as the app runs.
+            android.util.Log.w("Outbox", "send failed: ${e.javaClass.simpleName}")
+            backoff(s, item, null)
+            return false
         }
     }
 
@@ -239,12 +246,33 @@ object Outbox {
     )
 
     /**
+     * Pays a per-IP or per-network send limit on [server] with a proof of work and makes [call] once more with the
+     * `GF-PoW` header. The work comes out of [PowBudget]. A server that still refuses the paid call (with anything but
+     * a network failure) gets no more work for a while, so it can't make us solve again and again for nothing.
+     */
+    suspend fun <T> payPow(s: Session, server: String, api: ServerApi, call: suspend (String) -> T): T {
+        val ch = api.powChallenge(forSend = true)
+        val nonce = solvePow(s, server, ch)
+        return try {
+            call(powHeader(ch, nonce))
+        } catch (e: ApiException) {
+            if (e.status != 0) {
+                PowBudget.refused(s, server)
+            }
+            throw e
+        }
+    }
+
+    /**
      * Solves a send-limit challenge ([Pow.Lane.CONTACT_SEND]: usually a contact's server, which may be hostile). An unknown
      * scheme, parameters past the lane's tight caps, or a timeout count as a server failure (retried later) rather than
-     * letting it pin the CPU or memory, or crash the send loop. It pauses while our own mailbox creation needs the solver.
+     * letting it pin the CPU or memory, or crash the send loop, and a challenge the [PowBudget] can't afford now is a rate
+     * limit. It pauses while our own mailbox creation needs the solver.
      */
-    suspend fun solvePow(ch: PowChallenge): ByteArray = try {
+    private suspend fun solvePow(s: Session, server: String, ch: PowChallenge): ByteArray = try {
         val pow = ch.toPow()
+        Pow.refusal(pow.params, Pow.Lane.CONTACT_SEND)?.let { throw Pow.TooHardException(pow.params, it) }
+        PowBudget.spend(s, server, pow.params)
         Pow.solveContact(pow.bytes, pow.params)
     } catch (e: Pow.TooHardException) {
         throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
@@ -255,12 +283,21 @@ object Outbox {
     /** "challenge.nonce" for the GF-PoW header. */
     fun powHeader(ch: PowChallenge, nonce: ByteArray) = "${ch.challenge}.${B64.enc(nonce)}"
 
+    /**
+     * How long to wait before the next try of a row that has now failed [attempts] times: exponential from 10 s to
+     * 30 minutes with ±20% [jitterPercent], or the server's Retry-After if that's longer. The server's value is clamped
+     * (at most a day), so a huge one can't overflow the next-try time into the past and retry once a second.
+     */
+    internal fun backoffDelayMs(attempts: Int, retryAfterSeconds: Long?, jitterPercent: Int = Rand.int(40) - 20): Long {
+        val base = (5_000L shl attempts.coerceIn(0, 9)).coerceAtMost(30 * 60_000L)
+        val jitter = base * jitterPercent.coerceIn(-50, 50) / 100
+        val server = (retryAfterSeconds ?: 0).coerceIn(0, ServerApi.MAX_RETRY_AFTER_SECONDS) * 1000
+        return maxOf(base + jitter, server)
+    }
+
     private fun backoff(s: Session, item: OutboxItem, retryAfter: Long?) {
         val attempts = item.attempts + 1
-        val base = (5_000L shl attempts.coerceAtMost(9)).coerceAtMost(30 * 60_000L)
-        val jitter = (base * (Rand.int(40) - 20)) / 100
-        val delay = maxOf(base + jitter, (retryAfter ?: 0) * 1000)
-        s.repo.outboxBackoff(item.seq, attempts, System.currentTimeMillis() + delay)
+        s.repo.outboxBackoff(item.seq, attempts, System.currentTimeMillis() + backoffDelayMs(attempts, retryAfter))
         if (attempts == 1) {
             // The chat now shows the message as waiting.
             s.db.notifyChanged()

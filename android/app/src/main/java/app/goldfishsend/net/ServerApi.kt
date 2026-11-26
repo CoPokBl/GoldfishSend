@@ -362,7 +362,8 @@ class ServerApi(
                 if (results.size != items.size) {
                     throw ApiException("bad_server", 502, retryAfterSeconds = 60)
                 }
-                results
+                // Per-item Retry-After comes from the server's JSON: clamped like the header.
+                results.map { it.copy(retryAfter = clampRetryAfter(it.retryAfter)) }
             }
         } catch (e: ApiException) {
             // Through the gateway, an unknown inner route is a bare 404 from routing (no JSON error code), unlike a send's
@@ -430,7 +431,7 @@ class ServerApi(
                 GatewayCodec.encodeRequest(
                     GatewayCodec.InnerRequest(
                         GatewayCodec.methodCode(method),
-                        clock() / 1000 + state.clockOffset(serverId),
+                        (clock() / 1000 + state.clockOffset(serverId)).coerceAtLeast(0),
                         "/" + path.trimStart('/'),
                         headers,
                         body,
@@ -438,6 +439,10 @@ class ServerApi(
                 )
             } catch (e: GatewayCodec.FormatException) {
                 throw ApiException("too_large", 413, cause = e)
+            } catch (e: IllegalArgumentException) {
+                // A request the codec refuses, for example a header built from a server's challenge string. It has to be an
+                // ApiException like any other failure, so callers back off instead of retrying it in a tight loop.
+                throw ApiException("bad_server", 502, retryAfterSeconds = 3600, cause = e)
             }
             val sealed = Gateway.seal(key, inner)
             val req = Request.Builder().url(url("v1/gw")).post(sealed.body.toRequestBody(OCTET)).build()
@@ -476,7 +481,14 @@ class ServerApi(
             if (resp.status == 400 && !skewRetried) {
                 val skew = runCatching { lenient.decodeFromString(SkewBody.serializer(), resp.body.toString(Charsets.UTF_8)) }.getOrNull()
                 if (skew?.error == "clock_skew" && skew.serverTime != null) {
-                    state.setClockOffset(serverId, skew.serverTime - clock() / 1000)
+                    val offset = skew.serverTime - clock() / 1000
+                    if (skew.serverTime <= 0 || offset !in -MAX_CLOCK_OFFSET_SECONDS..MAX_CLOCK_OFFSET_SECONDS) {
+                        // The answer is authenticated, but a contact picks their own server: a time that's absurd, or
+                        // further off than a wrong phone clock can be while TLS still works, is a broken or hostile server.
+                        // It's never adopted, so it can't break requests to that server for the rest of the process.
+                        throw ApiException("bad_server", 502, retryAfterSeconds = 3600)
+                    }
+                    state.setClockOffset(serverId, offset)
                     skewRetried = true
                     continue
                 }
@@ -495,7 +507,7 @@ class ServerApi(
                 replayRetried = true
                 continue
             }
-            throw ApiException(err.error, resp.status, resp.header("retry-after")?.toLongOrNull(), scope = err.scope)
+            throw ApiException(err.error, resp.status, clampRetryAfter(resp.header("retry-after")?.toLongOrNull()), scope = err.scope)
         }
     }
 
@@ -582,6 +594,18 @@ class ServerApi(
 
         /** A key blob is 1250 bytes. */
         const val MAX_KEY_BYTES = 4096L
+
+        /**
+         * The longest Retry-After honoured from a server, in seconds. Anything longer, including a value chosen to overflow
+         * the outbox's arithmetic, is cut to this.
+         */
+        const val MAX_RETRY_AFTER_SECONDS = 86_400L
+
+        /** The largest clock offset adopted from a `clock_skew` answer: a week. A clock further off fails TLS anyway. */
+        const val MAX_CLOCK_OFFSET_SECONDS = 7 * 86_400L
+
+        /** A server's Retry-After (seconds), clamped to 1..[MAX_RETRY_AFTER_SECONDS]. Null stays null. */
+        fun clampRetryAfter(seconds: Long?): Long? = seconds?.coerceIn(1, MAX_RETRY_AFTER_SECONDS)
 
         /** Replaced by the app at startup with a store that keeps verified keys across launches. */
         @Volatile

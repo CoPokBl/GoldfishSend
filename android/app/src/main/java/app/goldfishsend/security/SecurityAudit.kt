@@ -160,7 +160,10 @@ object SecurityAudit {
         // --- Push distributor ---
         val dist = (if (decoy) prefs.decoyPushDistributor else null) ?: PushHub.current(ctx)
         val host = device.pushHost.orEmpty()
-        val googleHost = host.endsWith("googleapis.com") || host.contains("fcm") || host.endsWith("google.com")
+        val isGoogle = { h: String -> h.endsWith("googleapis.com") || h.contains("fcm") || h.endsWith("google.com") }
+        val googleHost = isGoogle(host)
+        // Switched away, but the server hasn't confirmed the new endpoint yet: it still wakes us through the old one.
+        val stillGoogle = device.pushHostUnconfirmed?.let(isGoogle) == true
         when {
             device.pushStatus != "ok" -> out += Finding(
                 "push", Severity.CRITICAL, "Notifications aren't set up",
@@ -170,6 +173,11 @@ object SecurityAudit {
                 "push", Severity.WARNING, "Notifications go through Google",
                 "Message contents stay encrypted, but Google can see when you receive messages. A self-hosted or community ntfy server avoids this.",
                 Fix.CHANGE_PUSH, "Change",
+            )
+            stillGoogle -> out += Finding(
+                "push", Severity.WARNING, "Notifications may still go through Google",
+                "Your server hasn't confirmed the switch to your new push service yet, so it may still wake you through Google. " +
+                    "GoldfishSend keeps retrying the switch.",
             )
             host.endsWith("mozilla.com") -> out += Finding(
                 "push", Severity.INFO, "Notifications go through Mozilla",

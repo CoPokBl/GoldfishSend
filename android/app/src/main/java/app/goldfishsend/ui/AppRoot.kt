@@ -46,6 +46,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import app.goldfishsend.proto.InviteLink
 import app.goldfishsend.ui.components.blockWhenObscured
+import app.goldfishsend.ui.components.rememberReAuth
+import androidx.activity.compose.LocalActivity
+import androidx.fragment.app.FragmentActivity
 
 private enum class RootState { ONBOARDING, LOCKED, UNLOCKING, READY }
 
@@ -76,8 +79,11 @@ fun AppRoot(pendingLink: MutableStateFlow<String?>) {
             RootState.READY -> session?.let { MainNav(it, pendingLink) }
         }
     }
-    // A pinned server presented a different key: ask the user, whatever screen is showing.
-    app.goldfishsend.ui.screens.PinMismatchDialog()
+    // A pinned server presented a different TLS key: ask the user. Never over the lock screen (it names the server, and
+    // trusting needs the app secret) or the decoy. During setup there's no secret yet.
+    if (state == RootState.ONBOARDING) {
+        app.goldfishsend.ui.screens.PinMismatchDialog { it() }
+    }
 }
 
 @Composable
@@ -116,6 +122,12 @@ private fun MainNav(s: Session, pendingLink: MutableStateFlow<String?>) {
     }
     // Our own server presented a different identity key: explain, and let the user trust it (after re-authenticating).
     app.goldfishsend.ui.screens.ServerIdentityChangedDialog(s)
+    if (!s.decoy) {
+        (LocalActivity.current as? FragmentActivity)?.let { activity ->
+            val reauth = rememberReAuth(s, activity)
+            app.goldfishsend.ui.screens.PinMismatchDialog { action -> reauth.require("Trusting a server's new TLS key.", action = action) }
+        }
+    }
     confirmLink?.takeIf { InviteLink.isOutdated(it) }?.let {
         AlertDialog(
             onDismissRequest = { confirmLink = null },

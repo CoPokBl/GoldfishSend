@@ -311,6 +311,45 @@ class ServerApiTest {
     }
 
     @Test
+    fun anAbsurdServerTimeIsNeverAdopted() = runBlocking {
+        val now = 1_800_000_000_000L
+        val skewed = ServerApi(server.url("/base/").toString(), OkHttpClient(), ServerPin(gw.fp), state, clock = { now })
+        // Negative (the request encoder refuses a negative timestamp, which used to escape as a non-ApiException and
+        // break every later call to that server), zero, and more than a week off.
+        for (t in listOf(-1000L, 0L, now / 1000 + 8 * 86_400, now / 1000 - 8 * 86_400)) {
+            reply(400, """{"error":"clock_skew","serverTime":$t}""")
+            try {
+                skewed.info()
+                fail("adopted $t")
+            } catch (e: ApiException) {
+                assertEquals("bad_server", e.code)
+                assertTrue(e.retryable)
+            }
+            assertEquals(0L, state.clockOffset(server.url("/base/").toString()))
+        }
+        // The next call still goes out with our own clock.
+        reply(200, INFO)
+        skewed.info()
+        assertEquals(now / 1000, last().timestamp)
+    }
+
+    @Test
+    fun aHostileRetryAfterIsClamped() = runBlocking {
+        reply(429, """{"error":"rate_limited","scope":"mailbox"}""", "retry-after" to "9223372036854775")
+        try {
+            api.sendMessage(ByteArray(32), byteArrayOf(1), ByteArray(16), null)
+            fail()
+        } catch (e: ApiException) {
+            assertEquals(ServerApi.MAX_RETRY_AFTER_SECONDS, e.retryAfterSeconds)
+        }
+        reply(200, """{"results":[{"status":429,"error":"rate_limited","retryAfter":9223372036854775},{"status":507,"retryAfter":-4}]}""")
+        val items = List(2) { app.goldfishsend.net.BatchItem(ByteArray(32), ByteArray(16), null, byteArrayOf(1)) }
+        val results = api.sendBatch(items)
+        assertEquals(ServerApi.MAX_RETRY_AFTER_SECONDS, results[0].retryAfter)
+        assertEquals(1L, results[1].retryAfter)
+    }
+
+    @Test
     fun replayedRequestIsResealedOnce() = runBlocking {
         reply(409, """{"error":"replay"}""")
         reply(202, """{"id":"ok"}""")

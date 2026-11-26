@@ -78,14 +78,19 @@ object NetRules {
      *
      * @param torPort the built-in Tor SOCKS port, or 0 if it isn't ready.
      * @param allowHttp debug builds allow plain http to any host (local development servers).
+     * @param ownServerDirect [host] is our own server and the user chose Tor only for other people's servers: it's
+     *   reached directly, unless it's an onion service. Every other server still goes through Tor.
      */
-    fun route(mode: ProxyMode, host: String, scheme: String, torPort: Int, allowHttp: Boolean = false): Route {
+    fun route(mode: ProxyMode, host: String, scheme: String, torPort: Int, allowHttp: Boolean = false, ownServerDirect: Boolean = false): Route {
         val onion = isOnionHost(host)
         if (onion && mode == ProxyMode.DIRECT) {
             return Route.Blocked(BlockReason.TOR_REQUIRED)
         }
         if (scheme == "http" && !onion && !allowHttp) {
             return Route.Blocked(BlockReason.CLEARTEXT)
+        }
+        if (ownServerDirect && !onion) {
+            return Route.Direct
         }
         return when (mode) {
             ProxyMode.DIRECT -> Route.Direct
@@ -95,9 +100,17 @@ object NetRules {
     }
 
     /**
-     * Server URLs: https anywhere, and also plain http to a valid v3 onion service, whose onion address already
-     * authenticates and encrypts the connection end to end.
+     * Whether a connection made through [proxy] is on [route]. OkHttp reuses pooled connections by address, whatever
+     * proxy they were made through, so after a mode change a connection opened directly could otherwise carry requests
+     * that should go through Tor. A blocked route matches nothing.
      */
+    fun proxyMatches(route: Route, proxy: java.net.Proxy): Boolean = when (route) {
+        Route.Direct -> proxy.type() == java.net.Proxy.Type.DIRECT
+        is Route.Socks -> proxy.type() == java.net.Proxy.Type.SOCKS &&
+            (proxy.address() as? java.net.InetSocketAddress)?.let { it.hostString == route.host && it.port == route.port } == true
+        is Route.Blocked -> false
+    }
+
     /** See ServerApi.isValidContactServer: https on 443, or a v3 onion (http on 80 or https on 443). */
     fun isAcceptableContactServer(scheme: String, host: String, port: Int, allowHttp: Boolean): Boolean {
         if (allowHttp) {
@@ -109,6 +122,10 @@ object NetRules {
         }
     }
 
+    /**
+     * Server URLs: https anywhere, and also plain http to a valid v3 onion service, whose onion address already
+     * authenticates and encrypts the connection end to end.
+     */
     fun isAcceptableServerScheme(scheme: String, host: String, allowHttp: Boolean): Boolean = when (scheme) {
         "https" -> !isOnionHost(host) || isValidV3Onion(host)
         "http" -> allowHttp || isValidV3Onion(host)
