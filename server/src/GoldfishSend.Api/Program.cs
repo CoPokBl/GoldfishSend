@@ -102,8 +102,17 @@ if (serverKey is not null) {
     startupLog.LogInformation("Server key fingerprint: {Fingerprint} ({FingerprintBase64Url})", serverKey.FingerprintDisplay, serverKey.FingerprintBase64Url);
 }
 
+// EpochKeyStore=Ephemeral promises shredded keys never reach the disk. Refuse to start rather than quietly break that.
+var keyring = app.Services.GetRequiredService<EpochKeyring>();
+if (await keyring.StoreProblemAsync(app.Services.GetRequiredService<GoldfishSend.Infrastructure.Redis.RedisPersistence>()) is { } storeProblem) {
+    if (!app.Environment.IsDevelopment()) {
+        throw new InvalidOperationException(storeProblem);
+    }
+    startupLog.LogWarning("{Problem}", storeProblem);
+}
+
 await app.Services.GetRequiredService<Migrator>().MigrateAsync();
-await app.Services.GetRequiredService<EpochKeyring>().RotateAsync();
+await keyring.RotateAsync();
 
 app.UseForwardedHeaders();
 

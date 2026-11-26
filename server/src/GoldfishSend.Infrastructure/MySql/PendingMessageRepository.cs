@@ -33,7 +33,8 @@ public sealed class PendingMessageRepository {
     }
 
     /// <summary>
-    /// Claims up to <paramref name="limit"/> due messages by pushing their <c>next_attempt_at</c> forward by a lease.
+    /// Claims up to <paramref name="limit"/> due messages by pushing their <c>next_attempt_at</c> forward by a lease, and
+    /// recording the lease in <c>claimed_until</c> so wake-ups leave them alone (<see cref="Unclaimed"/>).
     /// <c>SKIP LOCKED</c> lets several workers claim disjoint sets at the same time. If a worker crashes,
     /// its claimed rows simply come due again once the lease runs out.
     /// </summary>
@@ -51,7 +52,11 @@ public sealed class PendingMessageRepository {
 
         if (rows.Count > 0) {
             await conn.ExecuteAsync(new CommandDefinition(
-                "UPDATE pending_messages SET next_attempt_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL @secs SECOND) WHERE id IN @ids",
+                """
+                UPDATE pending_messages
+                SET next_attempt_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL @secs SECOND), claimed_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL @secs SECOND)
+                WHERE id IN @ids
+                """,
                 new { secs = (int)lease.TotalSeconds, ids = rows.Select(r => r.Id).ToArray() }, tx, cancellationToken: ct));
         }
         await tx.CommitAsync(ct);
@@ -63,18 +68,26 @@ public sealed class PendingMessageRepository {
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM pending_messages WHERE id = @id", new { id }, cancellationToken: ct));
     }
 
+    /// <summary>Ends the claim: the attempt is over and the row waits for <paramref name="nextAttemptAt"/>.</summary>
     public async Task RescheduleAsync(byte[] id, int attempts, DateTime nextAttemptAt, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         await conn.ExecuteAsync(new CommandDefinition(
-            "UPDATE pending_messages SET attempts = @attempts, next_attempt_at = @nextAttemptAt WHERE id = @id",
+            "UPDATE pending_messages SET attempts = @attempts, next_attempt_at = @nextAttemptAt, claimed_until = NULL WHERE id = @id",
             new { id, attempts, nextAttemptAt }, cancellationToken: ct));
     }
+
+    /// <summary>
+    /// The condition every wake-up adds: a row a retry worker is attempting right now is left alone. Making it due would
+    /// let another worker push it at the same time; if this attempt fails, <see cref="RecheckHeldAsync"/> or the retry
+    /// schedule takes over.
+    /// </summary>
+    public const string Unclaimed = "(claimed_until IS NULL OR claimed_until < UTC_TIMESTAMP())";
 
     /// <summary>Makes every held message of a mailbox due now (after its endpoint recovered).</summary>
     public async Task WakeMailboxAsync(byte[] mailboxId, CancellationToken ct = default) {
         await using var conn = await _db.OpenAsync(ct);
         await conn.ExecuteAsync(new CommandDefinition(
-            "UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id = @mailboxId",
+            $"UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id = @mailboxId AND {Unclaimed}",
             new { mailboxId }, cancellationToken: ct));
     }
 
@@ -85,12 +98,35 @@ public sealed class PendingMessageRepository {
         }
         await using var conn = await _db.OpenAsync(ct);
         foreach (var mailboxId in mailboxIds) {
-            await conn.ExecuteAsync(new CommandDefinition("""
+            await conn.ExecuteAsync(new CommandDefinition($"""
                 UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP()
-                WHERE mailbox_id = @mailboxId AND expires_at > UTC_TIMESTAMP()
+                WHERE mailbox_id = @mailboxId AND expires_at > UTC_TIMESTAMP() AND {Unclaimed}
                 ORDER BY expires_at LIMIT 1
                 """, new { mailboxId }, cancellationToken: ct));
         }
+    }
+
+    /// <summary>
+    /// Run straight after parking a message until its expiry. Verification, rotation and recovery wake the mailbox's
+    /// held messages, but only the rows there when they commit, so a park racing one of them would sleep until the
+    /// message expires. This looks at the mailbox again, with a locking read that waits for such a change to commit,
+    /// and makes the message due now unless the mailbox still can't receive at the endpoint the attempt used. A mailbox
+    /// deleted meanwhile also counts: the next attempt then drops the message instead of keeping it until expiry.
+    /// </summary>
+    /// <returns><c>true</c> if the message was made due again.</returns>
+    public async Task<bool> RecheckHeldAsync(byte[] id, byte[] mailboxId, byte[] heldEndpoint, CancellationToken ct = default) {
+        await using var conn = await _db.OpenAsync(ct);
+        // Its own statement, holding no other lock afterwards, so it can't deadlock with a transaction that takes the
+        // mailbox and its messages in the other order (deletion does).
+        var mailbox = await conn.QuerySingleOrDefaultAsync<MailboxRow>(new CommandDefinition(
+            "SELECT id AS Id, state AS State, sealed_endpoint AS SealedEndpoint FROM mailboxes WHERE id = @mailboxId FOR SHARE",
+            new { mailboxId }, cancellationToken: ct));
+        if (mailbox is not null && mailbox.State != MailboxState.Active && mailbox.SealedEndpoint.AsSpan().SequenceEqual(heldEndpoint)) {
+            return false;
+        }
+        await conn.ExecuteAsync(new CommandDefinition(
+            "UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE id = @id", new { id }, cancellationToken: ct));
+        return true;
     }
 
     public async Task<int> DeleteExpiredAsync(CancellationToken ct = default) {

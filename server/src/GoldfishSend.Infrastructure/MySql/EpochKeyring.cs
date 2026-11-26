@@ -21,7 +21,9 @@ namespace GoldfishSend.Infrastructure.MySql;
 /// undo and free pages until overwritten, so someone with an image of the disk <i>and</i> the KEK may recover recent
 /// "shredded" epochs. Full-disk encryption and redo/undo log encryption narrow this. See server/README.md.</item>
 /// <item><b>Ephemeral</b>: keys live only in the non-persistent ephemeral Redis, so deletion is real and nothing is ever on
-/// disk. The cost: restarting that Redis makes every queued and held message undecryptable (they get dropped).</item>
+/// disk. The cost: restarting that Redis makes every queued and held message undecryptable (they get dropped). Startup
+/// refuses this mode without a separate, AOF-less ephemeral Redis (<see cref="StoreProblemAsync"/>), and every rotation
+/// deletes any keys a previous MySql configuration left in MySQL.</item>
 /// </list>
 /// </summary>
 public sealed class EpochKeyring {
@@ -99,17 +101,47 @@ public sealed class EpochKeyring {
         await GetAsync(current, create: true, ct);
         await GetAsync(current + 1, create: true, ct);
 
-        var deleted = 0;
-        if (_store == EpochKeyStore.MySql) {
-            await using var conn = await _db.OpenAsync(ct);
-            deleted = await conn.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM epoch_keys WHERE epoch < @oldest", new { oldest = OldestKept }, cancellationToken: ct));
+        await using (var conn = await _db.OpenAsync(ct)) {
+            if (_store == EpochKeyStore.MySql) {
+                var deleted = await conn.ExecuteAsync(new CommandDefinition(
+                    "DELETE FROM epoch_keys WHERE epoch < @oldest", new { oldest = OldestKept }, cancellationToken: ct));
+                if (deleted > 0) {
+                    _logger.LogInformation("Shredded {Count} expired epoch key(s)", deleted);
+                }
+            } else {
+                // Nothing reads MySQL in Ephemeral mode, so keys written there before a switch from MySql would never be
+                // deleted, and with the KEK they'd still open what's left of those epochs' messages on disk.
+                var leftover = await conn.ExecuteAsync(new CommandDefinition("DELETE FROM epoch_keys", cancellationToken: ct));
+                if (leftover > 0) {
+                    _logger.LogWarning(
+                        "EpochKeyStore is Ephemeral: deleted {Count} epoch key(s) left in MySQL by the MySql store. Messages " +
+                        "held under them can no longer be delivered and are dropped.", leftover);
+                }
+            }
         }
-        // Redis-stored keys carry their own TTL, set at creation (retention + 1 day).
+        // Redis-stored keys carry their own TTL, set at creation (retention + 2 days).
         EvictExpired();
-        if (deleted > 0) {
-            _logger.LogInformation("Shredded {Count} expired epoch key(s)", deleted);
+    }
+
+    /// <summary>
+    /// Why the configured store can't keep its promise, or <c>null</c>. Ephemeral mode promises that a shredded key is gone
+    /// from disk, which only holds if the ephemeral Redis is a separate instance without an append-only file.
+    /// </summary>
+    public async Task<string?> StoreProblemAsync(RedisPersistence persistence) {
+        if (_store != EpochKeyStore.Ephemeral) {
+            return null;
         }
+        if (!_redis.IsSeparate) {
+            return "Goldfish:EpochKeyStore is Ephemeral, but ConnectionStrings:RedisEphemeral is not set, so epoch keys " +
+                "would be written to the persistent Redis and stay in its AOF. Point RedisEphemeral at a Redis without " +
+                "persistence (deploy/redis-ephemeral.conf), or use EpochKeyStore=MySql.";
+        }
+        if (await persistence.AofEnabledAsync(ephemeral: true) == true) {
+            return "Goldfish:EpochKeyStore is Ephemeral, but the Redis at ConnectionStrings:RedisEphemeral has appendonly " +
+                "enabled, so shredded epoch keys would stay in its AOF. Run it without persistence " +
+                "(deploy/redis-ephemeral.conf), or use EpochKeyStore=MySql.";
+        }
+        return null;
     }
 
     /// <summary>Wipes cached keys past retention from this process's memory. Every role calls it periodically.</summary>

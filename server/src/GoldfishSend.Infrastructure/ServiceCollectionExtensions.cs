@@ -30,6 +30,7 @@ public static class ServiceCollectionExtensions {
         services.AddSingleton(sp => string.IsNullOrWhiteSpace(ephemeralRedisConfiguration)
             ? new EphemeralRedis(sp.GetRequiredService<IConnectionMultiplexer>(), isSeparate: false)
             : new EphemeralRedis(Connect(ephemeralRedisConfiguration), isSeparate: true));
+        services.AddSingleton(_ => new RedisPersistence(redisConfiguration, ephemeralRedisConfiguration));
 
         services.AddSingleton<Db>();
         services.AddSingleton<Migrator>();
@@ -70,8 +71,12 @@ public static class ServiceCollectionExtensions {
         return services;
     }
 
-    private static ConnectionMultiplexer Connect(string configuration) {
+    /// <param name="admin">
+    /// Lets the client send admin commands (INFO, BGREWRITEAOF). Only <see cref="RedisPersistence"/> asks for it.
+    /// </param>
+    internal static ConnectionMultiplexer Connect(string configuration, bool admin = false) {
         var config = ConfigurationOptions.Parse(configuration);
+        config.AllowAdmin = admin;
         config.AbortOnConnectFail = false;
         config.ClientName = "goldfish";
         // Keep keys (which can carry mailbox-derived names) and server details out of exception messages and logs.

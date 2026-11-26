@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using GoldfishSend.Core.Protocol;
 
@@ -68,8 +69,21 @@ public sealed class MailboxCrypto {
         return CryptographicOperations.FixedTimeEquals(hash, storedHash);
     }
 
+    /// <summary>
+    /// Endpoint records are zero-padded to the largest possible record before sealing. One device's mailboxes all share
+    /// its push URL, so an unpadded length would group them in a database dump, and an unusual URL length (a self-hosted
+    /// distributor, say) would pick them out.
+    /// </summary>
+    public const int PaddedEndpointSize = 2 + EndpointRecord.MaxUrlBytes + WebPushCrypto.PublicKeySize + WebPushCrypto.AuthSecretSize;
+
+    /// <summary>The length of every sealed endpoint.</summary>
+    public const int SealedEndpointSize = SecretBox.Overhead + PaddedEndpointSize;
+
     public static byte[] SealEndpoint(ReadOnlySpan<byte> sealKey, EndpointRecord record, ReadOnlySpan<byte> mailboxId) {
-        var plain = record.Serialize();
+        var serialized = record.Serialize();
+        var plain = new byte[PaddedEndpointSize];
+        serialized.CopyTo(plain, 0);
+        CryptographicOperations.ZeroMemory(serialized);
         try {
             return SecretBox.Seal(sealKey, plain, mailboxId);
         } finally {
@@ -78,10 +92,22 @@ public sealed class MailboxCrypto {
     }
 
     /// <exception cref="CryptographicException">Wrong key or corrupted record.</exception>
+    /// <exception cref="FormatException">The record opened but isn't a padded endpoint record.</exception>
     public static EndpointRecord UnsealEndpoint(ReadOnlySpan<byte> sealKey, ReadOnlySpan<byte> sealedRecord, ReadOnlySpan<byte> mailboxId) {
         var plain = SecretBox.Open(sealKey, sealedRecord, mailboxId);
         try {
-            return EndpointRecord.Deserialize(plain);
+            if (plain.Length != PaddedEndpointSize) {
+                throw new FormatException("Endpoint record isn't padded.");
+            }
+            int urlLength = BinaryPrimitives.ReadUInt16BigEndian(plain);
+            if (urlLength > EndpointRecord.MaxUrlBytes) {
+                throw new FormatException("Malformed endpoint record.");
+            }
+            var length = 2 + urlLength + WebPushCrypto.PublicKeySize + WebPushCrypto.AuthSecretSize;
+            if (plain.AsSpan(length).ContainsAnyExcept((byte)0)) {
+                throw new FormatException("Endpoint record padding isn't zero.");
+            }
+            return EndpointRecord.Deserialize(plain.AsSpan(0, length));
         } finally {
             CryptographicOperations.ZeroMemory(plain);
         }

@@ -167,8 +167,9 @@ public sealed class MailboxRepository {
             }
         }
         var ids = items.Select(i => i.Id).ToArray();
+        // Rows parked by an attempt that's still running miss this, but that attempt rechecks the mailbox after parking.
         await conn.ExecuteAsync(new CommandDefinition(
-            "UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id IN @ids",
+            $"UPDATE pending_messages SET next_attempt_at = UTC_TIMESTAMP() WHERE mailbox_id IN @ids AND {PendingMessageRepository.Unclaimed}",
             new { ids }, tx, cancellationToken: ct));
         await tx.CommitAsync(ct);
         return true;

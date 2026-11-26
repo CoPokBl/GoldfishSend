@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using GoldfishSend.Core.Net;
 using GoldfishSend.Infrastructure.Delivery;
 using GoldfishSend.Infrastructure.Push;
+using GoldfishSend.Infrastructure.Redis;
 using GoldfishSend.Infrastructure.Services;
 
 namespace GoldfishSend.Tests.Core;
@@ -19,6 +20,17 @@ public sealed class HostGroupingTests {
     [InlineData("Push.Example.COM.", "example.com")]
     public void BaseDomain_GroupsWildcardSubdomains(string host, string expected) {
         Assert.Equal(expected, HostGrouping.BaseDomain(host));
+    }
+}
+
+public sealed class GatewayReplayGuardTests {
+    [Fact]
+    public void Retention_OutlivesTheWholeAcceptanceWindow() {
+        // Seen first with a timestamp just inside the window on one side, a replay stays acceptable until the floored
+        // clock passes the other side: twice the window plus one second. Nodes' clocks can also disagree.
+        var acceptable = TimeSpan.FromSeconds(2 * GatewayReplayGuard.TimestampWindowSeconds + 1);
+        Assert.True(GatewayReplayGuard.Retention >= acceptable + TimeSpan.FromSeconds(30));
+        Assert.Equal(GatewayReplayGuard.TimestampWindowSeconds, GoldfishSend.Api.GatewayMiddleware.TimestampWindowSeconds);
     }
 }
 
